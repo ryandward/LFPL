@@ -1,0 +1,32 @@
+# Build a list out of the free cells, add one to every element in place, then sum
+# it while giving each cell back. The result is 2 + 3 + 4 = 9.
+data Free = End | More(next: Free);
+data Res = Fail | Done(value: Int64, rest: Free);
+data List = Nil | Cons(h: Int64, t: List);
+
+fn inc(l: List) : List @l =
+  match l with
+  | Cons(d, h, t) => Cons@d(+(h, 1), inc(t))
+  | Nil => Nil
+  end;
+
+fn sum(l: List, acc: Int64, free: Free) : Res =
+  match l with
+  | Cons(d, h, t) => sum(t, +(acc, h), More@d(free))
+  | Nil => match free with
+           | End => Fail
+           | More(d, rest) => Done@d(acc, rest)
+           end
+  end;
+
+fn main(free: Free) : Res =
+  match free with
+  | End => Fail
+  | More(a, r1) => match r1 with
+    | End => Done@a(0, End)
+    | More(b, r2) => match r2 with
+      | End => Done@a(0, More@b(End))
+      | More(c, r3) => sum(inc(Cons@a(1, Cons@b(2, Cons@c(3, Nil)))), 0, r3)
+      end
+    end
+  end;
