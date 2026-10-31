@@ -311,6 +311,85 @@ class ZeroUnchangedFieldCopies(unittest.TestCase):
         self.assertTrue([v for v in validate(broken) if v.kind == "I2"], broken)
 
 
+SUM = b"""fn sum(l: List, acc: Int64, free: Free) : Res = match l with
+  | Cons(d, h, t) => sum(t, +(acc, h), More@d(free))
+  | Nil => match free with End => Fail | More(d, rest) => Done@d(acc, rest) end end;
+"""
+
+TAGS = PRE + b"""data S = A(x: Int32) | B(x: Int32, y: Int16);
+fn rd(s: S, free: Free) : Res = match s with
+  | A(d, x) => Done@d(+(1000, pack<32>(x)), free)
+  | B(d, x, y) => Done@d(+(2000, pack<16>(y)), free) end;
+"""
+
+
+def flip(arm: bytes, c: bytes) -> bytes:
+    """`flip` rebuilds an A cell inside an if; `main` runs it on A(5)."""
+    return TAGS + (b"fn flip(v: S, c: Bool) : S @v = match v with | A(d, x) => " + arm
+                   + b" | B(d, x, y) => B@d(x, y) end;\n"
+                   b"fn main(free: Free) : Res = match free with | End => Fail "
+                   b"| More(c, rest) => rd(flip(A@c(5), " + c + b"), rest) end;\n")
+
+
+class CellsLeavingAndTagsAtJoins(unittest.TestCase):
+    """Lemma 6.2's window must close when a cell's capability leaves the function,
+    and what is known about a cell's tag must not leak from one arm into the next.
+    Translation correctness. Found by reading the lowerer, then confirmed on silicon."""
+
+    FILL = PRE + b"fn fill(c: Diamond, t: List) : List = Cons@c(7, t);\n" + SUM
+
+    def _fill_program(self, arm: bytes) -> bytes:
+        return self.FILL + (b"fn f(l: List) : List = match l with | Cons(d, h, t) => " + arm
+                            + b" | Nil => Nil end;\n"
+                            b"fn main(free: Free) : Res = match free with | End => Fail "
+                            b"| More(a, r1) => sum(f(Cons@a(5, Nil)), 0, r1) end;\n")
+
+    def test_a_scalar_read_after_its_cell_leaves_is_never_stale(self):
+        """`fill` overwrites h's home, so reading h from the cell afterwards is wrong:
+        the answer is 12, and the stale read gave 14. Failing fast is also sound."""
+        source = self._fill_program(b"match fill(d, t) with "
+                                    b"| Cons(e, h2, t2) => Cons@e(+(h, h2), t2) | Nil => Nil end")
+        try:
+            got = run(source)
+        except FailFast as failure:
+            self.assertIn("erased", str(failure))
+        else:
+            self.assertEqual(got, 12)
+
+    def test_a_copy_taken_before_the_cell_leaves_is_correct(self):
+        """The control, and what the failure message advises: copy h out first."""
+        source = self._fill_program(b"let k = +(h, 0) in match fill(d, t) with "
+                                    b"| Cons(e, h2, t2) => Cons@e(+(k, h2), t2) | Nil => Nil end")
+        self.assertEqual(run(source), 12)
+
+    def test_a_linear_field_used_after_its_cell_leaves_is_evacuated(self):
+        """`put` overwrites t's home with 8, so a stale t is the pointer 8."""
+        source = PRE + SUM + (
+            b"fn put(c: Diamond) : Q = Q@c(7, 8);\n"
+            b"fn g(l: List, free: Free) : Res = match l with "
+            b"| Cons(d, h, t) => match put(d) with Q(e, a, b) => sum(Cons@e(a, t), 0, free) end "
+            b"| Nil => match free with End => Fail | More(d, rest) => Done@d(0, rest) end end;\n"
+            b"fn main(r0: Free) : Res = match r0 with | End => Fail | More(a, r1) => "
+            b"match r1 with | End => Done@a(0, End) "
+            b"| More(b, r2) => g(Cons@a(5, Cons@b(6, Nil)), r2) end end;\n")
+        self.assertEqual(run(source), 7 + 6)
+
+    def test_each_arm_writes_the_tag_it_needs(self):
+        """The then arm wrote B's tag, and the else arm took that for its own."""
+        arm = b"if c then B@d(x, 1) else B@d(x, 2)"
+        self.assertEqual(run(flip(arm, b"false")), 2002)
+        self.assertEqual(run(flip(arm, b"true")), 2001)
+
+    def test_a_tag_known_before_the_if_still_needs_no_write(self):
+        """The control: the else arm rebuilds the A it matched, so its tag is
+        unchanged on that path and STAY applies. Only the then arm writes a tag."""
+        source = flip(b"if c then B@d(x, 1) else A@d(x)", b"false")
+        tags = [line for line in body(source, "flip") if line.startswith("mov byte [rdi]")]
+        self.assertEqual(len(tags), 1, tags)
+        self.assertEqual(run(source), 1005)
+        self.assertEqual(run(source.replace(b"A@c(5), false", b"A@c(5), true")), 2001)
+
+
 class PhantomConstruction(unittest.TestCase):
     """Theorem 7.4 (translation correctness)."""
 
