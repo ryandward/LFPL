@@ -1944,6 +1944,17 @@ class Lower(Stage):
         leaving = frozenset(
             self._resolve(m[3]) for m in arguments
             if self._b(self._resolve(m[3])).flags & (F_LINEAR | F_TEMP))
+        # Lemma 6.2: a cell whose capability goes to the callee may be written
+        # there, so its stale-read window closes before the call, as a rebuild
+        # here would close it. Fields still owed a read leave the cell now (into
+        # registers the call keeps), and the rest are erased. The arguments are
+        # read by the moves below, before the call, so they stay where they are.
+        sources = frozenset(self._resolve(m[3]) for m in arguments)
+        self.lock_base = self.locked = mask
+        for index in sources:
+            if self._b(index).flags & F_LINEAR:
+                self._close_stale_window(index, keep=sources)
+        self.lock_base = self.locked = 0
         moved = self._evacuation_moves(mask, leaving)
         self.lock_base = params
         self.locked = params
