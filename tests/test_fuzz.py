@@ -3,14 +3,17 @@
 Each generator builds a program text and, alongside it, computes the answer from
 the language's meaning, without any part of the compiler. Translation correctness
 is judged by running the binary. Every program also runs with the register and
-cell partition checks on, and through the independent validator.
+cell partition checks on, through the redundancy validator, and through the symbolic
+check of meaning, which has to agree with the binary without running it.
 
-FailFast is a legal outcome for a program that really needs it, so it is counted
-and bounded rather than treated as a pass: a generator whose programs mostly get
-rejected would prove nothing.
+A declared limit is a legal outcome for a program that really hits it, so each is
+counted by rule and bounded: a generator whose programs mostly get rejected would
+prove nothing. Any other rejection means the lowerer reached a state it has no rule
+for, and that fails the campaign.
 
 Set LFPL_FUZZ to raise the number of programs per generator.
 """
+import collections
 import os
 import random
 import sys
@@ -20,6 +23,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.lower import FailFast, build_and_run, compile_source, occupancy_bound  # noqa: E402
+from src.symcheck import check_translation  # noqa: E402
 from src.validate import validate  # noqa: E402
 
 COUNT = int(os.environ.get("LFPL_FUZZ", "60"))
@@ -280,6 +284,18 @@ fn weigh(l: List, n: Int64, acc: Int64, free: Free) : Res = match l with
 """
 
 
+def take_cells(cells: list, body: str) -> str:
+    """Fetch these cells from free list r0, leaving the rest in r<len(cells)>. Running
+    out must hand back the cells already taken, because nothing can be dropped."""
+    for i in reversed(range(len(cells))):
+        held = "End"
+        for cell in cells[1:i]:
+            held = f"More@{cell}({held})"
+        fail = "Fail" if i == 0 else f"Done@{cells[0]}(0, {held})"
+        body = f"match r{i} with End => {fail} | More({cells[i]}, r{i + 1}) => {body} end"
+    return body
+
+
 def list_program(rng: random.Random) -> tuple[bytes, int]:
     """TRMC, in-place reversal, and giving every cell back."""
     mask = (1 << 64) - 1
@@ -306,16 +322,7 @@ def list_program(rng: random.Random) -> tuple[bytes, int]:
             expression = f"rev({expression}, Nil)"
             state = state[::-1]
     expected = sum(x * (i + 1) for i, x in enumerate(state)) & mask
-    last = f"r{len(items)}"
-    body = f"weigh({expression}, 1, 0, {last})"
-    # Running out of cells must hand back the ones already taken, so each early
-    # exit builds a Done from what it holds. Nothing can simply be dropped.
-    for i in reversed(range(len(items))):
-        held = "End"
-        for cell in cells[1:i]:
-            held = f"More@{cell}({held})"
-        fail = "Fail" if i == 0 else f"Done@c0(0, {held})"
-        body = f"match r{i} with End => {fail} | More(c{i}, r{i + 1}) => {body} end"
+    body = take_cells(cells, f"weigh({expression}, 1, 0, r{len(cells)})")
     return (LISTS + f"fn main(r0: Free) : Res = {body};\n").encode(), expected
 
 
@@ -554,36 +561,145 @@ def tree_program(rng: random.Random) -> tuple[bytes, int]:
             v, first, second = state
             if first is not None:
                 state = ((first[0] + v) & mask, (1, first[1], first[2]), second)
-    body = f"walk({expression}, Empty, 0, r{len(cells)})"
-    # Running out of cells must hand back the ones already taken: nothing drops.
-    for i in reversed(range(len(cells))):
-        held = "End"
-        for cell in cells[1:i]:
-            held = f"More@{cell}({held})"
-        fail = "Fail" if i == 0 else f"Done@c0(0, {held})"
-        body = f"match r{i} with End => {fail} | More(c{i}, r{i + 1}) => {body} end"
+    body = take_cells(cells, f"walk({expression}, Empty, 0, r{len(cells)})")
     return (TREES + f"fn main(r0: Free) : Res = {body};\n").encode(), fold(state, 0)
+
+
+DIAMONDS = """data Free = End | More(next: Free);
+data Res = Fail | Done(value: Int64, rest: Free);
+data List = Nil | Cons(h: Int64, t: List);
+fn mk(c: Diamond, k: Int64, t: List) : List = Cons@c(k, t);
+fn one(c: Diamond, k: Int64) : List = Cons@c(k, Nil);
+fn rev(l: List, acc: List) : List = match l with
+  | Nil => acc | Cons(d, h, t) => rev(t, Cons@d(h, acc)) end;
+fn weigh(l: List, n: Int64, acc: Int64, free: Free) : Res = match l with
+  | Cons(d, h, t) => weigh(t, +(n, 1), +(acc, *(h, n)), More@d(free))
+  | Nil => match free with End => Fail | More(d, rest) => Done@d(acc, rest) end end;
+"""
+
+
+def diamond_call_program(rng: random.Random) -> tuple[bytes, int]:
+    """A matched cell's diamond passed to a call, so the callee writes a cell whose
+    fields this function may still want. Reading a scalar after that without a copy
+    is a declared limit; the rest must give the right answer."""
+    mask = (1 << 64) - 1
+    k = rng.randrange(1 << 16)
+    templates = [
+        # A copy made before the call survives it.
+        (f"let s = +(h, 0) in match mk(d, {k}, t) with "
+         f"| Cons(e, h2, t2) => Cons@e(+(s, h2), t2) | Nil => Nil end",
+         lambda h, tail: [(h + k) & mask] + tail),
+        # A scalar passed as an argument is read before the callee runs.
+        (f"mk(d, +(h, {k}), t)", lambda h, tail: [(h + k) & mask] + tail),
+        (f"let r = mk(d, +(h, {k}), t) in r", lambda h, tail: [(h + k) & mask] + tail),
+        (f"let c = d in let r = mk(c, h, t) in r", lambda h, tail: [h] + tail),
+        # A linear field used after the call has to leave the cell first.
+        (f"rev(one(d, {k}), t)", lambda h, tail: [k] + tail),
+        (f"let m = one(d, h) in rev(m, t)", lambda h, tail: [h] + tail),
+        # A read an enclosing frame deferred has to survive the inner call.
+        (f"let m = one(d, {k}) in rev(m, t)", lambda h, tail: [k] + tail),
+    ]
+    items = [rng.randrange(1 << 32) for _ in range(rng.randrange(1, 6))]
+    if rng.random() < 0.15:
+        # No copy: h is erased at the call, so this must stop, and never print a guess.
+        text = (f"match mk(d, {k}, t) with "
+                f"| Cons(e, h2, t2) => Cons@e(+(h, h2), t2) | Nil => Nil end")
+        action = None
+    else:
+        text, action = rng.choice(templates)
+    chain = "Nil"
+    cells = [f"c{i}" for i in range(len(items))]
+    for cell, item in zip(reversed(cells), reversed(items)):
+        chain = f"Cons@{cell}({item}, {chain})"
+    state = action(items[0], items[1:]) if action is not None else []
+    expected = sum(x * (i + 1) for i, x in enumerate(state)) & mask
+    source = (DIAMONDS + f"fn f(l: List) : List = match l with "
+              f"| Cons(d, h, t) => {text} | Nil => Nil end;\n"
+              f"fn main(r0: Free) : Res = "
+              f"{take_cells(cells, f'weigh(f({chain}), 1, 0, r{len(cells)})')};\n")
+    return source.encode(), expected
+
+
+def tagged_if_program(rng: random.Random) -> tuple[bytes, int]:
+    """Tagged constructors built in both arms of an `if`, so each arm has to write or
+    keep the tag for itself, whatever the arm before it did."""
+    mask32, mask16, mask8 = (1 << 32) - 1, (1 << 16) - 1, 255
+    k32, k16, k8 = rng.randrange(1 << 20), rng.randrange(1 << 16), rng.randrange(256)
+    table = {
+        "A(d, x)": [("A@d(x)", lambda s: ("A", s[1])),
+                    (f"A@d(+(x, {k32}))", lambda s: ("A", (s[1] + k32) & mask32)),
+                    (f"B@d(x, {k16})", lambda s: ("B", s[1], k16)),
+                    (f"B@d(+(x, 1), {k16})", lambda s: ("B", (s[1] + 1) & mask32, k16)),
+                    (f"C@d({k8})", lambda s: ("C", k8)), ("D@d()", lambda s: ("D",))],
+        "B(d, x, y)": [("B@d(x, y)", lambda s: s),
+                       ("B@d(x, +(y, 1))", lambda s: ("B", s[1], (s[2] + 1) & mask16)),
+                       ("A@d(x)", lambda s: ("A", s[1])),
+                       (f"A@d(+(x, {k32}))", lambda s: ("A", (s[1] + k32) & mask32)),
+                       (f"C@d({k8})", lambda s: ("C", k8)), ("D@d()", lambda s: ("D",))],
+        "C(d, w)": [("C@d(w)", lambda s: s),
+                    ("C@d(+(w, 1))", lambda s: ("C", (s[1] + 1) & mask8)),
+                    (f"A@d({k32})", lambda s: ("A", k32)),
+                    (f"B@d({k32}, {k16})", lambda s: ("B", k32, k16)), ("D@d()", lambda s: ("D",))],
+        "D(d)": [("D@d()", lambda s: s), (f"A@d({k32})", lambda s: ("A", k32)),
+                 (f"B@d({k32}, {k16})", lambda s: ("B", k32, k16)),
+                 (f"C@d({k8})", lambda s: ("C", k8))],
+    }
+    state = rng.choice((("A", rng.randrange(1 << 20)),
+                        ("B", rng.randrange(1 << 20), rng.randrange(1 << 16)),
+                        ("C", rng.randrange(256)), ("D",)))
+    start = {"A": lambda s: f"A@c({s[1]})", "B": lambda s: f"B@c({s[1]}, {s[2]})",
+             "C": lambda s: f"C@c({s[1]})", "D": lambda s: "D@c()"}[state[0]](state)
+    functions, calls = [], start
+    for step in range(rng.randrange(1, 4)):
+        p, q = rng.random() < 0.5, rng.random() < 0.5
+        arms, chosen = [], {}
+        for pattern, options in table.items():
+            first, second, third = (rng.choice(options) for _ in range(3))
+            if rng.random() < 0.3:
+                text = f"if p then {first[0]} else if q then {second[0]} else {third[0]}"
+                taken = first if p else second if q else third
+            else:
+                text = f"if p then {first[0]} else {second[0]}"
+                taken = first if p else second
+            arms.append(f"{pattern} => {text}")
+            chosen[pattern[0]] = taken[1]
+        rng.shuffle(arms)
+        functions.append(f"fn s{step}(v: S, p: Bool, q: Bool) : S @v = match v with "
+                         + " | ".join(arms) + " end;")
+        calls = f"s{step}({calls}, {str(p).lower()}, {str(q).lower()})"
+        state = chosen[state[0]](state)
+    expected = {"A": lambda s: 1000000 + s[1], "B": lambda s: 2000000 + s[1] + s[2] * 3,
+                "C": lambda s: 3000000 + s[1], "D": lambda s: 4000000}[state[0]](state)
+    main = ("fn main(free: Free) : Res = match free with End => Fail | More(c, rest) => "
+            f"rd({calls}, rest) end;")
+    return (TAGGED + "\n".join(functions) + "\n" + main + "\n").encode(), expected
 
 
 class Differential(unittest.TestCase):
     def _campaign(self, generator, seed: int, *, min_compiled: float = 0.7) -> None:
         rng = random.Random(seed + 1000 * SEED)
-        compiled = rejected = 0
+        compiled = 0
+        limits: collections.Counter = collections.Counter()
         with tempfile.TemporaryDirectory() as workdir:
             for index in range(COUNT):
                 source, expected = generator(rng)
                 try:
                     asm = compile_checked(source)
-                except FailFast:
-                    rejected += 1
+                except FailFast as failure:
+                    self.assertIsNotNone(failure.limit, f"not a declared limit: {failure}\n"
+                                                         f"{source.decode()}")
+                    limits[failure.limit] += 1
                     continue
                 self.assertEqual(validate(asm), [], source.decode())
+                self.assertEqual([str(p) for p in check_translation(source, asm)], [],
+                                 f"#{index}\n{source.decode()}\n{asm}")
                 got = build_and_run(asm, workdir)
                 self.assertEqual(got, expected, f"#{index}\n{source.decode()}\n{asm}")
                 compiled += 1
-        print(f"{generator.__name__}: {compiled} ran, {rejected} failed fast", file=sys.stderr)
+        print(f"{generator.__name__}: {compiled} ran, stopped at limits {dict(limits)}",
+              file=sys.stderr)
         self.assertGreaterEqual(compiled, COUNT * min_compiled,
-                                f"only {compiled} compiled; {rejected} rejected")
+                                f"only {compiled} compiled; limits {dict(limits)}")
 
     def test_scalar_expressions(self):
         self._campaign(scalar_program, 1)
@@ -611,6 +727,12 @@ class Differential(unittest.TestCase):
 
     def test_nested_cells(self):
         self._campaign(tree_program, 9)
+
+    def test_diamonds_passed_to_calls(self):
+        self._campaign(diamond_call_program, 10)
+
+    def test_tagged_constructors_in_both_arms(self):
+        self._campaign(tagged_if_program, 11)
 
 
 if __name__ == "__main__":

@@ -15,13 +15,15 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.check import CheckStage  # noqa: E402
 from src.dyck import (CLOSE, K_ARM, K_FN, OPEN, DyckError, DyckValidator, Lexer,  # noqa: E402
                       Parser, ev_tag, parse_events, show_event)
-from src.lower import (FailFast, Lower, build_and_run, compile_source, compile_text,  # noqa: E402
-                       occupancy_bound, required_cells)
+from src.lower import (DECLARED_LIMITS, FailFast, Lower, build_and_run, compile_source,  # noqa: E402
+                       compile_text, file_bytes, occupancy_bound, required_cells)
 from src.ring import FStarved, Reject, Ring, Stage  # noqa: E402
 from src.tokens import (CellStore, ConservationError, Flags, Hole,  # noqa: E402
                         HomeUniquenessError, LMem, LReg, PayloadOverflow, Silicon, check_homes)
+from src.symcheck import check_translation  # noqa: E402
 from src.validate import function_body, validate  # noqa: E402
 
 PRE = b"""data Free = End | More(next: Free);
@@ -301,6 +303,17 @@ class ZeroUnchangedFieldCopies(unittest.TestCase):
         self.assertEqual(validate("    mov r10, qword [rdi]\n    mov r11, r10\n"
                                   "    mov qword [rdi], r11\n")[0].kind, "I2")
 
+    def test_a_location_named_through_a_register_dies_with_that_register(self):
+        """`[rdi+8]` names somewhere else after rdi changes, so a store there is not a
+        write-back of what the old `[rdi+8]` held."""
+        self.assertEqual(validate("    mov rax, qword [rdi+8]\n    mov rdi, rbx\n"
+                                  "    mov qword [rdi+8], rax\n"), [])
+        self.assertEqual(validate("    mov rax, qword [rdi+8]\n    add rdi, 16\n"
+                                  "    mov qword [rdi+8], rax\n"), [])
+        self.assertEqual(validate("    mov qword [rdi], rax\n    mov rdi, rcx\n"
+                                  "    mov rbx, qword [rdi]\n"), [])
+        self.assertEqual(validate("    mov rdi, qword [rdi+8]\n    mov qword [rdi+8], rdi\n"), [])
+
     def test_control_broken_lowerer_is_caught(self):
         """Disable STAY and RESTORE in the lowerer: the copies must appear, and the
         independent validator must see them. This is what the theorem rules out."""
@@ -513,20 +526,51 @@ class DepthBound(unittest.TestCase):
         padded = (b"# " + b"x" * 100000 + b"\n") * 5 + b" " * 100000 + base
         self.assertEqual(self._peak(padded), self._peak(base))
 
-    def test_python_heap_is_flat_in_source_length(self):
-        """Nothing hides O(N) in Python objects: the external measure agrees."""
-        def peak(text: bytes) -> int:
-            tracemalloc.start()
-            compile_source(text, cells=4096)
-            value = tracemalloc.get_traced_memory()[1]
-            tracemalloc.stop()
-            return value
+    @staticmethod
+    def _heap_peak(text: bytes, lexer: type = Lexer) -> int:
+        """Peak Python heap for one compile. The source itself was allocated before
+        tracing starts, so only what the stages keep counts against them."""
+        lower = Lower()
+        ring = Ring(required_cells(16), iter(text), [lexer(), Parser(16), CheckStage(), lower],
+                    lambda tag, payload: None)
+        tracemalloc.start()
+        ring.run()
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        return peak
 
-        full, _ = self._balanced(10)
-        make = "fn f(a: Int64) : Int64 = {};\nfn main() : Int64 = f(1);".format
-        small = peak(make(self._thin(10)).encode())
-        large = peak(make(full).encode())
-        self.assertLess(large, small + 64 * 1024, (small, large))
+    def _heap_sources(self) -> tuple[bytes, bytes]:
+        """Two sources of one depth, a thin one and one of roughly 100 KB."""
+        name = "a" * 15
+        make = f"fn f({name}: Int64) : Int64 = {{}};\n".format
+        full, _ = self._balanced(12)
+        return (make(self._thin(12).replace("a", name)).encode(),
+                make(full.replace("a", name).replace(", ", ",     ")).encode())
+
+    def test_python_heap_does_not_follow_source_length(self):
+        """The external measure. Nothing may hide O(N) in ordinary Python objects: the
+        allowance is a quarter of the source, which a stage keeping it would blow."""
+        small, large = self._heap_sources()
+        self.assertGreater(len(large), 90_000)
+        allowance = len(large) // 4
+        growth = self._heap_peak(large) - self._heap_peak(small)
+        self.assertLess(growth, allowance, (growth, allowance, len(large)))
+
+    def test_control_a_stage_that_buffers_the_source_fails_the_heap_test(self):
+        class Buffering(Lexer):
+            def __init__(self) -> None:
+                super().__init__()
+                self.kept = bytearray()
+
+            def fire(self, cell):
+                if cell is not None:
+                    self.kept += self.ring.store.payload(cell)[:1]
+                super().fire(cell)
+
+        small, large = self._heap_sources()
+        allowance = len(large) // 4
+        growth = self._heap_peak(large, Buffering) - self._heap_peak(small, Buffering)
+        self.assertGreaterEqual(growth, allowance, (growth, allowance, len(large)))
 
     def test_peak_grows_linearly_with_depth(self):
         peaks = []
@@ -826,6 +870,303 @@ class LinearTokens(unittest.TestCase):
         self.assertEqual(states[-1], Flags())
 
 
+class CellsGivenToCallees(unittest.TestCase):
+    """A callee owns a cell it is passed and may write it (resource safety)."""
+
+    FILL = PRE + (b"fn fill(c: Diamond, t: List) : List = Cons@c(7, t);\n"
+                  b"fn one(c: Diamond) : List = Cons@c(7, Nil);\n"
+                  b"fn rev(l: List, acc: List) : List = match l with "
+                  b"| Nil => acc | Cons(d, h, t) => rev(t, Cons@d(h, acc)) end;\n"
+                  b"fn sum(l: List, acc: Int64, free: Free) : Res = match l with "
+                  b"| Cons(d, h, t) => sum(t, +(acc, h), More@d(free)) "
+                  b"| Nil => match free with End => Fail "
+                  b"| More(d, rest) => Done@d(acc, rest) end end;\n")
+    MAIN = (b"fn main(free: Free) : Res = match free with End => Fail | More(a, r1) => "
+            b"match r1 with End => Done@a(0, End) | More(b, r2) => "
+            b"sum(f(Cons@a(5, Cons@b(6, Nil))), 0, r2) end end;")
+
+    def _program(self, body: bytes) -> bytes:
+        return self.FILL + b"fn f(l: List) : List = match l with | Cons(d, h, t) => " + body + (
+            b" | Nil => Nil end;\n") + self.MAIN
+
+    def test_a_scalar_read_after_the_call_stops_instead_of_reading_the_callees_write(self):
+        """The field's location now holds the callee's 7. This used to print 14."""
+        source = self._program(b"match fill(d, t) with "
+                               b"| Cons(e, h2, t2) => Cons@e(+(h, h2), t2) | Nil => Nil end")
+        with self.assertRaisesRegex(FailFast, "erased") as caught:
+            compile_text(source)
+        self.assertEqual(caught.exception.limit, "section 1:")
+
+    def test_a_copy_made_before_the_call_survives_it(self):
+        source = self._program(b"let k = +(h, 0) in match fill(d, t) with "
+                               b"| Cons(e, h2, t2) => Cons@e(+(k, h2), t2) | Nil => Nil end")
+        self.assertEqual(run(source), 5 + 7 + 6)
+
+    def test_a_linear_field_read_after_the_call_has_left_the_cell(self):
+        """one(d) writes [c+8], where t lives, so t has to move before the call."""
+        for body in (b"rev(one(d), t)", b"let m = one(d) in rev(m, t)"):
+            with self.subTest(body=body):
+                self.assertEqual(run(self._program(body)), 7 + 6)
+
+    def test_a_diamond_reaching_the_call_through_a_let(self):
+        source = self._program(b"let c = d in let m = one(c) in rev(m, t)")
+        self.assertEqual(run(source), 7 + 6)
+
+    def test_a_scalar_passed_to_the_same_call_needs_no_copy(self):
+        source = PRE + (b"fn fill(c: Diamond, k: Int64, t: List) : List = Cons@c(k, t);\n")
+        source += self.FILL[len(PRE):].split(b"\n", 1)[1] + (
+            b"fn f(l: List) : List = match l with "
+            b"| Cons(d, h, t) => let r = fill(d, +(h, 1), t) in r | Nil => Nil end;\n") + self.MAIN
+        self.assertEqual(run(source), 5 + 1 + 6)
+
+
+class TagWrites(unittest.TestCase):
+    """The tag is a store like any other (translation correctness)."""
+
+    FLIP = (b"data Free = End | More(next: Free);\n"
+            b"data Res = Fail | Done(value: Int64, rest: Free);\n"
+            b"data S = A(x: Int32) | B(x: Int32, y: Int16);\n"
+            b"fn flip(v: S, c: Bool) : S @v = match v with "
+            b"| A(d, x) => if c then B@d(x, 1) else B@d(x, 2) "
+            b"| B(d, x, y) => B@d(x, y) end;\n"
+            b"fn rd(s: S, free: Free) : Res = match s with "
+            b"| A(d, x) => Done@d(+(1000, pack<32>(x)), free) "
+            b"| B(d, x, y) => Done@d(+(2000, pack<16>(y)), free) end;\n")
+
+    def test_each_arm_of_an_if_writes_the_tag_for_itself(self):
+        """The first arm's write says nothing about the path through the second."""
+        for flag, expected in ((b"false", 2002), (b"true", 2001)):
+            source = self.FLIP + (b"fn main(free: Free) : Res = match free with End => Fail | "
+                                  b"More(c, rest) => rd(flip(A@c(5), %s), rest) end;" % flag)
+            with self.subTest(flag=flag):
+                self.assertEqual(run(source), expected)
+
+    def test_rebuilding_the_same_constructor_keeps_the_tag_without_a_store(self):
+        lines = body(self.FLIP + b"fn main() : Int64 = 0;", "flip")
+        self.assertEqual(len([l for l in lines if l == "mov byte [rdi], 1"]), 2, lines)
+
+    def test_a_tag_write_does_not_corrupt_a_field_still_owed_at_offset_zero(self):
+        """Found by the symbolic check, in programs whose result never showed it: the
+        tag landed on the free list's next pointer before that pointer was moved out."""
+        source = (b"data Free = End | More(next: Free);\n"
+                  b"data Res = Fail | Done(value: Int64, rest: Free);\n"
+                  b"data S = D | E(k: Int8) | G;\n"
+                  b"fn count(f: Free, n: Int64, s: S, back: Free) : Res = match f with "
+                  b"| More(d, rest) => count(rest, +(n, 1), s, More@d(back)) "
+                  b"| End => match s with D(c) => Done@c(n, back) "
+                  b"| E(c, k) => Done@c(n, back) | G(c) => Done@c(n, back) end end;\n"
+                  b"fn main(free: Free) : Res = match free with End => Fail | "
+                  b"More(c, rest) => count(rest, 0, D@c(), End) end;")
+        self.assertEqual(run(source), 1023)
+
+
+class MeaningCheck(unittest.TestCase):
+    """`symcheck` against assembly written by hand, so it is not tied to one emitter."""
+
+    SOURCE = PRE + b"fn u(p: P, v: Int32) : P @p = { p with y = if <(v, 9) then 1 else 2 };\n"
+
+    def _check(self, source: bytes, body_text: str) -> list:
+        return check_translation(source, "fn_u_body:\n" + body_text)
+
+    def test_two_shapes_of_one_meaning_both_pass(self):
+        """Stores in each arm, or one store of a register merged at the join: the merge
+        rule makes these the same value, however the code reached it."""
+        arms = ("    mov rax, rdi\n    cmp esi, 9\n    jae L2\n    mov dword [rdi+4], 1\n"
+                "    jmp L3\nL2:\n    mov dword [rdi+4], 2\nL3:\n    ret\n")
+        joined = ("    mov rax, rdi\n    cmp esi, 9\n    jae L2\n    mov r10d, 1\n    jmp L3\n"
+                  "L2:\n    mov r10d, 2\nL3:\n    mov dword [rdi+4], r10d\n    ret\n")
+        self.assertEqual(self._check(self.SOURCE, arms), [])
+        self.assertEqual(self._check(self.SOURCE, joined), [])
+
+    def test_a_store_missing_from_one_arm_is_found_and_named(self):
+        """validate.py passes this: there is no redundant move in it, only a lost one."""
+        lost = ("    mov rax, rdi\n    cmp esi, 9\n    jae L2\n    mov dword [rdi+4], 1\n"
+                "    jmp L3\nL2:\nL3:\n    ret\n")
+        self.assertEqual(validate(lost), [])
+        problems = self._check(self.SOURCE, lost)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("arg0", problems[0].detail)
+
+    def test_swapped_arms_are_found(self):
+        swapped = ("    mov rax, rdi\n    cmp esi, 9\n    jae L2\n    mov dword [rdi+4], 2\n"
+                   "    jmp L3\nL2:\n    mov dword [rdi+4], 1\nL3:\n    ret\n")
+        self.assertTrue(self._check(self.SOURCE, swapped))
+
+    def test_a_field_written_with_the_wrong_value_in_a_straight_line(self):
+        source = PRE + b"fn u(p: P, v: Int32) : P @p = { p with y = v };\n"
+        self.assertEqual(self._check(source, "    mov rax, rdi\n    mov dword [rdi+4], esi\n    ret\n"), [])
+        problems = self._check(source, "    mov rax, rdi\n    mov dword [rdi+4], 3\n    ret\n")
+        self.assertIn("field +4 holds 3, the source says arg1", problems[0].detail)
+        problems = self._check(source, "    mov rax, rdi\n    mov dword [rdi+0], esi\n    ret\n")
+        self.assertTrue(problems)
+
+    def test_a_store_into_the_wrong_cell_is_found(self):
+        source = PRE + b"fn u(p: P, q: P, v: Int32) : P @p = { p with y = v };\n"
+        problems = check_translation(source, "fn_u_body:\n    mov rax, rdi\n"
+                                             "    mov dword [rsi+4], edx\n    ret\n")
+        self.assertTrue(problems)
+
+    def test_it_imports_nothing_from_the_compiler(self):
+        import ast
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "src", "symcheck.py")
+        with open(path) as handle:
+            tree = ast.parse(handle.read())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported |= {alias.name for alias in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0, "a relative import reaches into the compiler")
+                imported.add(node.module)
+        self.assertLessEqual(imported, {"__future__", "dataclasses", "re", "sys", "typing"})
+
+    def test_it_stays_clean_on_the_examples(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for name in ("inc.lfpl", "sum.lfpl"):
+            with open(os.path.join(root, "examples", name), "rb") as handle:
+                source = handle.read()
+            self.assertEqual(check_translation(source, compile_text(source)), [])
+
+    # A broken compiler, one line at a time. Each mutant is a real bug, most of them
+    # ones this project actually shipped for a while. The check has to find every one
+    # without running the binary.
+    Q_READ = (b"fn hi(q: Q, free: Free) : Res = match q with Q(d, a, b) => "
+              b"Done@d(+(a, b), free) end;\n")
+    TAGS = (b"data Free = End | More(next: Free);\n"
+            b"data Res = Fail | Done(value: Int64, rest: Free);\n"
+            b"data S = A(x: Int32) | B(x: Int32, y: Int16);\n"
+            b"fn flip(v: S, c: Bool) : S @v = match v with "
+            b"| A(d, x) => if c then B@d(x, 1) else B@d(x, 2) | B(d, x, y) => B@d(x, y) end;\n")
+    H = b"fn h(x: Int64, y: Int64) : Int64 = +(*(x, 3), y);\n"
+    MUTANTS = [
+        ("a join trusts its last arm's word",
+         "return first if first == second else 0", "return second",
+         PRE + b"fn u(p: P) : P @p = match p with P(d, x, y, z) => "
+               b"P@d(x, y, if <(z, 0) then 7 else z) end;\n", True),
+        ("a literal is taken for a provenance word",
+         "return 0 if b.loc == L_IMM else b.word", "return b.word",
+         PRE + b"fn u(q: Q) : Q @q = match q with Q(d, a, b) => let k = 3 in Q@d(k, b) end;\n",
+         True),
+        ("every store is elided",
+         "return word != 0 and word == self._word_at(dest[1], dest[2], dest[3])", "return True",
+         PRE + b"fn u(q: Q) : Q @q = match q with Q(d, a, b) => Q@d(b, a) end;\n", True),
+        ("a deferred read is not evacuated",
+         "if index not in deferred:\n                    continue", "continue",
+         PRE + b"data Box;\nrecord B { p: Int64, c: Box };\n"
+               b"record Box { n: Int64, m: Int64 };\n"
+               b"fn f(z: Box, y: Box) : B = match z with Box(e, u, w) => "
+               b"match y with Box(d, v, x) => B@e(+(u, v), Box@d(1, x)) end end;\n", False),
+        ("the back-edge forgets the root",
+         'if fr.b1 and self.root >= 0:\n            moves = moves + [[("r", RAX), E_BIND, 0, self.root]]',
+         "if False:\n            pass",
+         PRE + H.replace(b"h(", b"g(") + b"fn dbl(l: List) : List @l = match l with | Nil => Nil "
+               b"| Cons(d, x, t) => Cons@d(g(x, 1), dbl(t)) end;\n", False),
+        ("an operand is not locked across its partner's spill",
+         "            self.locked |= 1 << b.r\n            return (O_REG, b.r, 8)",
+         "            return (O_REG, b.r, 8)",
+         PRE + H + b"fn s2(q: Q) : Q @q = match q with Q(d, a, b) => "
+               b"let t0 = h(b, b) in let t1 = h(b, b) in let t2 = +(a, t0) in "
+               b"let t3 = h(t1, t2) in let t4 = h(t1, t0) in let t5 = h(a, t0) in "
+               b"let t6 = h(t1, t1) in let t7 = +(t5, t5) in let t8 = h(t3, t6) in "
+               b"let t9 = +(t5, t8) in let t10 = +(t4, b) in let t11 = +(t2, t2) in "
+               b"let t12 = +(t11, t2) in let t13 = +(t6, t7) in let t14 = +(t3, t1) in "
+               b"Q@d(t0, t6) end;\n", False),
+        ("the first arm's tag write is trusted by the second",
+         "            self.i(\"mov\", (O_MEM, self._base(cell), 0, 1), (O_IMM, tag))\n",
+         "            self.i(\"mov\", (O_MEM, self._base(cell), 0, 1), (O_IMM, tag))\n"
+         "            b = self._b(cell)\n            b.aux = tag + 1\n            self._set_b(cell, b)\n",
+         TAGS, True),
+        ("a tag is never written",
+         "if tagged and self._b(cell).aux != tag + 1:", "if False:", TAGS, True),
+        ("the tag lands before the field under it has left",
+         "        self._close_stale_window(cell, keep)\n        self._write_tag(cell, fr.b1, fr.b2)\n",
+         "        self._write_tag(cell, fr.b1, fr.b2)\n        self._close_stale_window(cell, keep)\n",
+         b"data Free = End | More(next: Free);\n"
+         b"data Res = Fail | Done(value: Int64, rest: Free);\ndata S = D | E(k: Int8) | G;\n"
+         b"fn take(s: S, f: Free) : Res = match s with D(c) => Done@c(1, f) "
+         b"| E(c, k) => Done@c(2, f) | G(c) => Done@c(3, f) end;\n"
+         b"fn u(f: Free) : Res = match f with End => Fail | More(c, r) => take(D@c(), r) end;\n",
+         False),
+        ("a cell given to a callee keeps its stale window open",
+         "        for index in passed:\n            self._close_stale_window(index, passed)\n", "",
+         PRE + b"fn one(c: Diamond) : List = Cons@c(7, Nil);\n"
+               b"fn rev(l: List, acc: List) : List = match l with "
+               b"| Nil => acc | Cons(d, h, t) => rev(t, Cons@d(h, acc)) end;\n"
+               b"fn f(l: List) : List = match l with "
+               b"| Cons(d, h, t) => let m = one(d) in rev(m, t) | Nil => Nil end;\n", True),
+        ("registers a call clobbers are not evacuated",
+         "moved = self._evacuation_moves(mask, leaving)", "moved = []",
+         # The callee has to really write rdi, or leaving a value there would be correct.
+         b"fn dec(x: Int64, y: Int64) : Int64 = if ==(x, 0) then y else dec(-(x, 1), y);\n"
+         b"fn f(a: Int64, b: Int64) : Int64 = let t = dec(a, b) in +(t, a);\n", False),
+        ("a comparison branches the wrong way",
+         "self._hold_flags(cc, dest.x, dest.y)", "self._hold_flags(CC.index(NEGATED[CC[cc]]), dest.x, dest.y)",
+         b"fn f(a: Int64, b: Int64) : Int64 = if <(a, b) then 1 else 2;\n", False),
+        ("subtraction becomes addition",
+         "        op = OP_NAMES[fr.b1]\n        second = self._second_value(fr)",
+         "        op = OP_NAMES[fr.b1].replace(\"sub\", \"add\")\n        second = self._second_value(fr)",
+         b"fn f(a: Int64, b: Int64) : Int64 = let c = -(a, b) in c;\n", False),
+        ("a call is silently dropped",
+         "        self._raw_name(\"call_name\", name)\n        self._forget_registers()\n",
+         "        self._forget_registers()\n",
+         H + b"fn f(a: Int64) : Int64 = let t = h(a, 1) in t;\n", False),
+        ("a join leaves values where the arm put them",
+         "        if fr.dk != D_COND and not self.dead:\n            self._normalize(bytes(fr.tail))\n"
+         "            self._goto(fr.l3)\n",
+         "        if fr.dk != D_COND and not self.dead:\n            self._goto(fr.l3)\n",
+         H + b"fn f(a: Int64, b: Int64) : Int64 = let x = +(a, 1) in "
+             b"let y = if <(a, b) then h(x, b) else +(x, 2) in +(+(x, y), b);\n", False),
+    ]
+
+    def _mutant_asm(self, old: str, new: str, source: bytes) -> str:
+        """Compile with one line of the lowerer changed, in a separate process."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "src", "lower.py")) as handle:
+            text = handle.read()
+        self.assertIn(old, text, "this mutant no longer applies to the lowerer")
+        with tempfile.TemporaryDirectory() as workdir:
+            import shutil
+            shutil.copytree(os.path.join(root, "src"), os.path.join(workdir, "src"))
+            with open(os.path.join(workdir, "src", "lower.py"), "w") as handle:
+                handle.write(text.replace(old, new))
+            program = os.path.join(workdir, "p.lfpl")
+            with open(program, "wb") as handle:
+                handle.write(source)
+            done = subprocess.run([sys.executable, "-m", "src.lower", program], cwd=workdir,
+                                  capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout
+
+    def test_every_mutant_is_found_without_running_it(self):
+        for name, old, new, source, blind in self.MUTANTS:
+            with self.subTest(mutant=name):
+                self.assertEqual(check_translation(source, compile_text(source)), [],
+                                 "the unbroken compiler must pass, or this proves nothing")
+                asm = self._mutant_asm(old, new, source)
+                self.assertTrue(check_translation(source, asm), asm)
+
+    def test_the_redundancy_validator_is_blind_to_lost_stores(self):
+        """Why this check exists: these mutants lose or misplace a store, and validate.py
+        has nothing to say about any of them."""
+        for name, old, new, source, blind in self.MUTANTS:
+            if blind:
+                with self.subTest(mutant=name):
+                    self.assertEqual(validate(self._mutant_asm(old, new, source)), [])
+
+
+class DeclaredLimits(unittest.TestCase):
+    def test_each_limit_is_recognized_and_an_internal_state_is_not(self):
+        deep = "a"
+        for i in range(20):
+            deep = f"+(+(a, {i}), {deep})"
+        with self.assertRaises(FailFast) as caught:
+            compile_text(f"fn f(a: Int64) : Int64 = {deep};".encode())
+        self.assertEqual(caught.exception.limit, "register starvation")
+        self.assertIsNone(FailFast("a variable has no rule for this destination", "", "", "").limit)
+        self.assertTrue(all(isinstance(key, str) and key for key in DECLARED_LIMITS))
+
+
 class Horner(unittest.TestCase):
     """Section 4.5's worked example, exactly (translation correctness)."""
 
@@ -864,6 +1205,44 @@ class Horner(unittest.TestCase):
                         b"fn main(free: Free) : Res = match free with End => Fail | "
                         b"More(c, rest) => w(P@c(1, 2, 3), rest) end;")
         self.assertEqual(run(source), 1 << 32 | 2)
+
+
+class CommandLine(unittest.TestCase):
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _cli(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-m", "src.lower", *args], cwd=self.ROOT,
+                              capture_output=True, text=True)
+
+    def test_it_runs_a_program_and_prints_the_result(self):
+        done = self._cli("examples/sum.lfpl", "-r")
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "9"), done.stderr)
+
+    def test_a_rejected_program_exits_nonzero_with_the_rule(self):
+        with tempfile.NamedTemporaryFile(suffix=".lfpl") as bad:
+            bad.write(PRE + b"fn forget(l: List) : Int64 = 1;\n")
+            bad.flush()
+            done = self._cli(bad.name)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("linear variable l is never used", done.stderr)
+
+    def test_the_ring_is_fed_from_the_open_file_in_small_chunks(self):
+        class Counting:
+            def __init__(self, data: bytes):
+                self.data, self.at, self.largest = data, 0, 0
+
+            def read(self, size: int) -> bytes:
+                self.largest = max(self.largest, size)
+                block = self.data[self.at:self.at + size]
+                self.at += len(block)
+                return block
+
+        text = b"# padding\n" * 5000 + b"fn main() : Int64 = 1;"
+        handle = Counting(text)
+        ring, _ = compile_source(file_bytes(handle))
+        self.assertEqual(handle.at, len(text))
+        self.assertLessEqual(handle.largest, 4096)
+        self.assertLess(ring.peak_cells, 64)
 
 
 class Toolchain(unittest.TestCase):

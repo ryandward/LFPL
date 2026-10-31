@@ -7,10 +7,14 @@ per register and memory location. It rejects the three identity morphisms:
     I2  a load from a, then a store to a of the same word (Theorem 6.1)
     I3  a store of v to a, then a load from a while a register still holds v
 
-Words are tracked within one straight-line block, because a label is a join and
-this checker has no control flow graph. So a clean result proves the absence of
-these morphisms within blocks, which is where a lowering rule could emit them,
-and says nothing about a pair that spans a label.
+This looks for redundancy, not correctness: it never compares the code with what the
+source means, so a dropped store passes it unless it also leaves a redundant move.
+`symcheck.py` is the check of meaning.
+
+Words are tracked within one straight-line block, because a label is a join and this
+checker has no control flow graph. Locations are matched by their text, so it cannot
+see one location reached through a copied pointer. A clean result is therefore
+evidence that these morphisms are absent, not proof of it.
 """
 from __future__ import annotations
 
@@ -72,6 +76,10 @@ def function_body(asm: str, name: str) -> list[tuple[str, list[str]]]:
     return body
 
 
+def _names(location: str, register: str) -> bool:
+    return any(_REG64.get(part) == register for part in re.findall(r"\w+", location))
+
+
 def _memory(operand: str):
     match = _MEM.match(operand)
     return match.group(1).replace(" ", "") if match else None
@@ -89,6 +97,14 @@ def validate(asm: str) -> list[Violation]:
         nonlocal fresh
         fresh += 1
         return ("v", fresh)
+
+    def overwritten(register: str) -> None:
+        """`[rdi+8]` means somewhere else once rdi changes, so whatever was known
+        under that text is about a location this text no longer names."""
+        for location in [m for m in mem if _names(m, register)]:
+            del mem[location]
+        for holder in [r for r, (m, _w) in loaded_from.items() if _names(m, register)]:
+            del loaded_from[holder]
 
     for number, op, operands in instructions(asm):
         text = f"{op} {', '.join(operands)}"
@@ -112,8 +128,12 @@ def validate(asm: str) -> list[Violation]:
                 if any(holder != reg and value == word and value[0] == "stored"
                        for holder, value in regs.items()):
                     found.append(Violation("I3", number, text))
+                overwritten(reg)
                 regs[reg] = word
-                loaded_from[reg] = (source_mem, word)
+                if not _names(source_mem, reg):
+                    loaded_from[reg] = (source_mem, word)
+                else:
+                    loaded_from.pop(reg, None)
             elif dest_mem is not None and source in _REG64:
                 reg = _REG64[source]
                 word = regs.get(reg)
@@ -131,18 +151,21 @@ def validate(asm: str) -> list[Violation]:
             elif dest in _REG64 and _REG64[dest] == dest and _REG64.get(source) == source:
                 # Only a full 64-bit copy keeps the word. `mov r32, r32` zero-extends,
                 # which is a new value unless the upper half was already clear.
+                overwritten(dest)
                 regs[dest] = regs.get(source) or new_word()
                 if source in loaded_from:
                     loaded_from[dest] = loaded_from[source]
                 else:
                     loaded_from.pop(dest, None)
             elif dest in _REG64:
+                overwritten(_REG64[dest])
                 regs[_REG64[dest]] = new_word()
                 loaded_from.pop(_REG64[dest], None)
             continue
         if operands:
             dest = operands[0]
-            if dest in _REG64:
+            if dest in _REG64 and op not in ("cmp", "test"):
+                overwritten(_REG64[dest])
                 regs[_REG64[dest]] = new_word()
                 loaded_from.pop(_REG64[dest], None)
             elif _memory(dest) is not None and op not in ("cmp", "test"):

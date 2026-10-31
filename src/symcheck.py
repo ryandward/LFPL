@@ -1,0 +1,1392 @@
+"""Does the assembly mean what the source means? An independent symbolic check.
+
+`validate.py` only rejects redundant moves, so a dropped store passes it. This
+module compares meaning. It executes the emitted NASM symbolically, evaluates the
+source symbolically, and requires that every value leaving a function agrees: at
+each `ret`, call and tail jump, each field of every constructor that was built must
+hold what the source says it holds.
+
+It shares no code with the compiler, which a test enforces by reading the imports:
+it has its own source parser, its own layout rule and its own reading of x86. Two
+separate mistakes would have to agree for a miscompile to get through. It is a test
+oracle, not a pipeline stage, so unlike the compiler it builds whole syntax trees.
+
+Terms and joins. A value is a canonical decision diagram: comparisons at the inner
+nodes in one fixed order, and data at the leaves. Every operation distributes over
+decisions, so two values that agree under every outcome of the comparisons are the
+same object, however they were reached.
+
+The merge rule. At a label, a location that holds the same term on every incoming
+edge keeps it; otherwise it holds ite(edge condition, a, b). Because the form is
+canonical, `if c then 7 else z` in the source compares directly against a register
+that a branch filled on two paths. Within a straight-line block this is plain
+symbolic execution, and nothing is merged.
+
+What this assumes, and so cannot catch:
+  * Linearity. Distinct pointer terms are treated as distinct cells, because Check
+    guarantees it. A broken Check would not be noticed here.
+  * Callees are uninterpreted: f(x) is checked against f's meaning when f itself is
+    checked, and a recursive jump is taken to mean what the function means. That is
+    partial correctness by induction, and it says nothing about termination.
+  * Comparisons are independent propositions. That can only cause a false alarm on
+    code relying on arithmetic facts between them, never a missed mismatch.
+  * Encodings. A truncated immediate is NASM's business, not visible in the text.
+"""
+from __future__ import annotations
+
+import re
+import sys
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+MASK64 = (1 << 64) - 1
+NO_ATOM = 1 << 60
+FIELD_SIZES = {"Int8": 1, "Int16": 2, "Int32": 4, "Int64": 8, "Bool": 1}
+
+
+class TooLarge(Exception):
+    """The diagrams outgrew the budget. Reported as inconclusive, never as a pass."""
+
+
+# ------------------------------------------------------------------- terms
+
+
+class Terms:
+    """Hash-consed terms: two terms are equal exactly when their ids are equal.
+
+    Leaves: ('c', n)  ('arg', i, size)  ('load', ptr, off, size)
+            ('op', add|sub|imul|shl, width, x, y)  ('bit', and|or|xor, x, y)
+            ('shr', x, k)  ('trunc', width, x)  ('call', f, args, size)
+            ('struct', ctor, tag, cell, ((off, size, leaf), ...))
+            ('setl', width, old, low)  ('undef', why)
+    Decisions: ('ite', atom, hi, lo), where an atom is ('lt', x, y) or ('eq', x, y).
+    Values are in unsigned integer terms, so a width only matters where it wraps.
+    """
+
+    def __init__(self, budget: int = 400_000):
+        self.ids: dict[tuple, int] = {}
+        self.nodes: list[tuple] = []
+        self.budget = budget
+        self.select_memo: dict[tuple, int] = {}
+        self.lift_memo: dict[tuple, int] = {}
+        self.ZERO = self.const(0)
+        self.ONE = self.const(1)
+
+    def intern(self, node: tuple) -> int:
+        found = self.ids.get(node)
+        if found is None:
+            found = len(self.nodes)
+            if found >= self.budget:
+                raise TooLarge(f"more than {self.budget} terms")
+            self.nodes.append(node)
+            self.ids[node] = found
+        return found
+
+    def const(self, value: int) -> int:
+        return self.intern(("c", value & MASK64))
+
+    def undef(self, why: str) -> int:
+        return self.intern(("undef", why))
+
+    def is_const(self, term: int) -> bool:
+        return self.nodes[term][0] == "c"
+
+    def value(self, term: int) -> int:
+        return self.nodes[term][1]
+
+    # --- decisions
+
+    def top(self, term: int) -> int:
+        node = self.nodes[term]
+        return node[1] if node[0] == "ite" else NO_ATOM
+
+    def cof(self, term: int, atom: int, outcome: bool) -> int:
+        node = self.nodes[term]
+        if node[0] == "ite" and node[1] == atom:
+            return node[2] if outcome else node[3]
+        return term
+
+    def _node(self, atom: int, hi: int, lo: int) -> int:
+        return hi if hi == lo else self.intern(("ite", atom, hi, lo))
+
+    def select(self, cond: int, a: int, b: int) -> int:
+        """ite(cond, a, b), canonical. This is the whole of the merge rule."""
+        if cond == self.ONE or a == b:
+            return a
+        if cond == self.ZERO:
+            return b
+        key = (cond, a, b)
+        found = self.select_memo.get(key)
+        if found is not None:
+            return found
+        atom = min(self.top(cond), self.top(a), self.top(b))
+        result = self._node(
+            atom,
+            self.select(self.cof(cond, atom, True), self.cof(a, atom, True), self.cof(b, atom, True)),
+            self.select(self.cof(cond, atom, False), self.cof(a, atom, False), self.cof(b, atom, False)))
+        self.select_memo[key] = result
+        return result
+
+    def neg(self, cond: int) -> int:
+        return self.select(cond, self.ZERO, self.ONE)
+
+    def both(self, a: int, b: int) -> int:
+        return self.select(a, b, self.ZERO)
+
+    def either(self, a: int, b: int) -> int:
+        return self.select(a, self.ONE, b)
+
+    def lift(self, fn: Callable[..., int], *terms: int, key: Optional[tuple] = None) -> int:
+        """Apply fn to leaves, distributing over every decision in its arguments.
+        fn may itself return a decision, so results are rebuilt through select."""
+        if not terms:
+            return fn()
+        memo_key = None
+        if key is not None:
+            memo_key = (key, terms)
+            found = self.lift_memo.get(memo_key)
+            if found is not None:
+                return found
+        atom = min(self.top(t) for t in terms)
+        if atom == NO_ATOM:
+            result = fn(*terms)
+        else:
+            hi = self.lift(fn, *(self.cof(t, atom, True) for t in terms), key=key)
+            lo = self.lift(fn, *(self.cof(t, atom, False) for t in terms), key=key)
+            result = self.select(self._node(atom, self.ONE, self.ZERO), hi, lo)
+        if memo_key is not None:
+            self.lift_memo[memo_key] = result
+        return result
+
+    def paths(self, term: int) -> list[tuple[int, int]]:
+        """(condition, leaf) for each leaf of a value."""
+        node = self.nodes[term]
+        if node[0] != "ite":
+            return [(self.ONE, term)]
+        test = self._node(node[1], self.ONE, self.ZERO)
+        found = [(self.both(test, c), leaf) for c, leaf in self.paths(node[2])]
+        found += [(self.both(self.neg(test), c), leaf) for c, leaf in self.paths(node[3])]
+        return found
+
+    # --- data leaves
+
+    def width(self, term: int) -> int:
+        node = self.nodes[term]
+        kind = node[0]
+        if kind == "c":
+            value = node[1]
+            return 1 if value < 1 << 8 else 2 if value < 1 << 16 else 4 if value < 1 << 32 else 8
+        if kind == "arg":
+            return node[2]
+        if kind == "load":
+            return node[3]
+        if kind == "op":
+            return node[2]
+        if kind == "trunc":
+            return node[1]
+        if kind == "call":
+            return node[3]
+        if kind == "shr":
+            return self.width(node[1])
+        if kind == "bit":
+            pair = (self.width(node[2]), self.width(node[3]))
+            return min(pair) if node[1] == "and" else max(pair)
+        return 8
+
+    def trunc(self, width: int, term: int) -> int:
+        if width >= 8 or self.width(term) <= width:
+            return term
+        node = self.nodes[term]
+        kind = node[0]
+        if kind == "c":
+            return self.const(node[1] & ((1 << 8 * width) - 1))
+        if kind == "op":  # the low bits of these depend only on the low bits
+            return self.arith(node[1], width, node[3], node[4])
+        if kind == "bit":
+            return self.bitop(node[1], self.trunc(width, node[2]), self.trunc(width, node[3]))
+        if kind == "setl" and width <= node[1]:
+            return self.trunc(width, node[3])
+        if kind == "load":  # x86-64 is little-endian: the low bytes are at the same address
+            return self.load(node[1], node[2], width)
+        if kind == "trunc":
+            return self.trunc(width, node[2])
+        return self.intern(("trunc", width, term))
+
+    def arith(self, name: str, width: int, x: int, y: int) -> int:
+        mask = (1 << 8 * width) - 1
+        x = self.trunc(width, x)
+        if name != "shl":
+            y = self.trunc(width, y)
+        if self.is_const(x) and self.is_const(y):
+            a, b = self.value(x), self.value(y)
+            table = {"add": a + b, "sub": a - b, "imul": a * b, "shl": a << b if b < 64 else 0}
+            return self.const(table[name] & mask)
+        if name in ("add", "imul") and y < x:
+            x, y = y, x
+        if (name in ("add", "sub", "shl") and y == self.ZERO) or (
+                name == "imul" and y == self.ONE):
+            return x
+        if name == "add" and x == self.ZERO:
+            return y
+        return self.intern(("op", name, width, x, y))
+
+    def bitop(self, name: str, x: int, y: int) -> int:
+        if self.is_const(x) and self.is_const(y):
+            a, b = self.value(x), self.value(y)
+            return self.const({"and": a & b, "or": a | b, "xor": a ^ b}[name])
+        if y < x:
+            x, y = y, x
+        if x == y:
+            return self.ZERO if name == "xor" else x
+        if self.ZERO in (x, y):
+            other = y if x == self.ZERO else x
+            return self.ZERO if name == "and" else other
+        return self.intern(("bit", name, x, y))
+
+    def shr(self, x: int, count: int) -> int:
+        if count == 0:
+            return x
+        if self.is_const(x):
+            return self.const(self.value(x) >> count)
+        return self.intern(("shr", x, count))
+
+    def setl(self, width: int, old: int, low: int) -> int:
+        """A write to a subregister: the low `width` bytes change, and the rest do not."""
+        return low if old == self.ZERO else self.intern(("setl", width, old, low))
+
+    def load(self, pointer: int, off: int, size: int) -> int:
+        return self.intern(("load", pointer, off, size))
+
+    def call(self, name: str, args: tuple, size: int) -> int:
+        return self.intern(("call", name, args, size))
+
+    def struct(self, ctor: str, tag: Optional[int], cell: int, fields: tuple) -> int:
+        return self.intern(("struct", ctor, tag, cell, fields))
+
+    def unchanged(self, cell: int, fields: tuple) -> bool:
+        """Every field still holds what the cell held on entry, so nothing was built."""
+        return all(leaf == self.load(cell, off, size) for off, size, leaf in fields)
+
+    def lt(self, x: int, y: int) -> int:
+        if x == y:
+            return self.ZERO
+        if self.is_const(x) and self.is_const(y):
+            return self.ONE if self.value(x) < self.value(y) else self.ZERO
+        return self._node(self.intern(("lt", x, y)), self.ONE, self.ZERO)
+
+    def eq(self, x: int, y: int) -> int:
+        if x == y:
+            return self.ONE
+        if self.is_const(x) and self.is_const(y):
+            return self.ZERO
+        if y < x:
+            x, y = y, x
+        return self._node(self.intern(("eq", x, y)), self.ONE, self.ZERO)
+
+    # --- substitution and display
+
+    def subst(self, term: int, sigma: dict, memo: dict) -> int:
+        """Replace leaves by what a path's `x == constant` atoms say they equal."""
+        if term in sigma:
+            return sigma[term]
+        found = memo.get(term)
+        if found is not None:
+            return found
+        node = self.nodes[term]
+        kind = node[0]
+        sub = lambda t: self.subst(t, sigma, memo)  # noqa: E731
+        if kind == "load":
+            result = self.load(sub(node[1]), node[2], node[3])
+        elif kind == "op":
+            result = self.arith(node[1], node[2], sub(node[3]), sub(node[4]))
+        elif kind == "bit":
+            result = self.bitop(node[1], sub(node[2]), sub(node[3]))
+        elif kind == "shr":
+            result = self.shr(sub(node[1]), node[2])
+        elif kind == "trunc":
+            result = self.trunc(node[1], sub(node[2]))
+        elif kind == "call":
+            result = self.call(node[1], tuple(sub(a) for a in node[2]), node[3])
+        elif kind == "struct":
+            result = self.struct(node[1], node[2], sub(node[3]),
+                                 tuple((o, s, sub(f)) for o, s, f in node[4]))
+        elif kind == "setl":
+            result = self.setl(node[1], sub(node[2]), sub(node[3]))
+        else:
+            result = term
+        memo[term] = result
+        return result
+
+    def show(self, term: int) -> str:
+        node = self.nodes[term]
+        kind = node[0]
+        if kind == "c":
+            return str(node[1])
+        if kind == "arg":
+            return f"arg{node[1]}"
+        if kind == "load":
+            return f"[{self.show(node[1])}+{node[2]}]"
+        if kind == "op":
+            return f"{node[1]}{node[2] * 8}({self.show(node[3])}, {self.show(node[4])})"
+        if kind == "bit":
+            return f"{node[1]}({self.show(node[2])}, {self.show(node[3])})"
+        if kind == "shr":
+            return f"shr({self.show(node[1])}, {node[2]})"
+        if kind == "trunc":
+            return f"low{node[1] * 8}({self.show(node[2])})"
+        if kind == "call":
+            return f"{node[1]}({', '.join(self.show(a) for a in node[2])})"
+        if kind == "struct":
+            parts = ", ".join(f"+{o}={self.show(f)}" for o, _s, f in node[4])
+            return f"{node[1]}@{self.show(node[3])}{{{parts}}}"
+        if kind == "setl":
+            return f"setlow{node[1] * 8}({self.show(node[2])}, {self.show(node[3])})"
+        if kind == "undef":
+            return f"undefined({node[1]})"
+        if kind == "ite":
+            return f"ite({self.show_atom(node[1])}, {self.show(node[2])}, {self.show(node[3])})"
+        return str(node)
+
+    def show_atom(self, atom: int) -> str:
+        node = self.nodes[atom]
+        return f"{self.show(node[1])} {'<' if node[0] == 'lt' else '=='} {self.show(node[2])}"
+
+
+# ------------------------------------------------------------- source syntax
+
+_TOKEN = re.compile(r"\s+|#[^\n]*|([A-Za-z_][A-Za-z0-9_]*|\d+|=>|==|!=|<=|>=|<<|>>|&&|\|\||"
+                    r"[(){},:;@=|+\-*&^<>!])")
+_BINOPS = {"+": "add", "-": "sub", "*": "imul", "<<": "shl", ">>": "shr",
+           "&": "and", "|": "or", "^": "xor"}
+_CMPS = ("<", "<=", ">", ">=", "==", "!=")
+
+
+@dataclass
+class Ctor:
+    name: str
+    tag: Optional[int]
+    is_null: bool
+    index: int
+    fields: list = field(default_factory=list)  # (name, type, off, size)
+
+
+@dataclass
+class TypeInfo:
+    name: str
+    ctors: list
+
+
+@dataclass
+class Fn:
+    name: str
+    params: list
+    ret: str
+    at: Optional[int]
+    body: tuple
+
+
+class SourceParser:
+    """A plain recursive descent over the whole text."""
+
+    def __init__(self, text: str):
+        self.tokens = [m.group(1) for m in _TOKEN.finditer(text) if m.group(1)]
+        self.at = 0
+        self.types: dict[str, TypeInfo] = {}
+        self.fns: dict[str, Fn] = {}
+
+    def peek(self) -> Optional[str]:
+        return self.tokens[self.at] if self.at < len(self.tokens) else None
+
+    def next(self) -> str:
+        token = self.tokens[self.at]
+        self.at += 1
+        return token
+
+    def expect(self, token: str) -> None:
+        got = self.next()
+        if got != token:
+            raise ValueError(f"expected {token}, got {got}")
+
+    def parse(self) -> None:
+        while self.peek() is not None:
+            keyword = self.next()
+            if keyword == "data":
+                self._data()
+            elif keyword == "record":
+                self._record()
+            elif keyword == "fn":
+                self._fn()
+            else:
+                raise ValueError(f"unexpected {keyword}")
+
+    def _fields(self, close: str) -> list:
+        fields = []
+        while True:
+            name = self.next()
+            self.expect(":")
+            fields.append((name, self.next()))
+            if self.next() == close:
+                return fields
+
+    def _data(self) -> None:
+        name = self.next()
+        if self.next() == ";":
+            return  # a forward declaration says nothing about layout
+        raw = []
+        while True:
+            ctor = self.next()
+            fields = []
+            if self.peek() == "(":
+                self.next()
+                fields = self._fields(")")
+            raw.append((ctor, fields))
+            if self.next() == ";":
+                break
+        counts = sorted(len(f) for _, f in raw)
+        tagless = len(raw) == 2 and counts[0] == 0 and counts[1] > 0
+        ctors = []
+        for index, (ctor, fields) in enumerate(raw):
+            tag = None if tagless else index
+            ctors.append(Ctor(ctor, tag, tagless and not fields, index,
+                              self._layout(fields, 0 if tagless else 1)))
+        self.types[name] = TypeInfo(name, ctors)
+
+    def _record(self) -> None:
+        name = self.next()
+        self.expect("{")
+        fields = self._fields("}")
+        self.expect(";")
+        self.types[name] = TypeInfo(name, [Ctor(name, None, False, 0, self._layout(fields, 0))])
+
+    @staticmethod
+    def _layout(fields: list, start: int) -> list:
+        placed = []
+        off = start
+        for name, ty in fields:
+            size = FIELD_SIZES.get(ty, 8)
+            off = (off + size - 1) // size * size
+            placed.append((name, ty, off, size))
+            off += size
+        return placed
+
+    def _fn(self) -> None:
+        name = self.next()
+        self.expect("(")
+        params = []
+        if self.peek() == ")":
+            self.next()
+        else:
+            params = self._fields(")")
+        self.expect(":")
+        ret = self.next()
+        at = None
+        if self.peek() == "@":
+            self.next()
+            wanted = self.next()
+            at = [p for p, _ in params].index(wanted)
+        self.expect("=")
+        body = self.expr()
+        self.expect(";")
+        self.fns[name] = Fn(name, params, ret, at, body)
+
+    def _args(self) -> list:
+        args = []
+        if self.peek() == ")":
+            self.next()
+            return args
+        while True:
+            args.append(self.expr())
+            if self.next() == ")":
+                return args
+
+    def expr(self) -> tuple:
+        token = self.next()
+        if token.isdigit():
+            return ("int", int(token))
+        if token in ("true", "false"):
+            return ("int", int(token == "true"), "Bool")
+        if token == "let":
+            name = self.next()
+            self.expect("=")
+            bound = self.expr()
+            self.expect("in")
+            return ("let", name, bound, self.expr())
+        if token == "if":
+            cond = self.expr()
+            self.expect("then")
+            then = self.expr()
+            self.expect("else")
+            return ("if", cond, then, self.expr())
+        if token == "match":
+            return self._match()
+        if token == "{":
+            base = self.expr()
+            self.expect("with")
+            name = self.next()
+            self.expect("=")
+            value = self.expr()
+            self.expect("}")
+            return ("with", base, name, value)
+        if token == "pack":
+            self.expect("<")
+            widths = []
+            while True:
+                widths.append(int(self.next()))
+                if self.next() == ">":
+                    break
+            self.expect("(")
+            return ("pack", widths, self._args())
+        if token in _BINOPS or token in _CMPS or token in ("&&", "||"):
+            self.expect("(")
+            left = self.expr()
+            self.expect(",")
+            right = self.expr()
+            self.expect(")")
+            return ("bin", token, left, right)
+        if token == "!":
+            self.expect("(")
+            inner = self.expr()
+            self.expect(")")
+            return ("not", inner)
+        if token[0].isupper():
+            if self.peek() == "@":
+                self.next()
+                cell = self.next()
+                self.expect("(")
+                return ("ctor", token, cell, self._args())
+            return ("null", token)
+        if self.peek() == "(":
+            self.next()
+            return ("call", token, self._args())
+        return ("var", token)
+
+    def _match(self) -> tuple:
+        scrutinee = self.expr()
+        self.expect("with")
+        arms = []
+        while self.peek() != "end":
+            if self.peek() == "|":
+                self.next()
+            ctor = self.next()
+            binders = []
+            if self.peek() == "(":
+                self.next()
+                while True:
+                    binders.append(self.next())
+                    if self.next() == ")":
+                        break
+            self.expect("=>")
+            arms.append((ctor, binders, self.expr()))
+        self.next()
+        return ("match", scrutinee, arms)
+
+
+# ------------------------------------------------------- the source's meaning
+
+
+def _norm(ty: str):
+    """An integer type is its width in bytes; other types stay named."""
+    return {"Int8": 1, "Int16": 2, "Int32": 4, "Int64": 8}.get(ty, ty)
+
+
+class SourceMeaning:
+    """Evaluates a function body symbolically. The source has no heap to speak of:
+    a built constructor is simply a struct leaf naming its cell and fields."""
+
+    def __init__(self, terms: Terms, program: SourceParser):
+        self.T = terms
+        self.types = program.types
+        self.fns = program.fns
+        self.ctors = {c.name: (t, c) for t in program.types.values() for c in t.ctors}
+        self.orig: dict[int, Optional[int]] = {}  # struct leaf -> tag its cell held
+
+    def function(self, fn: Fn) -> int:
+        env = {}
+        for index, (name, ty) in enumerate(fn.params):
+            leaf = self.T.intern(("arg", index, FIELD_SIZES.get(ty, 8)))
+            env[name] = (leaf, _norm(ty), None)
+        return self.ev(fn.body, env)[0]
+
+    def truth(self, term: int) -> int:
+        T = self.T
+        return T.neg(T.lift(lambda x: T.eq(x, T.ZERO), term, key=("is0",)))
+
+    def ev(self, e: tuple, env: dict) -> tuple:
+        """(term, type, the tag a diamond's cell is known to hold)."""
+        T = self.T
+        kind = e[0]
+        if kind == "int":
+            return T.const(e[1]), (e[2] if len(e) > 2 else None), None
+        if kind == "var":
+            return env[e[1]]
+        if kind == "null":
+            return T.ZERO, self.ctors[e[1]][0].name, None
+        if kind == "bin":
+            return self._binary(e, env)
+        if kind == "not":
+            return T.neg(self.truth(self.ev(e[1], env)[0])), "Bool", None
+        if kind == "let":
+            inner = dict(env)
+            inner[e[1]] = self.ev(e[2], env)
+            return self.ev(e[3], inner)
+        if kind == "if":
+            cond = self.truth(self.ev(e[1], env)[0])
+            a, ta, _ = self.ev(e[2], env)
+            b, tb, _ = self.ev(e[3], env)
+            return T.select(cond, a, b), (ta if ta is not None else tb), None
+        if kind == "ctor":
+            return self._ctor(e, env)
+        if kind == "match":
+            return self._match(e, env)
+        if kind == "with":
+            return self._with(e, env)
+        if kind == "call":
+            fn = self.fns[e[1]]
+            args = [self.ev(a, env)[0] for a in e[2]]
+            size = FIELD_SIZES.get(fn.ret, 8)
+            built = lambda *leaves: T.call(fn.name, leaves, size)  # noqa: E731
+            return T.lift(built, *args, key=("call", fn.name)), _norm(fn.ret), None
+        if kind == "pack":
+            return self._pack(e, env)
+        raise ValueError(f"unknown expression {kind}")
+
+    def _binary(self, e: tuple, env: dict) -> tuple:
+        T = self.T
+        _, op, left, right = e
+        a, ta, _ = self.ev(left, env)
+        b, tb, _ = self.ev(right, env)
+        if op == "&&":
+            return T.both(self.truth(a), self.truth(b)), "Bool", None
+        if op == "||":
+            return T.either(self.truth(a), self.truth(b)), "Bool", None
+        if op in _CMPS:
+            less = lambda x, y: T.lift(T.lt, x, y, key=("lt",))  # noqa: E731
+            table = {"<": lambda: less(a, b), "<=": lambda: T.neg(less(b, a)),
+                     ">": lambda: less(b, a), ">=": lambda: T.neg(less(a, b)),
+                     "==": lambda: T.lift(T.eq, a, b, key=("eq",)),
+                     "!=": lambda: T.neg(T.lift(T.eq, a, b, key=("eq",)))}
+            return table[op](), "Bool", None
+        width = ta if ta is not None else tb
+        result_ty = width if width is not None else 8
+        name = _BINOPS[op]
+        if name == "shr":
+            count = T.value(b)
+            return T.lift(lambda x: T.shr(x, count), a, key=("shr", count)), result_ty, None
+        if name in ("and", "or", "xor"):
+            return T.lift(lambda x, y: T.bitop(name, x, y), a, b, key=("bit", name)), result_ty, None
+        return (T.lift(lambda x, y: T.arith(name, result_ty, x, y), a, b,
+                       key=("arith", name, result_ty)), result_ty, None)
+
+    def _pack(self, e: tuple, env: dict) -> tuple:
+        """Horner over a 64-bit word: every field keeps only its own low bits."""
+        T = self.T
+        _, widths, args = e
+        acc = None
+        for bits, arg in zip(widths, args):
+            size = bits // 8
+            term = T.lift(lambda x, w=size: T.trunc(w, x), self.ev(arg, env)[0], key=("trunc", size))
+            if acc is None:
+                acc = term
+            else:
+                count = T.const(bits)
+                shifted = T.lift(lambda x: T.arith("shl", 8, x, count), acc, key=("shl8", bits))
+                acc = T.lift(lambda x, y: T.bitop("or", x, y), shifted, term, key=("bit", "or"))
+        assert acc is not None
+        return acc, 8, None
+
+    def _built(self, ctor: Ctor, cell: int, known: Optional[int], fields: tuple) -> int:
+        """A cell whose fields and tag are what it already held was not built at all."""
+        T = self.T
+        if T.unchanged(cell, fields) and (ctor.tag is None or known == ctor.tag):
+            return cell
+        leaf = T.struct(ctor.name, ctor.tag, cell, fields)
+        self.orig[leaf] = known
+        return leaf
+
+    def _ctor(self, e: tuple, env: dict) -> tuple:
+        T = self.T
+        _, name, cell_name, args = e
+        info, ctor = self.ctors[name]
+        cell, _ty, known = env[cell_name]
+        terms = []
+        for (_fname, _fty, _off, size), arg in zip(ctor.fields, args):
+            term = self.ev(arg, env)[0]
+            terms.append(T.lift(lambda x, w=size: T.trunc(w, x), term, key=("trunc", size)))
+        layout = [(off, size) for _f, _t, off, size in ctor.fields]
+
+        def build(*leaves: int) -> int:
+            fields = tuple((o, s, leaf) for (o, s), leaf in zip(layout, leaves))
+            return self._built(ctor, cell, known, fields)
+
+        return T.lift(build, *terms), info.name, None
+
+    def _match(self, e: tuple, env: dict) -> tuple:
+        T = self.T
+        _, scrutinee, arms = e
+        term, ty, _ = self.ev(scrutinee, env)
+        info = self.types[ty]
+        by_name = {arm[0]: arm for arm in arms}
+        result_ty: list = [None]
+
+        def run(arm: tuple, cell: int, known: Optional[int], fields: list) -> int:
+            inner = dict(env)
+            if arm[1]:
+                inner[arm[1][0]] = (cell, "Diamond", known)
+                for binder, value in zip(arm[1][1:], fields):
+                    inner[binder] = value
+            result, arm_ty, _ = self.ev(arm[2], inner)
+            if result_ty[0] is None:
+                result_ty[0] = arm_ty
+            return result
+
+        def opaque_fields(ctor: Ctor, pointer: int) -> list:
+            return [(T.load(pointer, off, size), _norm(fty), None)
+                    for _f, fty, off, size in ctor.fields]
+
+        def on_leaf(leaf: int) -> int:
+            node = T.nodes[leaf]
+            if node[0] == "struct":  # a known constructor: only its arm exists
+                _i, ctor = self.ctors[node[1]]
+                fields = [(f[2], _norm(meta[1]), None) for f, meta in zip(node[4], ctor.fields)]
+                return run(by_name[ctor.name], node[3], self.orig.get(leaf), fields)
+            ctors = info.ctors
+            if leaf == T.ZERO:
+                nulls = [c for c in ctors if c.is_null]
+                return run(by_name[nulls[0].name], leaf, None, [])
+            if len(ctors) == 1:
+                only = ctors[0]
+                return run(by_name[only.name], leaf, only.tag, opaque_fields(only, leaf))
+            if ctors[0].tag is None:  # tagless: dispatch is a null test
+                full = [c for c in ctors if not c.is_null][0]
+                null = [c for c in ctors if c.is_null][0]
+                return T.select(T.eq(leaf, T.ZERO), run(by_name[null.name], T.ZERO, None, []),
+                                run(by_name[full.name], leaf, None, opaque_fields(full, leaf)))
+            # Tagged: the arms test the tag in source order, and the last needs no test.
+            ordered = [self.ctors[arm[0]][1] for arm in arms]
+            last = ordered[-1]
+            result = run(by_name[last.name], leaf, last.tag, opaque_fields(last, leaf))
+            tag_read = T.load(leaf, 0, 1)
+            for ctor in reversed(ordered[:-1]):
+                body = run(by_name[ctor.name], leaf, ctor.tag, opaque_fields(ctor, leaf))
+                result = T.select(T.eq(tag_read, T.const(ctor.tag)), body, result)
+            return result
+
+        return T.lift(on_leaf, term), result_ty[0], None
+
+    def _with(self, e: tuple, env: dict) -> tuple:
+        """Section 5.5: a rebuild in which every other field is its own old value."""
+        T = self.T
+        _, base, name, value = e
+        term, ty, _ = self.ev(base, env)
+        ctor = self.types[ty].ctors[0]
+        position = [f[0] for f in ctor.fields].index(name)
+
+        def on_leaf(leaf: int) -> int:
+            node = T.nodes[leaf]
+            if node[0] == "struct":
+                cell, known = node[3], self.orig.get(leaf)
+                old = [f[2] for f in node[4]]
+            else:
+                cell, known = leaf, None
+                old = [T.load(leaf, off, size) for _f, _t, off, size in ctor.fields]
+            inner = dict(env)
+            inner[name] = (old[position], _norm(ctor.fields[position][1]), None)
+            new = self.ev(value, inner)[0]
+            size = ctor.fields[position][3]
+
+            def build(v: int) -> int:
+                leaves = list(old)
+                leaves[position] = T.trunc(size, v)
+                fields = tuple((f[2], f[3], x) for f, x in zip(ctor.fields, leaves))
+                return self._built(ctor, cell, known, fields)
+
+            return T.lift(build, new)
+
+        return T.lift(on_leaf, term), ty, None
+
+
+# ---------------------------------------------------------- the assembly's meaning
+
+_REGISTERS: dict[str, tuple[str, int]] = {}
+for _full, _low32, _low16, _low8 in (("rax", "eax", "ax", "al"), ("rbx", "ebx", "bx", "bl"),
+                                     ("rcx", "ecx", "cx", "cl"), ("rdx", "edx", "dx", "dl"),
+                                     ("rsi", "esi", "si", "sil"), ("rdi", "edi", "di", "dil"),
+                                     ("rbp", "ebp", "bp", "bpl")):
+    _REGISTERS.update({_full: (_full, 8), _low32: (_full, 4), _low16: (_full, 2), _low8: (_full, 1)})
+for _n in range(8, 16):
+    _REGISTERS.update({f"r{_n}": (f"r{_n}", 8), f"r{_n}d": (f"r{_n}", 4),
+                       f"r{_n}w": (f"r{_n}", 2), f"r{_n}b": (f"r{_n}", 1)})
+_PARAMS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
+_SIZES = {"byte": 1, "word": 2, "dword": 4, "qword": 8}
+_ARITH = {"add", "sub", "imul", "shl"}
+_BITS = {"and", "or", "xor"}
+_WRITERS = _ARITH | _BITS | {"shr", "mov", "movzx"}
+
+
+def _operand(text: str) -> tuple:
+    text = text.strip()
+    if text in _REGISTERS:
+        base, width = _REGISTERS[text]
+        return ("reg", base, width)
+    match = re.fullmatch(r"(byte|word|dword|qword) \[(\w+)(?:\+(\d+))?\]", text)
+    if match:
+        return ("mem", match.group(2), int(match.group(3) or 0), _SIZES[match.group(1)])
+    if re.fullmatch(r"-?\d+", text):
+        return ("imm", int(text) & MASK64)
+    return ("name", text)
+
+
+def parse_assembly(asm: str) -> tuple[dict, dict]:
+    """Function bodies, in order, and the label aliases that `equ` declares."""
+    bodies: dict[str, list] = {}
+    aliases: dict[str, str] = {}
+    current: Optional[list] = None
+    for number, raw in enumerate(asm.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith(("section", "global", "alignb", "cells:")):
+            continue
+        if " equ " in line:
+            left, _, right = line.partition(" equ ")
+            if left.startswith("L"):
+                aliases[left] = right
+            continue
+        if line.endswith(":"):
+            name = line[:-1]
+            if name.startswith("fn_") and name.endswith("_body"):
+                current = bodies.setdefault(name[3:-5], [])
+            elif name.startswith("fn_") or name == "_start" or name.startswith("."):
+                current = None
+            elif current is not None:
+                current.append(("label", name, number))
+            continue
+        if current is None:
+            continue
+        head, _, rest = line.partition(" ")
+        operands = [_operand(part) for part in rest.split(",")] if rest else []
+        current.append(("ins", head, operands, number))
+    return bodies, aliases
+
+
+def _resolve_label(name: str, aliases: dict) -> str:
+    while name in aliases:
+        name = aliases[name]
+    return name
+
+
+@dataclass
+class State:
+    regs: dict
+    mem: dict
+    flags: Optional[tuple]
+    cond: int
+    tags: dict
+    dead: set
+
+    def copy(self) -> "State":
+        return State(dict(self.regs), dict(self.mem), self.flags, self.cond,
+                     dict(self.tags), set(self.dead))
+
+
+@dataclass(frozen=True)
+class Problem:
+    """The assembly and the source disagree, or the check could not decide."""
+    function: str
+    where: str
+    detail: str
+    inconclusive: bool = False
+
+    def __str__(self) -> str:
+        return f"fn {self.function}, {self.where}: {self.detail}"
+
+
+class FunctionCheck:
+    def __init__(self, terms: Terms, meaning: SourceMeaning, fn: Fn, body: list,
+                 aliases: dict, clobbers: dict):
+        self.T = terms
+        self.meaning = meaning
+        self.fn = fn
+        self.body = body
+        self.aliases = aliases
+        self.clobbers = clobbers
+        self.types = meaning.types
+        self.fns = meaning.fns
+        self.rsp = terms.intern(("rsp",))
+        self.problems: list[Problem] = []
+        self.steps = 0
+
+    # --- memory: distinct pointer leaves are distinct cells, by linearity
+
+    def _dead(self, S: State, pointer: int) -> bool:
+        if pointer in S.dead:
+            return True
+        node = self.T.nodes[pointer]
+        return node[0] == "load" and self._dead(S, node[1])
+
+    def _read(self, S: State, pointer: int, off: int, size: int) -> int:
+        T = self.T
+        if pointer != self.rsp and self._dead(S, pointer):
+            return T.undef("read of a cell a callee now owns")
+        found = S.mem.get((pointer, off, size))
+        if found is not None:
+            return found
+        for p, o, s in S.mem:
+            if p == pointer and o < off + size and off < o + s:
+                if o == off and s > size:  # the low bytes of a wider write
+                    return T.lift(lambda x: T.trunc(size, x), S.mem[(p, o, s)])
+                return T.undef("read overlaps a different write")
+        if pointer == self.rsp:
+            return T.undef("slot never written")
+        if T.is_const(pointer):
+            return T.undef("read through a constant")
+        return T.load(pointer, off, size)
+
+    def _store(self, S: State, pointer: int, off: int, size: int, value: int) -> None:
+        for cond, leaf in self.T.paths(pointer):
+            old = self._read(S, leaf, off, size)
+            merged = self.T.select(cond, value, old)
+            for key in [k for k in S.mem if k[0] == leaf and k[1] < off + size and off < k[1] + k[2]]:
+                del S.mem[key]
+            S.mem[(leaf, off, size)] = merged
+
+    def _pointer(self, S: State, base: str) -> int:
+        if base == "rsp":
+            return self.rsp
+        found = S.regs.get(base)
+        return found if found is not None else self.T.undef(f"{base} was never set")
+
+    def _val(self, S: State, o: tuple) -> int:
+        T = self.T
+        if o[0] == "imm":
+            return T.const(o[1])
+        if o[0] == "reg":
+            found = S.regs.get(o[1])
+            term = found if found is not None else T.undef(f"{o[1]} was clobbered or never set")
+            return T.lift(lambda x, w=o[2]: T.trunc(w, x), term, key=("trunc", o[2]))
+        if o[0] == "mem":
+            return T.lift(lambda leaf: self._read(S, leaf, o[2], o[3]), self._pointer(S, o[1]))
+        raise ValueError(f"cannot read {o}")
+
+    def _binop(self, name: str, width: int, x: int, y: int) -> int:
+        T = self.T
+        if name in _ARITH:
+            return T.lift(lambda a, b: T.arith(name, width, a, b), x, y, key=("arith", name, width))
+        if name in _BITS:
+            return T.lift(lambda a, b: T.bitop(name, a, b), x, y, key=("bit", name))
+        count = T.value(y)
+        return T.lift(lambda a: T.shr(a, count), x, key=("shr", count))
+
+    def _cond(self, S: State, cc: str, where: str) -> int:
+        T = self.T
+        if S.flags is None:
+            self.problems.append(Problem(self.fn.name, where, f"j{cc}: the flags hold no comparison"))
+            return T.ZERO
+        x, y = S.flags
+        less = lambda a, b: T.lift(T.lt, a, b, key=("lt",))  # noqa: E731
+        same = lambda: T.lift(T.eq, x, y, key=("eq",))  # noqa: E731
+        return {"b": lambda: less(x, y), "ae": lambda: T.neg(less(x, y)),
+                "a": lambda: less(y, x), "be": lambda: T.neg(less(y, x)),
+                "e": same, "ne": lambda: T.neg(same())}[cc]()
+
+    # --- what a pointer and the memory behind it mean, in the source's terms
+
+    def _touched(self, S: State, pointer: int) -> bool:
+        """Was this cell, or any cell reached through its fields, written? The root of
+        a rebuilt structure can be untouched while a cell below it changed."""
+        for key in S.mem:
+            at = key[0]
+            while True:
+                if at == pointer:
+                    return True
+                node = self.T.nodes[at]
+                if node[0] != "load":
+                    break
+                at = node[1]
+        return False
+
+    def _tag_of(self, S: State, pointer: int, tag_leaf: int, info: TypeInfo) -> Optional[int]:
+        T = self.T
+        if T.is_const(tag_leaf):
+            return T.value(tag_leaf)
+        fact = S.tags.get(pointer)
+        if fact is None:
+            return 0 if len(info.ctors) == 1 else None
+        if fact[0] == "is":
+            return fact[1]
+        left = [c.tag for c in info.ctors if c.tag not in fact[1]]
+        return left[0] if len(left) == 1 else None
+
+    def reify(self, S: State, term: int, ty) -> int:
+        """Read a value the way the source would see it: a pointer to a rebuilt cell
+        becomes the struct its memory now holds, so it compares with the source's."""
+        if ty not in self.types:
+            return term
+        return self.T.lift(lambda leaf: self._reify_leaf(S, leaf, ty), term)
+
+    def _reify_leaf(self, S: State, leaf: int, ty: str) -> int:
+        T = self.T
+        if leaf == T.ZERO or not self._touched(S, leaf):
+            return leaf
+        if self._dead(S, leaf):
+            return T.undef("a callee owns this cell")
+        info = self.types[ty]
+        if info.ctors[0].tag is None:
+            ctor = [c for c in info.ctors if not c.is_null][0]
+            return self._reify_fields(S, leaf, ctor, False)
+        content = self._read(S, leaf, 0, 1)
+
+        def on_tag(tag_leaf: int) -> int:
+            tag = self._tag_of(S, leaf, tag_leaf, info)
+            ctor = next((c for c in info.ctors if c.tag == tag), None)
+            if ctor is None:
+                return T.undef(f"tag of {T.show(leaf)} is {T.show(tag_leaf)}")
+            return self._reify_fields(S, leaf, ctor, T.is_const(tag_leaf))
+
+        return T.lift(on_tag, content)
+
+    def _reify_fields(self, S: State, cell: int, ctor: Ctor, tag_written: bool) -> int:
+        T = self.T
+        terms = [self.reify(S, self._read(S, cell, off, size), _norm(fty))
+                 for _f, fty, off, size in ctor.fields]
+        layout = [(off, size) for _f, _t, off, size in ctor.fields]
+
+        def build(*leaves: int) -> int:
+            fields = tuple((o, s, leaf) for (o, s), leaf in zip(layout, leaves))
+            if T.unchanged(cell, fields) and not tag_written:
+                return cell
+            return T.struct(ctor.name, ctor.tag, cell, fields)
+
+        return T.lift(build, *terms)
+
+    def _pointer_of(self, leaf: int) -> int:
+        """The word a value occupies: a built cell's own, or, through an `@` callee,
+        the word of the argument it was declared to return."""
+        node = self.T.nodes[leaf]
+        if node[0] == "struct":
+            return node[3]
+        if node[0] == "call":
+            at = self.fns[node[1]].at
+            if at is not None:
+                return self._pointer_of(node[2][at])
+        return leaf
+
+    def _rewrite(self, S: State, pointer: int, new: int) -> None:
+        """After `f @k`, that word denotes the updated value, wherever it is held.
+        This is why RESTORE compares equal: the skipped store's location already holds
+        the word, and it holds the updated value only because the call really ran."""
+        T = self.T
+        swap = lambda term: T.lift(lambda x: new if x == pointer else x, term)  # noqa: E731
+        node = T.nodes[pointer]
+        implicit = None
+        if node[0] == "load" and self._read(S, node[1], node[2], node[3]) == pointer:
+            implicit = (node[1], node[2], node[3])
+        S.regs = {r: swap(t) for r, t in S.regs.items()}
+        S.mem = {k: swap(t) for k, t in S.mem.items()}
+        if implicit is not None:
+            S.mem[implicit] = new
+
+    def _invoke(self, S: State, callee: Fn) -> int:
+        """The value of calling `callee` with the parameter registers as they stand."""
+        T = self.T
+        args = []
+        for position, (_name, ty) in enumerate(callee.params):
+            found = S.regs.get(_PARAMS[position])
+            term = found if found is not None else T.undef(f"{_PARAMS[position]} was never set")
+            args.append(self.reify(S, term, _norm(ty)))
+        size = FIELD_SIZES.get(callee.ret, 8)
+        result = T.lift(lambda *leaves: T.call(callee.name, leaves, size), *args,
+                        key=("call", callee.name))
+        for term, (_name, ty) in zip(args, callee.params):
+            if _norm(ty) in self.types or ty == "Diamond":
+                for _cond, leaf in T.paths(term):
+                    self._hand_over(S, leaf)
+        if callee.at is not None:
+            for cond, leaf in T.paths(args[callee.at]):
+                word = self._pointer_of(leaf)
+                self._rewrite(S, word, T.select(cond, result, word))
+        return result
+
+    def _hand_over(self, S: State, leaf: int) -> None:
+        """The callee owns this cell and everything inside it from now on."""
+        node = self.T.nodes[leaf]
+        if node[0] == "struct":
+            S.dead.add(node[3])
+            for _o, _s, inner in node[4]:
+                if not self.T.is_const(inner):
+                    S.dead.add(inner)
+        elif not self.T.is_const(leaf):
+            S.dead.add(leaf)
+
+    # --- the obligations
+
+    def _compare(self, cond: int, got: int, want: int, where: str) -> None:
+        T = self.T
+
+        def walk(c: int, g: int, w: int, sigma: dict) -> bool:
+            if c == T.ZERO:
+                return True
+            self.steps += 1
+            if self.steps > 2_000_000:
+                raise TooLarge("too many paths")
+            atom = min(T.top(c), T.top(g), T.top(w))
+            if atom == NO_ATOM:
+                memo: dict = {}
+                a, b = T.subst(g, sigma, memo), T.subst(w, sigma, memo)
+                if a != b:
+                    self.problems.append(Problem(self.fn.name, where, self._explain(a, b, sigma)))
+                    return False
+                return True
+            node = T.nodes[atom]
+            hi_sigma = sigma
+            if node[0] == "eq":  # on this path, x really is that constant
+                x, y = node[1], node[2]
+                if T.is_const(x) or T.is_const(y):
+                    hi_sigma = dict(sigma)
+                    leaf, value = (y, x) if T.is_const(x) else (x, y)
+                    hi_sigma[leaf] = value
+            return (walk(T.cof(c, atom, True), T.cof(g, atom, True), T.cof(w, atom, True), hi_sigma)
+                    and walk(T.cof(c, atom, False), T.cof(g, atom, False), T.cof(w, atom, False), sigma))
+
+        walk(cond, got, want, {})
+
+    def _explain(self, found: int, expected: int, sigma: dict) -> str:
+        T = self.T
+        a, b = T.nodes[found], T.nodes[expected]
+        path = "" if not sigma else " when " + ", ".join(
+            f"{T.show(k)} is {T.show(v)}" for k, v in sigma.items())
+        if a[0] == "struct" and b[0] == "struct" and a[3] == b[3] and a[1] == b[1]:
+            wrong = [f"field +{x[0]} holds {T.show(x[2])}, the source says {T.show(y[2])}"
+                     for x, y in zip(a[4], b[4]) if x[2] != y[2]]
+            return f"constructor {b[1]} in cell {T.show(b[3])}{path}: " + "; ".join(wrong)
+        if b[0] == "struct":
+            return (f"the source builds {T.show(expected)}{path}, "
+                    f"but the machine produces {T.show(found)}")
+        return f"expected {T.show(expected)}{path}, found {T.show(found)}"
+
+    def _exit(self, S: State, got: int, want: int, where: str, reached: list) -> None:
+        self._compare(S.cond, got, want, where)
+        reached.append(S.cond)
+
+    def _merge(self, states: list) -> State:
+        """The merge rule of the module docstring, one incoming edge at a time."""
+        T = self.T
+        merged = states[0]
+        for other in states[1:]:
+            c = merged.cond
+            regs = {}
+            for r in set(merged.regs) | set(other.regs):
+                a = merged.regs.get(r)
+                b = other.regs.get(r)
+                regs[r] = T.select(c, a if a is not None else T.undef(f"{r} unset on one path"),
+                                   b if b is not None else T.undef(f"{r} unset on one path"))
+            mem = {}
+            for key in set(merged.mem) | set(other.mem):
+                mem[key] = T.select(c, self._read(merged, *key), self._read(other, *key))
+            tags = {}
+            for pointer in set(merged.tags) & set(other.tags):
+                x, y = merged.tags[pointer], other.tags[pointer]
+                if x == y:
+                    tags[pointer] = x
+                elif x[0] == "not" and y[0] == "not":
+                    tags[pointer] = ("not", x[1] & y[1])
+            merged = State(regs, mem, merged.flags if merged.flags == other.flags else None,
+                           T.either(c, other.cond), tags, merged.dead | other.dead)
+        return merged
+
+    # --- the walk over the function, in emitted order
+
+    def run(self) -> list[Problem]:
+        T = self.T
+        fn = self.fn
+        want = self.meaning.function(fn)
+        regs = {}
+        for position, (_name, ty) in enumerate(fn.params):
+            regs[_PARAMS[position]] = T.intern(("arg", position, FIELD_SIZES.get(ty, 8)))
+        current: Optional[State] = State(regs, {}, None, T.ONE, {}, set())
+        pending: dict[str, list] = {}
+        placed: set[str] = set()
+        reached: list[int] = []
+        for item in self.body:
+            if item[0] == "label":
+                name = item[1]
+                placed.add(name)
+                edges = pending.pop(name, [])
+                if current is not None:
+                    edges = edges + [current]
+                current = self._merge(edges) if edges else None
+                continue
+            if current is None:
+                continue
+            current = self._step(current, item[1], item[2], item[3], want, pending, placed, reached)
+        if current is not None:
+            self.problems.append(Problem(fn.name, "end of body", "control runs off the function"))
+        covered = T.ZERO
+        for cond in reached:
+            covered = T.either(covered, cond)
+        if covered != T.ONE and not self.problems:
+            self.problems.append(Problem(fn.name, "end of body", "some path never leaves the function"))
+        return self.problems
+
+    def _step(self, S: State, op: str, ops: list, line: int, want: int, pending: dict,
+              placed: set, reached: list) -> Optional[State]:
+        T = self.T
+        where = f"line {line}"
+        if op == "mov":
+            dest, source = ops
+            value = self._val(S, source)
+            if dest[0] == "reg" and dest[2] == 8:
+                S.regs[dest[1]] = value
+            elif dest[0] == "reg" and dest[2] == 4:  # a 32-bit write clears the upper half
+                S.regs[dest[1]] = T.lift(lambda x: T.trunc(4, x), value, key=("trunc", 4))
+            elif dest[0] == "reg":
+                old = S.regs.get(dest[1], T.undef("subregister of an unset register"))
+                S.regs[dest[1]] = T.lift(lambda a, b, w=dest[2]: T.setl(w, a, T.trunc(w, b)), old, value)
+            else:
+                self._write(S, dest, value)
+        elif op == "movzx":
+            S.regs[ops[0][1]] = self._val(S, ops[1])
+        elif op in _ARITH or op in _BITS or op == "shr":
+            self._arith_step(S, op, ops, where)
+        elif op == "cmp":
+            S.flags = (self._val(S, ops[0]), self._val(S, ops[1]))
+        elif op == "test":
+            if ops[0] != ops[1]:
+                self.problems.append(Problem(self.fn.name, where, "test of two different operands"))
+            S.flags = (self._val(S, ops[0]), T.ZERO)
+        elif op == "ret":
+            self._exit(S, self.reify(S, S.regs.get("rax", T.undef("rax never set")), _norm(self.fn.ret)),
+                       want, f"ret at {where}", reached)
+            return None
+        elif op == "call":
+            callee = self.fns[ops[0][1][3:]]
+            result = self._invoke(S, callee)
+            for register in self.clobbers.get(callee.name, ()):
+                S.regs.pop(register, None)
+            S.regs["rax"] = result
+            S.flags = None
+        elif op == "jmp":
+            return self._jump(S, ops[0][1], where, want, pending, placed, reached)
+        elif op.startswith("set"):
+            old = S.regs.get(ops[0][1], T.undef("setcc into an unset register"))
+            S.regs[ops[0][1]] = T.lift(lambda a, b: T.setl(1, a, b), old, self._cond(S, op[3:], where))
+        elif op.startswith("j"):
+            return self._branch(S, op[1:], ops[0][1], where, pending)
+        else:
+            self.problems.append(Problem(self.fn.name, where, f"unknown instruction {op}"))
+        return S
+
+    def _write(self, S: State, dest: tuple, value: int) -> None:
+        T = self.T
+        narrowed = T.lift(lambda x, w=dest[3]: T.trunc(w, x), value, key=("trunc", dest[3]))
+        self._store(S, self._pointer(S, dest[1]), dest[2], dest[3], narrowed)
+
+    def _arith_step(self, S: State, op: str, ops: list, where: str) -> None:
+        T = self.T
+        dest, source = ops
+        if dest[0] == "reg" and dest[2] < 4:
+            if op != "or":
+                self.problems.append(Problem(self.fn.name, where, f"{op} on a subregister"))
+            # Setting low bits in the Horner accumulator leaves the upper bits alone.
+            S.regs[dest[1]] = self._binop("or", 8, S.regs.get(dest[1], T.undef("unset accumulator")),
+                                          self._val(S, source))
+        elif dest[0] == "reg":
+            S.regs[dest[1]] = self._binop(op, dest[2], self._val(S, dest), self._val(S, source))
+        else:
+            self._write(S, dest, self._binop(op, dest[3], self._val(S, dest), self._val(S, source)))
+        S.flags = None
+
+    def _branch(self, S: State, cc: str, target: str, where: str, pending: dict) -> Optional[State]:
+        T = self.T
+        taken_cond = self._cond(S, cc, where)
+        taken = S.copy()
+        taken.cond = T.both(S.cond, taken_cond)
+        fall = S
+        fall.cond = T.both(S.cond, T.neg(taken_cond))
+        if cc in ("e", "ne") and S.flags is not None:
+            equal, unequal = (taken, fall) if cc == "e" else (fall, taken)
+            self._learn_tag(equal, unequal)
+        if taken.cond != T.ZERO:
+            pending.setdefault(_resolve_label(target, self.aliases), []).append(taken)
+        return fall if fall.cond != T.ZERO else None
+
+    def _learn_tag(self, equal: State, unequal: State) -> None:
+        """A tag test tells each path which constructor the cell holds, so a rebuild
+        with the same constructor can legitimately leave the tag alone."""
+        T = self.T
+        x, y = equal.flags if equal.flags is not None else (None, None)
+        if x is None or not T.is_const(y):
+            return
+        node = T.nodes[x]
+        if node[0] == "load" and node[2] == 0 and node[3] == 1:
+            pointer, value = node[1], T.value(y)
+            equal.tags[pointer] = ("is", value)
+            fact = unequal.tags.get(pointer)
+            ruled_out = fact[1] if fact is not None and fact[0] == "not" else frozenset()
+            unequal.tags[pointer] = ("not", ruled_out | {value})
+
+    def _jump(self, S: State, target: str, where: str, want: int, pending: dict, placed: set,
+              reached: list) -> Optional[State]:
+        T = self.T
+        fn = self.fn
+        if target.startswith("fn_"):  # a tail call to another function
+            result = self._invoke(S, self.fns[target[3:]])
+            self._exit(S, result, want, f"tail call at {where}", reached)
+            return None
+        label = _resolve_label(target, self.aliases)
+        if label not in placed:
+            pending.setdefault(label, []).append(S)
+            return None
+        # A back-edge is a call of this function, taken to mean what it means.
+        result = self._invoke(S, fn)
+        if fn.at is not None:
+            got = self.reify(S, S.regs.get("rax", T.undef("rax never set")), _norm(fn.ret))
+        else:
+            got = result
+        self._exit(S, got, want, f"back-edge at {where}", reached)
+        return None
+
+
+# ------------------------------------------------------------------- the check
+
+
+def _clobber_sets(bodies: dict) -> dict:
+    """Which registers each function may change: read from its body, not trusted."""
+    sets: dict[str, set] = {}
+    for name, body in bodies.items():
+        touched = {"rax"}
+        for item in body:
+            if item[0] != "ins":
+                continue
+            op, ops = item[1], item[2]
+            if op in ("call", "jmp") and ops[0][0] == "name" and ops[0][1].startswith("fn_"):
+                touched |= sets.get(ops[0][1][3:], set())
+            elif op in _WRITERS or op.startswith("set"):
+                if ops and ops[0][0] == "reg":
+                    touched.add(ops[0][1])
+        sets[name] = touched
+    return sets
+
+
+def check_translation(source: bytes, asm: str) -> list[Problem]:
+    """Every problem found in `asm` as a translation of `source`; [] means agreement."""
+    program = SourceParser(source.decode())
+    program.parse()
+    bodies, aliases = parse_assembly(asm)
+    clobbers = _clobber_sets(bodies)
+    problems: list[Problem] = []
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(limit, 100_000))
+    try:
+        for name, fn in program.fns.items():
+            body = bodies.get(name)
+            if body is None:
+                problems.append(Problem(name, "whole function", "no code was emitted for it"))
+                continue
+            terms = Terms()
+            check = FunctionCheck(terms, SourceMeaning(terms, program), fn, body, aliases, clobbers)
+            try:
+                problems.extend(check.run())
+            except TooLarge as reason:
+                problems.append(Problem(name, "whole function", str(reason), inconclusive=True))
+    finally:
+        sys.setrecursionlimit(limit)
+    return problems

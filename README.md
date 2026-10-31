@@ -143,16 +143,35 @@ with controls that must trip the same detector on code that really is wrong. One
 deliberately breaks the lowerer so that it writes the forbidden copies, and the test has
 to notice.
 
-`src/validate.py` is a second opinion that shares no code with the lowerer. It reads the
-emitted assembly as text and rejects the redundant moves the model says cannot occur.
+Running a program only tells you about the answer it printed, and a bug can damage
+something the answer never looks at. So `src/symcheck.py` compares meaning without running
+anything. It has its own parser for the source and its own reading of x86, and a test
+confirms that it imports nothing from the compiler. It works out from the source what each
+function should produce, executes the emitted assembly symbolically, and requires the two
+to agree wherever a value leaves the function: at every `ret`, call and tail jump, each
+field of every constructor that was built must hold what the source says it holds. Where
+paths join, a location that differs between them holds "this if that condition, otherwise
+that", kept in a canonical form, so a source argument like `if c then 7 else z` compares
+directly with a register that two branches filled. To show the check can fail, the test
+suite breaks the lowerer one line at a time, mostly in ways it really has been broken, and
+the check has to find each break without running the result. It has also found a bug
+nothing else could see: a tag byte written over a free-list pointer that had not yet been
+moved out of the cell, in programs whose answers came out right anyway.
 
-`tests/test_fuzz.py` has done the most to earn trust, by repeatedly proving that trust
-premature. It generates random programs, works out each expected answer in Python from
-what the language means, then runs the binary and compares. It found miscompiles that
-every hand-written test had missed. In one, a value joined after an `if` kept the
-provenance of its last arm alone, so a store the other arm needed was silently dropped.
-In another, a nested constructor overwrote a location an outer constructor was still
-waiting to read. Each one now has a named regression test.
+`tests/test_fuzz.py` attacks from the other side. It generates random programs, works out
+each expected answer in Python from what the language means, runs the binary and compares,
+and puts every program through the symbolic check as well. It found miscompiles that every
+hand-written test had missed. In one, a value joined after an `if` kept the provenance of
+its last arm alone, so a store the other arm needed was silently dropped. In another, a
+nested constructor overwrote a location an outer constructor was still waiting to read. A
+review of the code then found two more that the generators had never reached, which is why
+they now pass a cell's capability to callees and build tagged constructors in both arms of
+an `if`. Each of these bugs has a named regression test, and a campaign fails if a program
+is rejected for any reason other than a limit the language declares.
+
+`src/validate.py` asks a narrower question. It reads the assembly as text and rejects the
+redundant moves the model says cannot occur. That is a check for waste rather than for
+correctness, since a lost store leaves nothing redundant behind and passes it.
 
 ```
 python3 -m unittest discover -s tests -t .
@@ -172,7 +191,8 @@ future, which nothing here can know, so the oldest value spills instead. Scalars
 the same problem from another side. A read cannot tell whether it was the last, so
 writing to a location erases the scalar living there, and using it afterwards is a
 compile error, unless an enclosing construct is already waiting on it, in which case it
-moves out first. Section 5.6 needs to know that a recursive call returns its argument's
+moves out first. Handing a cell to a callee counts as writing to it, because the callee now
+owns it, so a field you still want has to be copied first, with `+(x, 0)`. Section 5.6 needs to know that a recursive call returns its argument's
 own cell, which depends on exits the compiler has not reached yet, and that is why the
 `@l` annotation exists: the signature declares it, and each exit is checked against it.
 
@@ -192,7 +212,10 @@ When a program runs into one of these limits, the compiler does not work around 
 stops and reports the rule along with the exact state of the registers, the homes of
 live values and the destination it was trying to fill. A deeply right-nested sum that
 pins all fifteen registers fails this way, and naming its intermediate values with `let`
-is usually all it takes to fix it.
+is usually all it takes to fix it. The other limits work the same way: a partial result
+that would have to survive a call clobbering its register, a home that would change after
+a jump under a condition has already been written, and a value moved out of a cell in one
+arm of a conditional while it is still needed after the join.
 
 ## What is not here yet
 
@@ -207,6 +230,13 @@ The language is also narrower than the model in smaller ways. Pairs are left out
 section 1 gives them no term form, functions take at most six arguments and must be
 defined before they are called, and shift counts must be literals. On the verification
 side, the model's term-level rules are realized by the emitted code rather than run by
-an interpreter, the stages themselves are Python rather than LFPL, the stack bound of
-Theorem 7.3 is computed but has not been measured, and the validator reasons only within
-straight-line blocks, so it says nothing about a pair of moves on either side of a label.
+an interpreter, the stages themselves are Python rather than LFPL, and the stack bound of
+Theorem 7.3 is computed but has not been measured.
+
+The checks have edges of their own too. The symbolic check trusts the linear type checker,
+because it treats distinct pointers as distinct cells, and it takes each callee to mean
+what that callee's own check established, so it says nothing about termination. It also
+cannot see an instruction encoding, which is why NASM warnings are fatal. The redundancy
+validator matches locations by their text within straight-line blocks, so it cannot see
+one location reached through a copied pointer, and a clean result from it is evidence
+rather than proof.

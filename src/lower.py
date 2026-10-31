@@ -193,8 +193,21 @@ def _trailer(mode: int, target_cells: int) -> str:
 # ---------------------------------------------------------------- failures
 
 
+# The rejections the language declares. Each is a limit a program can run into and
+# fix. Any other FailFast means the lowerer reached a state it has no rule for,
+# which is a bug in the lowerer, not a property of the program.
+DECLARED_LIMITS = ("register starvation", "section 1:", "section 4.1 against 4.2",
+                   "section 4.4:", "section 5.3:", "section 5.6:",
+                   "a shift count must be a literal")
+
+
 class FailFast(Exception):
     """The directive's stop rule, raised by the compiler at the conflict itself."""
+
+    @property
+    def limit(self) -> Optional[str]:
+        """Which declared limit this is, or None if it is not one."""
+        return next((key for key in DECLARED_LIMITS if self.rule.startswith(key)), None)
 
     def __init__(self, rule: str, delta: str, homes: str, dest: str):
         super().__init__(f"{rule}\n  Delta = {delta}\n  H     = {homes}\n  delta = {dest}")
@@ -505,8 +518,8 @@ class Lower(Stage):
         b = self._b(index)
         if b.flags & F_ERASED and not b.flags & F_CONSUMED:
             raise self._fail(
-                f"section 1: scalar b{index} is erased, its home was overwritten "
-                f"before this use; bind a copy into a register first", dest)
+                f"section 1: scalar b{index} is erased, because its cell was rebuilt or "
+                f"given to a callee before this use; copy it first, with +(x, 0)", dest)
 
     # --- registers
 
@@ -1138,7 +1151,12 @@ class Lower(Stage):
         if b.loc == L_VIRT:
             r, word = self._materialize(index)
             self._deliver_reg(r, word, dest)
-        elif kind == D_REG:
+            return
+        if b.flags & F_LINEAR:
+            # A cell's capability going anywhere but a rebuild, say through a let into
+            # an argument: from here this function cannot tell who writes it next.
+            self._close_stale_window(index, frozenset((index,)))
+        if kind == D_REG:
             self._load_opnd(self._opnd(index), dest.x)
             self._end_scratch()
             self._used(index)
@@ -1178,11 +1196,11 @@ class Lower(Stage):
 
     def _write_tag(self, cell: int, tag: int, tagged: int) -> None:
         """tag(p, C), or STAY when the cell already holds this tag."""
-        b = self._b(cell)
-        if tagged and b.aux != tag + 1:
+        if tagged and self._b(cell).aux != tag + 1:
+            # aux is the tag dispatch proved, and it never changes after that. The
+            # diamond is linear, so this cell is rebuilt at most once on any path, and
+            # recording this write could only mislead the other arm of an `if`.
             self.i("mov", (O_MEM, self._base(cell), 0, 1), (O_IMM, tag))
-            b.aux = tag + 1
-            self._set_b(cell, b)
 
     def _materialize(self, virt: int) -> tuple[int, int]:
         """virt(C, u) reached a use that is not a match: build it now, in place."""
@@ -1200,8 +1218,8 @@ class Lower(Stage):
             else:
                 moves.append([target, E_BIND, 0, h])
         self._pmove(moves)
-        self._write_tag(cell, v.r, v.size)
         self._close_stale_window(cell)
+        self._write_tag(cell, v.r, v.size)
         v.flags |= F_CONSUMED
         self._set_b(virt, v)
         word = self._b(cell).word
@@ -1734,8 +1752,10 @@ class Lower(Stage):
         # These moves are being carried out, so they are no longer deferred reads.
         self._save_at(index, fr)
         self._pmove(moves)
-        self._write_tag(cell, fr.b1, fr.b2)
+        # The tag byte is a store like any other: whatever still lives at offset 0 has
+        # to leave before it lands, so the window closes first.
         self._close_stale_window(cell, keep)
+        self._write_tag(cell, fr.b1, fr.b2)
 
     def _close_stale_window(self, cell: int, keep: frozenset = frozenset()) -> None:
         """Lemma 6.2's window ends when the cell is rebuilt: the cell now belongs to
@@ -1941,6 +1961,12 @@ class Lower(Stage):
         params = self._param_mask(moves)
         mask = kappa | params | 1 << RAX
         arguments = [m for m in moves if m[1] == E_BIND]
+        # The callee owns any cell passed to it and may write it, so the stale-read
+        # window closes before the call, exactly as it does for a rebuild here. Tail
+        # calls and returns do not need this: nothing in this function runs after them.
+        passed = frozenset(self._resolve(m[3]) for m in arguments)
+        for index in passed:
+            self._close_stale_window(index, passed)
         leaving = frozenset(
             self._resolve(m[3]) for m in arguments
             if self._b(self._resolve(m[3])).flags & (F_LINEAR | F_TEMP))
@@ -2448,17 +2474,14 @@ def required_cells(d_max: int, g_max: int = DEFAULT_G_MAX) -> int:
 # ------------------------------------------------------------------ driver
 
 
-def build_and_run(asm: str, workdir: str, *, name: str = "prog") -> int:
-    """Assemble with nasm, link with ld (no libc, no C compiler), run on the
-    silicon, and return the 64-bit result `_start` writes to stdout."""
+def assemble_and_run(source: str, workdir: str, *, name: str = "prog") -> int:
+    """Assemble a NASM file with nasm, link with ld (no libc, no C compiler), run it
+    on the silicon, and return the 64-bit result `_start` writes to stdout."""
     import os
     import subprocess
 
-    source = os.path.join(workdir, f"{name}.asm")
     obj = os.path.join(workdir, f"{name}.o")
     exe = os.path.join(workdir, name)
-    with open(source, "w") as handle:
-        handle.write(asm)
     # -Werror: NASM only warns when it truncates an immediate, and a truncated
     # immediate is a miscompile that still assembles.
     subprocess.run(["nasm", "-Werror", "-f", "elf64", "-o", obj, source], check=True,
@@ -2466,6 +2489,15 @@ def build_and_run(asm: str, workdir: str, *, name: str = "prog") -> int:
     subprocess.run(["ld", "-o", exe, obj], check=True, capture_output=True, text=True)
     done = subprocess.run([exe], check=True, capture_output=True, timeout=10)
     return int.from_bytes(done.stdout, "little")
+
+
+def build_and_run(asm: str, workdir: str, *, name: str = "prog") -> int:
+    import os
+
+    source = os.path.join(workdir, f"{name}.asm")
+    with open(source, "w") as handle:
+        handle.write(asm)
+    return assemble_and_run(source, workdir, name=name)
 
 
 def compile_source(source, *, cells: Optional[int] = None, d_max: int = 64,
@@ -2498,22 +2530,36 @@ def compile_text(source: bytes, **options) -> str:
     return "\n".join(lines) + "\n"
 
 
+def file_bytes(handle, chunk: int = 4096):
+    """Ingest from an open file: the ring sees one byte at a time, and no more than
+    one small chunk of the source is ever in memory."""
+    while True:
+        block = handle.read(chunk)
+        if not block:
+            return
+        yield from block
+
+
 def main(argv: list[str]) -> int:
     """lfplc FILE [-r]: print NASM for FILE, or assemble it, run it, print the result."""
+    import os
     import sys
     import tempfile
 
     if not argv:
         print("usage: python3 -m src.lower FILE.lfpl [-r]", file=sys.stderr)
         return 2
-    with open(argv[0], "rb") as handle:
-        source = handle.read()
     try:
-        if "-r" not in argv:
-            compile_source(source, on_line=print)
-            return 0
-        with tempfile.TemporaryDirectory() as workdir:
-            print(build_and_run(compile_text(source), workdir))
+        with open(argv[0], "rb") as handle:
+            if "-r" not in argv:
+                compile_source(file_bytes(handle), on_line=print)
+                return 0
+            with tempfile.TemporaryDirectory() as workdir:
+                source = os.path.join(workdir, "prog.asm")
+                with open(source, "w") as out:
+                    compile_source(file_bytes(handle),
+                                   on_line=lambda line: out.write(line + "\n"))
+                print(assemble_and_run(source, workdir))
     except (Reject, FailFast) as failure:
         print(failure, file=sys.stderr)
         return 1
