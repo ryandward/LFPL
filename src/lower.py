@@ -270,7 +270,15 @@ PARAM_REGS = (RDI, RSI, RDX, RCX, R8, R9)  # the internal convention
 _HDR = struct.Struct("<BBIIHHBBBBBIIIQI")
 _HDR_FIELDS = ("st", "dk", "dx", "dy", "mark", "srcmark", "b1", "b2", "b3", "b4", "w",
                "l1", "l2", "l3", "q", "word")
-_SNAPSHOT_BYTES = 16 + 16 + 16 + REG_COUNT + 8 + 16
+# A snapshot records the tag known for up to _TAGS_MAX cells (binder, aux) so a
+# later arm starts from what was known before the first; past that, a cell's tag
+# is simply unknown there, which costs a tag write and never correctness.
+_TAGS_MAX = 16
+_TAG_BYTES = 1 + 3 * _TAGS_MAX
+# consumed, erased, evacuated, regmap, held slots, known tags, then two masks the
+# arms accumulate: tags changed in some arm, and fields erased in some arm.
+_SNAPSHOT_BYTES = 16 + 16 + 16 + REG_COUNT + 8 + _TAG_BYTES + 16 + 16
+_TAGS_AT = 16 + 16 + 16 + REG_COUNT + 8
 _ENTRY = struct.Struct("<BBBBQ")  # kind, op, off, size, value: one pending move
 E_EMPTY, E_BIND, E_IMM, E_RMW_BIND, E_RMW_IMM = range(5)
 _NO_REG = 255
@@ -929,8 +937,11 @@ class Lower(Stage):
         consumed = erased = evacuated = 0
         held = 0
         regmap = bytearray(b"\xff" * REG_COUNT)
+        known: list[tuple[int, int]] = []
         for index in range(len(self.B)):
             b = self._b(index)
+            if b.loc != L_VIRT and b.aux:  # aux is a known tag except on virt
+                known.append((index, b.aux))
             if b.flags & F_CONSUMED:
                 consumed |= 1 << index
             if b.flags & F_ERASED:
@@ -943,9 +954,22 @@ class Lower(Stage):
                 regmap[b.r] = index
             elif b.loc == L_SLOT:
                 held |= 1 << b.r
+        tags = bytearray(_TAG_BYTES)
+        tags[0] = min(len(known), _TAGS_MAX)
+        for slot, (index, aux) in enumerate(known[:_TAGS_MAX]):
+            struct.pack_into("<BH", tags, 1 + 3 * slot, index, aux)
         return (consumed.to_bytes(16, "little") + erased.to_bytes(16, "little")
                 + evacuated.to_bytes(16, "little")
-                + bytes(regmap) + held.to_bytes(8, "little") + bytes(16))
+                + bytes(regmap) + held.to_bytes(8, "little") + bytes(tags)
+                + bytes(16) + bytes(16))
+
+    @staticmethod
+    def _snap_tags(snap: bytes) -> dict[int, int]:
+        """The tag each cell was known to hold when the snapshot was taken."""
+        count = snap[_TAGS_AT]
+        return {snap[_TAGS_AT + 1 + 3 * slot]:
+                struct.unpack_from("<H", snap, _TAGS_AT + 2 + 3 * slot)[0]
+                for slot in range(count)}
 
     def _restore(self, snap: bytes) -> None:
         consumed = int.from_bytes(snap[:16], "little")
@@ -953,6 +977,7 @@ class Lower(Stage):
         evacuated = int.from_bytes(snap[32:48], "little")
         regmap = snap[48:48 + REG_COUNT]
         held = int.from_bytes(snap[48 + REG_COUNT:56 + REG_COUNT], "little")
+        tags = self._snap_tags(snap)
         for index in range(len(self.B)):
             b = self._b(index)
             if b.flags & F_EVACUATED and not evacuated >> index & 1:
@@ -963,6 +988,9 @@ class Lower(Stage):
                 b.flags |= F_CONSUMED
             if erased >> index & 1:
                 b.flags |= F_ERASED
+            if b.loc != L_VIRT:
+                # A tag written in an earlier arm was never written on this path.
+                b.aux = tags.get(index, 0)
             self._set_b(index, b)
         occupied = 0
         for r, index in enumerate(regmap):
@@ -1036,6 +1064,31 @@ class Lower(Stage):
                 erased |= 1 << index
         fr.tail[snap_offset + _SNAPSHOT_BYTES - 16:snap_offset + _SNAPSHOT_BYTES] = (
             erased.to_bytes(16, "little"))
+
+    def _remember_tags(self, fr: Fr) -> None:
+        """At the end of an arm, before the next one is restored: note every cell
+        whose known tag this arm changed, since the join cannot see it afterwards."""
+        at = _SNAPSHOT_BYTES - 32
+        changed = int.from_bytes(fr.tail[at:at + 16], "little")
+        tags = self._snap_tags(bytes(fr.tail))
+        for index in range(min(len(self.B), MAX_BINDERS)):
+            b = self._b(index)
+            if b.loc != L_VIRT and b.aux != tags.get(index, 0):
+                changed |= 1 << index
+        fr.tail[at:at + 16] = changed.to_bytes(16, "little")
+
+    def _merge_tags(self, fr: Fr) -> None:
+        """Section 5.3: a cell's tag is known after a join only if no arm changed it.
+        Otherwise it is unknown, and the next rebuild writes it."""
+        at = _SNAPSHOT_BYTES - 32
+        changed = int.from_bytes(fr.tail[at:at + 16], "little")
+        tags = self._snap_tags(bytes(fr.tail))
+        for index in range(len(self.B)):
+            b = self._b(index)
+            if b.loc != L_VIRT and b.aux and (
+                    changed >> index & 1 or b.aux != tags.get(index, 0)):
+                b.aux = 0
+                self._set_b(index, b)
 
     # --- delivering a value to a destination
 
@@ -1504,6 +1557,7 @@ class Lower(Stage):
             self._save(fr)
             return
         self._remember_erased(fr)
+        self._remember_tags(fr)
         fr.word = self.res_word
         if fr.dk != D_COND and not self.dead:
             self._normalize(bytes(fr.tail))
@@ -1519,6 +1573,7 @@ class Lower(Stage):
             self._normalize(bytes(fr.tail))
             self.place(fr.l3)
         self._merge_erased(fr)
+        self._merge_tags(fr)
         self.res_word = self._join_word(fr.word, self.res_word)
         self.K.pop()
         self.res = None
@@ -1626,6 +1681,7 @@ class Lower(Stage):
         if not self.dead:
             self._consume(cell)
         self._remember_erased(fr)
+        self._remember_tags(fr)
         fr.word = word if not fr.b3 else self._join_word(fr.word, word)
         fr.b3 = 1
         self.res_word = fr.word
@@ -1645,6 +1701,7 @@ class Lower(Stage):
                 self._normalize(bytes(fr.tail))
                 self.place(fr.q)
             self._merge_erased(fr)
+            self._merge_tags(fr)
             b = self._b(fr.l3 - 1)
             b.flags &= ~F_NULLARM
             self._set_b(fr.l3 - 1, b)
