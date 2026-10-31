@@ -4,6 +4,7 @@ Each kind of claim is marked: resource safety, or translation correctness. A
 theorem test that cannot fail proves nothing, so every class holds a control
 that must trip the same detector on code that really does violate the claim.
 """
+import gc
 import os
 import re
 import subprocess
@@ -592,20 +593,43 @@ class DepthBound(unittest.TestCase):
         padded = (b"# " + b"x" * 100000 + b"\n") * 5 + b" " * 100000 + base
         self.assertEqual(self._peak(padded), self._peak(base))
 
-    def test_python_heap_is_flat_in_source_length(self):
-        """Nothing hides O(N) in Python objects: the external measure agrees."""
-        def peak(text: bytes) -> int:
-            tracemalloc.start()
-            compile_source(text, cells=4096)
-            value = tracemalloc.get_traced_memory()[1]
-            tracemalloc.stop()
-            return value
+    HEAP_ALLOWANCE = 8 * 1024
 
-        full, _ = self._balanced(10)
+    @staticmethod
+    def _heap_peak(text: bytes, hoard: bool = False) -> int:
+        """Peak traced Python heap over one compile. gc.collect() first also empties
+        CPython's free lists, so memory left there by earlier tests cannot hide a
+        cost: without it, this measure depended on which tests ran before it."""
+        lines: list[str] = []
+        gc.collect()
+        tracemalloc.start()
+        try:
+            compile_source(text, cells=4096, on_line=lines.append if hoard else None)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def _heap_sources(self) -> tuple[bytes, bytes]:
+        """One shape at two lengths, 6 KB and 25 KB. A bushy tree costs a fixed
+        ~330 KB more than a thin chain, levelling off at depth 10, so comparing the
+        two shapes measured that constant rather than growth with length."""
         make = "fn f(a: Int64) : Int64 = {};\nfn main() : Int64 = f(1);".format
-        small = peak(make(self._thin(10)).encode())
-        large = peak(make(full).encode())
-        self.assertLess(large, small + 64 * 1024, (small, large))
+        return make(self._balanced(10)[0]).encode(), make(self._balanced(12)[0]).encode()
+
+    def test_python_heap_is_flat_in_source_length(self):
+        """Nothing hides O(N) in Python objects: the external measure agrees. The
+        longer source is three times the allowance, so a stage that kept even one
+        copy of it would fail; the control below shows the detector trips."""
+        small_text, large_text = self._heap_sources()
+        self.assertGreater(len(large_text), 3 * self.HEAP_ALLOWANCE)
+        small, large = self._heap_peak(small_text), self._heap_peak(large_text)
+        self.assertLess(large, small + self.HEAP_ALLOWANCE, (small, large))
+
+    def test_control_heap_detector_catches_an_o_n_hoard(self):
+        """Keep every emitted line during the compile: the same measure must fail."""
+        small_text, large_text = self._heap_sources()
+        small, large = self._heap_peak(small_text, True), self._heap_peak(large_text, True)
+        self.assertGreater(large, small + self.HEAP_ALLOWANCE, (small, large))
 
     def test_peak_grows_linearly_with_depth(self):
         peaks = []

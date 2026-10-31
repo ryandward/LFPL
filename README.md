@@ -130,8 +130,9 @@ Python allocates, of course, so what this reference enforces is the model. Token
 events and frames live in a real array of 16-byte cells, and a cell refuses a 16th byte
 of payload, so a stage cannot quietly keep more state than the model allows. A few short
 Python lists name those cells. So that nothing can hide in ordinary objects instead, a
-test also watches the Python heap and confirms that it barely moves between a short
-source and a far longer one of the same depth.
+test also watches the Python heap and confirms that it barely moves between a source
+and one four times longer of the same shape, with a control that keeps its output and
+must fail.
 
 ## Why you might believe it
 
