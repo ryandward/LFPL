@@ -4,6 +4,7 @@ Each kind of claim is marked: resource safety, or translation correctness. A
 theorem test that cannot fail proves nothing, so every class holds a control
 that must trip the same detector on code that really does violate the claim.
 """
+import gc
 import os
 import re
 import subprocess
@@ -532,10 +533,13 @@ class DepthBound(unittest.TestCase):
     @staticmethod
     def _heap_peak(text: bytes, lexer: type = Lexer) -> int:
         """Peak Python heap for one compile. The source itself was allocated before
-        tracing starts, so only what the stages keep counts against them."""
+        tracing starts, so only what the stages keep counts against them. gc.collect()
+        also empties CPython's free lists, so memory that earlier tests left there
+        cannot absorb a cost: without it, the result depended on test order."""
         lower = Lower()
         ring = Ring(required_cells(16), iter(text), [lexer(), Parser(16), CheckStage(), lower],
                     lambda tag, payload: None)
+        gc.collect()
         tracemalloc.start()
         ring.run()
         peak = tracemalloc.get_traced_memory()[1]
@@ -543,12 +547,18 @@ class DepthBound(unittest.TestCase):
         return peak
 
     def _heap_sources(self) -> tuple[bytes, bytes]:
-        """Two sources of one depth, a thin one and one of roughly 100 KB."""
+        """One shape at two lengths, about 25 KB and 100 KB. A bushy tree costs a
+        fixed ~340 KB more heap than a thin chain whatever its length, levelling off
+        by depth 10, so comparing those two shapes measured that constant instead of
+        growth, and passed only when earlier tests had warmed the process."""
         name = "a" * 15
         make = f"fn f({name}: Int64) : Int64 = {{}};\n".format
-        full, _ = self._balanced(12)
-        return (make(self._thin(12).replace("a", name)).encode(),
-                make(full.replace("a", name).replace(", ", ",     ")).encode())
+
+        def padded(depth: int) -> bytes:
+            tree, _ = self._balanced(depth)
+            return make(tree.replace("a", name).replace(", ", ",     ")).encode()
+
+        return padded(10), padded(12)
 
     def test_python_heap_does_not_follow_source_length(self):
         """The external measure. Nothing may hide O(N) in ordinary Python objects: the
