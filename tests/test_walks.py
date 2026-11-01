@@ -88,6 +88,26 @@ fn choose(l: Bytes) : Bytes =
   let (k, m) = first(l) in
   let j = if ==(&(k, 1), 0) then m else rev(m, Last) in
   rev(j, Last);
+fn sums(l: Bytes, acc: Bytes) : Bytes = match l with
+  | Last => acc
+  | Chunk(d, {FIELDS}, next) => match next with
+      | Last => Chunk@d({FIELDS}, acc)
+      | Chunk(e, {C2}, rest) =>
+          sums(rest, Chunk@e(used, +(b0, c0), b1, b2, b3, b4, b5, b6, Chunk@d({C2}, acc)))
+      end
+  end;
+fn late(l: Bytes) : Bytes = match l with
+  | Last => Last
+  | Chunk(d, {FIELDS}, next) =>
+      let r = rev(next, Last) in
+      Chunk@d(used, +(b0, 1), b1, b2, b3, b4, b5, b6, r)
+  end;
+fn early(l: Bytes) : Bytes = match l with
+  | Last => Last
+  | Chunk(d, {FIELDS}, next) =>
+      let r = if <(b1, 128) then next else rev(next, Last) in
+      Chunk@d(used, +(b0, 1), b1, b2, b3, b4, b5, b6, r)
+  end;
 fn touch(l: Bytes) : Bytes = match l with
   | Last => Last
   | Chunk(d, {FIELDS}, next) => Chunk@d(used, ^(b0, 255), b1, b2, b3, b4, b5, b6, next)
@@ -178,6 +198,31 @@ def model_choose(cells: list) -> list:
     return list(cells) if cells and cells[0][1] & 1 else cells[::-1]
 
 
+def model_sums(cells: list) -> list:
+    out: list = []
+    for at in range(0, len(cells), 2):
+        pair = cells[at:at + 2]
+        if len(pair) == 2:
+            (used, b0, *others), second = pair
+            pair = [(used, (b0 + second[1]) & 255, *others), second]
+        out = pair + out
+    return out
+
+
+def model_late(cells: list) -> list:
+    if not cells:
+        return cells
+    (used, b0, *others), *rest = cells
+    return [(used, (b0 + 1) & 255, *others), *rest[::-1]]
+
+
+def model_early(cells: list) -> list:
+    if not cells:
+        return cells
+    (used, b0, b1, *others), *rest = cells
+    return [(used, (b0 + 1) & 255, b1, *others), *(rest if b1 < 128 else rest[::-1])]
+
+
 def model_touch(cells: list) -> list:
     if not cells:
         return cells
@@ -200,6 +245,9 @@ STEPS = {
     "rev": ("let {out} = rev({x}, Last) in\n", model_rev, 1),
     "dear": ("let {out} = dear({x}, Last) in\n", model_dear, 1),
     "choose": ("let {out} = choose({x}) in\n", model_choose, 1),
+    "sums": ("let {out} = sums({x}, Last) in\n", model_sums, 1),
+    "late": ("let {out} = late({x}) in\n", model_late, 1),
+    "early": ("let {out} = early({x}) in\n", model_early, 1),
     "touch": ("let {out} = touch({x}) in\n", model_touch, 1),
     "incr": ("let {out} = incr({x}) in\n", model_incr, 1),
     "marks": ("let ({out}, {free_out}) = marks({x}, {free}) in\n", model_marks, 1),
@@ -281,6 +329,9 @@ class TheModels(unittest.TestCase):
         self.assertEqual(model_dup([a, b]), [b, b, a, a])
         self.assertEqual(model_thin([a, b, c]), [c, a])
         self.assertEqual(model_pairs([a, b, c]), [c, a, b])
+        self.assertEqual(model_sums([a, b, c]), [c, (1, 5, *bytes(6)), b])
+        self.assertEqual(model_late([a, b, c]), [(1, 3, *bytes(6)), c, b])
+        self.assertEqual(model_early([a, b, c]), [(1, 3, *bytes(6)), b, c])
         self.assertEqual(model_touch([a, b]), [(1, 2 ^ 255, *bytes(6)), b])
         self.assertEqual(model_incr([a, b]), [(1, 3, *bytes(6)), (1, 4, *bytes(6))])
         # b1 and b2 are zero, so both ifs take their first arm: 2 + 6 = 8, and mix(8) = 15 ^ 85.
@@ -369,7 +420,7 @@ class RandomWalks(unittest.TestCase):
             with tempfile.TemporaryDirectory() as workdir:
                 share = self._serve(names, workdir, rng, seed)
             loosest = min(loosest, share)
-            if not {"thin", "marks", "choose"} & set(names):
+            if not {"thin", "marks", "choose", "early"} & set(names):
                 loosest_exact = min(loosest_exact, share)
         print(f"walking handlers: {COUNT} ran; the loosest W(n) was {loosest:.0%} used, "
               f"and {loosest_exact:.0%} among those with one path", file=sys.stderr)

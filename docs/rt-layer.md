@@ -330,24 +330,85 @@ front end, because every backend needs them.
 
 ## Lowering to RTL
 
-Each function is one state machine. Each RT register is a flip-flop bank at its type's width,
-so nothing spills. This is LFPL-O section 9.1 with its inputs named.
+`src/rtverilog.py` is LFPL-O section 9.1 with its inputs named. It reads the stream as text, imports
+nothing from `src/x86.py` or `src/runtime.py`, and writes nothing until rtcheck has accepted every
+line and the bound has passed its certificate.
 
-    const, move, copy      a latch, or a wire when it can be renamed
-    drop, r!, =, open      nothing
-    op, cmp, trunc         combinational. Verilog's << and >> are already 0 past the width.
-    pack                   wires: {a, b, c}
-    read, take             a block-RAM read state, then a latch
-    build                  one block-RAM write whose byte enables cover exactly the sources that
-                           are not `=` or `r!`, and the tag on `write`. RTL-3 is then a property
-                           of this rule, not something to check for afterwards.
-    br, br.null, br.tag    the next state, chosen by a comparison, with no boolean register
-    call                   start and done on the callee's unit, inlined or shared
-    tail, tailmod          latch the parameters, then return to the entry state
-    ret                    done, with the result on the unit's output
+The whole handler is one synchronous state machine. Each RT register is a flip-flop bank at its
+type's width, named for its function, so nothing spills. There is no stack: rtcheck refuses non-tail
+recursion, so no function is ever active twice and its registers can be static. A cell is one 128-bit
+word of a dual-port block RAM addressed by a log2(C)-bit pointer, whose word 0 is null and never a
+cell. Port A reads, and its output holds until the next read. Port B writes, with a byte enable per
+byte. No state uses both.
 
-Each instruction takes at most `k_rtl` states, and the schedule keeps to the block RAM's port
-limit. `inc` becomes the machine in LFPL-O section 9.2 directly.
+    drop, open         no state. `open` needs no read until a field of the cell is named
+    move               no state: the move happens in the next clock, as one more <=
+    const, copy, op,   one state, one <=. Verilog's << and >> are already 0 past the width, and a
+      cmp, trunc,      literal is written at the width it meets
+      pack, idx
+    read, take         one state: a slice of port A's output, latched
+    build              one state: one write, whose byte enables cover exactly the sources that are
+                       not `=`, `r!` or `*`, and the tag on `write`. RTL-3 is then a property of this
+                       rule. If nothing changes, memory is not touched
+    br, jump           one state, with no boolean register
+    br.null            one state. The test and the read are the same clock, with the pointer as the
+                       address, so the word is at port A in the next state and a walk spends no extra
+                       clock per cell. Nothing is read if the pointer is null
+    br.tag             one state, and a read in front of it if the word is not already at the port
+    aget               two states: an array is its own block RAM, so a read, and a latch
+    call               one state: <= on the callee's parameters, and on its return state if it has
+                       more than one. The results come back by the callee's `ret`
+    tail               one state: <= on every parameter, and the entry state. `tail f0, r23, r24,
+                       r25, r2` is four <= at one edge, each from what held before it, so the parallel
+                       move x86 has to schedule, with a scratch register to break cycles, is not there
+    tailmod            one state: `build` and `tail` at once
+    ret                one state: <= on the destination registers of the call this is returning
+                       from, chosen by the return state if there are several, then that state
+
+An instruction that names a location of a cell whose word is not at port A's output gets a read state
+in front of it. Locations of two cells in one instruction need the first latched, because there is one
+read port. The emitter tracks which cell's word is at the port along each path: a read replaces
+it, a `build` of that cell ends it, a call to something that reads ends it, and a join keeps it only
+if every edge agrees.
+
+### The bound in cycles
+
+Those extra states are the only ones RT does not charge for, so the emitter can derive a bound
+from what it emitted, and it prints it at compile time, before anything runs. Count from the edge that
+samples `start` to the edge that raises `done`. Each state holds the machine for one clock, so that
+count is the number of states executed. Write cost(I) for one plus the hardware-only states in front
+of an instruction I, and split the code in two:
+
+- **In a walk:** a recursive function and everything it calls, which run a number of times that depends
+  on the item. k is the largest cost(I) among them.
+- **The rest:** runs at most once per call on a call graph with no cycle. c is the largest number of
+  hardware-only states on any path through it, found by walking the states.
+
+So cycles <= k * steps + c, and rtcheck has certified steps <= W(n). The checksum's numbers are k = 1
+and c = 1: its walks are one state per instruction, and the one state RT does not charge for is the read
+of the header cell, the first time a field of it is named. Since every path of that handler takes W(n)
+steps, the bound is an equality, and `tests/test_rtverilog.py` requires it to be. A tagged walk has k = 2,
+and one that adds a field of one cell to a field of another has k = 3.
+
+### What only made sense for x86
+
+Nothing in RT had to change for this backend. There were no flags, frames, spills, clobber sets or
+calling conventions to work around, because RT has none of them. But lowering it to a target without
+x86's habits shows what in it came from x86:
+
+- **`open` costs nothing, and `br.tag` one step.** On x86 a field is read by naming it, and
+  `cmp byte [p], k` reads memory and compares in one instruction. A block RAM returns a word a clock
+  after it is asked, so a tag test here is two clocks, and that is what k > 1 comes from. W(n) charges
+  for x86's way of touching memory. It is a count of steps, and k is what it costs to treat it as cycles.
+- **A computed source `f([l], b)` is limited to add, sub, and, or and xor,** because that is what one
+  x86 instruction does in memory (`READ_MODIFY_WRITE` in rtcheck). Here it is a slice of port A through
+  whatever logic, and into port B, for any operation.
+- **A pointer takes 8 bytes of a cell.** That is x86's word, and it is written into the stream as a field
+  of size 8. A 14-bit pointer leaves 50 bits of every link unused, and it is why a chain cell holds 7
+  bytes of payload and not 13. Any other target would want this to be its own.
+- **Six arguments and six tuple members** is the x86 register convention, and Check holds it. A state
+  machine has no such limit.
+- **`r!` on a comparison** tells x86 a register has gone free. Here it means nothing.
 
 ## Worked example: `inc`
 
@@ -392,7 +453,7 @@ stream says, and that the stream means what the source says.
                                               \-> RTL backend -> differential simulation
 
 `src/rtcheck.py` shares no code with Lower, and a failure means no output. `src/rtlower.py`
-writes the stream, and `src/x86.py` lowers it. Every Phase 1 generator passes through this path
-and the section 4.7 handler is built by it. What is left: moving `tests/test_invariants.py` over
-so `src/lower.py` can go, then the RTL backend. Division and `swap` are new instructions with total
+writes the stream, and `src/x86.py` and `src/rtverilog.py` lower it. Every Phase 1 generator passes
+through this path and the section 4.7 handler is built by it. What is left: moving
+`tests/test_invariants.py` over so `src/lower.py` can go. Division and `swap` are new instructions with total
 meanings, and DESCEND and ASCEND are a pair that saves live registers into the destructured cell.

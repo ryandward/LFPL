@@ -16,6 +16,9 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATIENCE = 300  # seconds: a mutant with nothing to catch it takes about 90
+VERILOG_TESTS = ["tests.test_rtverilog.TheEmittersOwnArithmetic", "tests.test_rtverilog.TheChecksum",
+                 "tests.test_rtverilog.RandomWalks", "tests.test_rtverilog.OtherHandlers",
+                 "tests.test_rtverilog.Synthesis"]
 # Running code first, so that a verdict says whether a mutant is caught by what a binary does, and
 # not only by the numbers in a unit test.
 TESTS = ["tests.test_walks.RandomWalks", "tests.test_walks.TheDearestWayThrough", "tests.test_walks.TheEndArm",
@@ -137,6 +140,77 @@ MUTANTS = {
         'add(f"    jae .too_long_{position}")', 'pass'),
     "a whole cell's used count is left stale": ("src/runtime.py",
         'add(f"    mov byte [rdi], {BODY_PAYLOAD}")', 'pass'),
+    # --- the Verilog backend: what it builds, and what it says about what it built
+    "a field is read before its cell is": ("src/rtverilog.py",
+        "        if self.loaded == register:\n            return\n        pointer = self._pointer(register)\n",
+        "        self.loaded = register\n        return\n        pointer = self._pointer(register)\n"),
+    "a word at the port survives a call that reads": ("src/rtverilog.py",
+        "        if callee.reads:  # it leaves its own word at the port\n            self.loaded = None\n",
+        ""),
+    "a word at the port survives another read": ("src/rtverilog.py",
+        "        self._edge(a[1], self.loaded)\n        self._edge(a[2], p)\n",
+        "        self._edge(a[1], self.loaded)\n        self._edge(a[2], self.loaded)\n"),
+    "a word at the port survives a join it does not reach": ("src/rtverilog.py",
+        "self.loaded = incoming[0] if incoming and all(i == incoming[0] for i in incoming) else None",
+        "self.loaded = incoming[0] if incoming else None"),
+    "a word at the port outlives a call's result in its register": ("src/rtverilog.py",
+        "            site.results.append((fn.flop(register), fn.widths[register]))\n            if self.loaded == register:\n                self.loaded = None\n",
+        "            site.results.append((fn.flop(register), fn.widths[register]))\n"),
+    "a word at the port outlives a move into its register": ("src/rtverilog.py",
+        "        elif self.loaded == target:\n            self.loaded = None  # it held that cell once, and it does not now\n",
+        ""),
+    "a callee's reads do not count for what calls it": ("src/rtverilog.py",
+        "fn.reads = any(state.reads for state in fn.states) or any(callee.reads for callee in fn.calls)",
+        "fn.reads = any(state.reads for state in fn.states)"),
+    "a write covers the whole cell": ("src/rtverilog.py",
+        "            enables |= ((1 << size) - 1) << offset\n            low, high, width",
+        "            enables = 0xffff\n            low, high, width"),
+    "a tag is not written": ("src/rtverilog.py",
+        "        if tag == \"write\":\n            enables |= 1\n",
+        "        if False:\n            enables |= 1\n"),
+    "a RESTORE writes": ("src/rtverilog.py",
+        "            if source in (\"=\", \"*\") or source.endswith(\"!\"):\n                continue\n            enables",
+        "            if source in (\"=\", \"*\"):\n                continue\n            enables"),
+    "the emitter forgets the states in front when it works out k": ("src/rtverilog.py",
+        "        cost = 1 + self.attached\n",
+        "        cost = 1\n"),
+    "the emitter forgets the states in front when it works out c": ("src/rtverilog.py",
+        "            own = 1 if state.hardware else 0\n",
+        "            own = 0\n"),
+    "c does not look inside what a handler calls": ("src/rtverilog.py",
+        "                own += self._hardware_states(state.next.callee, walking, known)\n",
+        "                pass\n"),
+    "k does not look at what a walk calls": ("src/rtverilog.py",
+        "                waiting.extend(fn.calls)\n",
+        "                pass\n"),
+    "a tail call returns to nobody's caller": ("src/rtverilog.py",
+        "                    if inherited not in callee.sites:\n                        callee.sites.append(inherited)\n",
+        "                    pass\n"),
+    "an @ function returns where it got to": ("src/rtverilog.py",
+        "        if fn.at is not None:  # whatever this iteration holds, the caller gets the cell it passed\n            values",
+        "        if False:\n            values"),
+    "a waiting move is forgotten": ("src/rtverilog.py",
+        "        for target, source in self.pending.items():  # every waiting move happens in this clock\n",
+        "        for target, source in ():\n"),
+    "a latched operand is not what is used": ("src/rtverilog.py",
+        "        if text in self.latched:\n            name, width = self.latched[text]\n            return _whole(name, width, want)\n",
+        ""),
+    "pack puts its operands the other way round": ("src/rtverilog.py",
+        "        parts = [self._value(operand, bits) for bits, operand in zip(widths, a[2:])]\n",
+        "        parts = [self._value(operand, bits) for bits, operand in zip(widths, a[2:])][::-1]\n"),
+    "a comparison is one wider than it should be": ("src/rtverilog.py",
+        "COMPARISONS = {\"b\": \"<\", \"be\": \"<=\", ",
+        "COMPARISONS = {\"b\": \"<=\", \"be\": \"<=\", "),
+    "the host can read while it writes": ("src/rtverilog.py",
+        "a_en = host_en && host_we == {CELL_BYTES}'d0;",
+        "a_en = host_en;"),
+    "a write reads as well": ("src/rtverilog.py",
+        "        return [f\"b_we = {CELL_BYTES}'h{enables:04x};\", ",
+        "        return [\"a_en = 1'b1;\", f\"b_we = {CELL_BYTES}'h{enables:04x};\", "),
+    "port A's output does not hold": ("src/rtverilog.py",
+        "        add(\"        if (a_en) a_dout <= cells[a_addr];\")\n",
+        "        add(\"        a_dout <= cells[a_addr];\")\n"),
+    # --- back to the runtime
     "the image is sized without the reserve": ("src/runtime.py",
         "return (K_IN * n_max + self.reserve_at_most + n_max\n",
         "return (K_IN * n_max + n_max\n"),
@@ -159,6 +233,7 @@ MUTANTS = {
 
 
 def run(work: str, path: str, old: str, new: str) -> tuple:
+    tests = VERILOG_TESTS if path == "src/rtverilog.py" else TESTS
     """What became of one mutant: its verdict, and whether the tests failed to notice it."""
     tree = os.path.join(work, "tree")
     shutil.rmtree(tree, ignore_errors=True)
@@ -172,7 +247,7 @@ def run(work: str, path: str, old: str, new: str) -> tuple:
         handle.write(text.replace(old, new, 1))
     start = time.time()
     try:
-        done = subprocess.run([sys.executable, "-W", "ignore::ResourceWarning", "-m", "unittest", "-f", *TESTS],
+        done = subprocess.run([sys.executable, "-W", "ignore::ResourceWarning", "-m", "unittest", "-f", *tests],
                               cwd=tree, env=dict(os.environ, TMPDIR=work, LFPL_FUZZ="30"),
                               capture_output=True, text=True, timeout=PATIENCE)
     except subprocess.TimeoutExpired:  # what removing a size limit looks like

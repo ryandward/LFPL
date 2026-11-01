@@ -550,7 +550,7 @@ Lower does not write x86 directly. `src/rtlower.py` emits a flat, typed register
 - **Explicit ownership.** Registers are unbounded per function, and moves consume their source, so ownership is written into the code instead of being reconstructed beside it.
 - **Atomic constructors.** A constructor is one instruction: it reads all its sources, then writes, and each field's source says STAY, RESTORE or STORE. Writing a value back where it came from is a local type error, and so is claiming RESTORE when a store is needed. That is the first specification's Theorem 6.1, checked locally.
 - **Joins and calls.** Labels apply the merge rule of section 8.3. A call removes every token of a cell whose capability it receives.
-- **Two backends.** x86 becomes register allocation over this stream, which is `src/x86.py`, and RTL maps almost one instruction to one state, which is not built yet.
+- **Two backends.** x86 becomes register allocation over this stream, which is `src/x86.py`, and RTL maps almost one instruction to one state, which is `src/rtverilog.py`.
 
 Of the 12 wrong-code bugs found in Phase 1, 8 are local type errors at this level. The other 4 are facts about x86: a truncated immediate, a spilled operand, the result register lost across a back-edge, and a masked shift count. Those stay with the symbolic checker. The layer keeps the O(D) bound: control flow is structured, so the checker holds token states only for labels still open, at most one per enclosing construct.
 
@@ -755,7 +755,7 @@ The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and 
 | identity-morphism validator | present, but **only in the test suite**: `src/lfplo.py` does not run it, so a build does not yet make the fourth check of section 8.4 | run it on every build |
 | heap-flatness test | present, on both compilers, and it holds when run on its own | nothing |
 | cell conservation in the compiler ring | present on both compilers, with Theorem 7.2's bound checked at every step | nothing |
-| RTL backend | absent | section 9 |
+| RTL backend | the handler and everything it calls, for every RT instruction: `src/rtverilog.py`, which needed no change to anything before it. Its bound in cycles is derived by the emitter and held to in simulation, its outputs are compared with the x86 binary's on the same bytes, and yosys maps its cell store to block RAM. | hardware ingress, egress and admission, which are test code on this target so far, and `swap` |
 
 The implementation decides some things this text leaves open, or does not mention:
 
@@ -769,7 +769,9 @@ The implementation decides some things this text leaves open, or does not mentio
 - **Link-time options.** `--state` gives a state array its initial contents, and `--cells` can make the image smaller than section 3.4's C, which is what makes Short reachable. `--count-steps` validates the build without its counters and then rebuilds with one at each step the checker charged for, so that tests can hold running code to W(n). That rebuild is for measuring, and is not itself validated.
 - **The chain.** An item's chain may be abstract, like `data Bytes;`, or declared with the exact layout the runtime builds, `Last | Chunk(used, b0, ..., b6: Int8, next)`, which lets a handler walk it. Cells are reused, so admission clears what follows the used bytes of a chain's last cell, and a program can read nothing an earlier item left. A program can now also write the used count and grow the chain, so egress clamps each count to 7. N\_out is not declared: it is N\_max + R(N\_max), because an output can hold every cell of its item and of its reserve. One message gathers at most 1,024 chain entries, which is what `sendmsg` takes, and a longer chain counts as a send error, with its cells returned.
 - **Narrowing.** `low8`, `low16` and `low32` keep the low bits of an integer. `pack` only widens, and without these a sum worked out in Int64 could not be stored in a narrower field.
-- **Steps.** A step is one instruction of the register-transfer stream, except `move`, `drop` and `open`, which lower to nothing.
+- **Steps.** A step is one instruction of the register-transfer stream, except `move`, `drop` and `open`, which lower to nothing on x86. On the RTL target `open` can take a clock, and so can the read in front of `br.tag`, because a block RAM returns a word a clock after it is asked. `docs/rt-layer.md` lists what else in the stream came from x86.
+- **k\_rtl.** It is not a constant of the translation. The emitter derives k and c for each program from the states it wrote, and section 9.3's bound becomes cycles(n) <= k * W(n) + c, counted from the edge that samples `start` to the edge that raises `done`. For `examples/checksum.lfpl`, k = 1 and c = 1.
+- **Read during write.** No state of the machine enables both of the cell store's ports, and a host that writes does not read, so a clock never reads and writes one address. In the Verilog such a read would return the old word, but no block RAM is asked to say so: yosys proves from the state decode that the two enables never meet, and maps the store with no logic for it. If the host's write did not hold off its read, yosys could not prove it, and on iCE40 it spends about 300 flip-flops delaying the write to keep the old-word answer.
 
 The plan, with what is done marked. Arrays and tuples came ahead of resource analysis, because the handler needs them:
 

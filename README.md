@@ -82,7 +82,8 @@ fn forget(l: List) : Int64 = 1;
 
 ## Running it
 
-You need Python 3, `nasm` and `ld`, and no C compiler is involved at any point.
+You need Python 3, `nasm` and `ld`, and no C compiler is involved at any point. The hardware target
+also uses `iverilog`, `yosys` and `verilator`, and its tests skip themselves without them.
 
 ```
 python3 -m src.lower examples/inc.lfpl      # print the assembly
@@ -227,6 +228,80 @@ have to be able to fail, so `tools/mutate_bounds.py` breaks the rules that deriv
 code that uses one, a line at a time, and reports any break that no test notices. Its first run found
 that the image was too small for a handler that grows its item, and that nothing was timing a walk
 with a join in it.
+
+## The same stream in hardware
+
+The layer between the compiler and x86 claims not to be about x86. The way to find out is to lower it
+to something with no registers to run out of, no stack and no instructions, and see what breaks.
+`src/rtverilog.py` turns the same checked stream into one synchronous state machine in Verilog. It
+imports nothing from the x86 backend or runtime, nothing before it changed to allow it, and it writes
+nothing until `src/rtcheck.py` has accepted every line.
+
+```
+$ python3 -m src.rtverilog examples/checksum.lfpl -o checksum.v
+...
+walk add: 24 cycles per iteration, 2 to leave
+walk reverse: 4 cycles per iteration, 2 to leave
+k = 1: the most cycles any one instruction takes in a walk
+c = 1: the most states RT does not charge for, on a path outside the walks
+cycles(n) <= 1*W(n) + 1 = 28 n + 5, from the edge that samples start to the edge that raises done
+```
+
+Every RT register becomes flip-flops, and every cell a word of block RAM. A state is one instruction,
+and here is the end of `add`'s loop, as the compiler wrote it:
+
+```
+// take r25, r2[8:8]
+add_s22: begin
+    add_r25 <= a_dout[77:64];
+    state <= add_s23;
+end
+// build r2, c6, none, =, =, =, =, =, =, =, =, r3
+add_s23: state <= add_s24;
+// tail f0, r23, r24, r25, r2
+add_s24: begin
+    add_r0 <= add_r23;
+    add_r1 <= add_r24;
+    add_r2 <= add_r25;
+    add_r3 <= add_r2;
+    state <= add_s0;
+end
+```
+
+The `tail` is the part x86 finds hard. Four registers change at once, and `add_r3` gets the value `add_r2`
+held before the clock edge, because that is what `<=` means, so the parallel move that takes
+the x86 backend a scheduler and a scratch register does not exist. The `build` is a state with no
+assignment, because its work is on the block RAM's write port, where `b_we = 16'hff00` enables the
+eight bytes of the link and no others. Eight of its nine fields say `=`, and a field with no enable
+cannot be written. Nothing checks for that: it is what the instruction means. And `add_s0`, the null
+test, is also the read of the next cell, whose word is at the port in the next state, so a walk
+spends no extra clock per cell.
+
+So the emitter can say what the machine will take before anything runs, as the report above does.
+`tests/test_rtverilog.py` then holds it to that, on the datagrams of the live UDP run, 240 random ones
+and those that take each path all the way along, with each output compared with the x86 binary's
+on the same bytes. These are the five the UDP run showed, with the steps counted by an x86 build:
+
+| Payload bytes | n | W(n) | x86 steps | Cycles | Cycles / steps |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 1 | 32 | 32 | 33 | 1.0312 |
+| 7 | 2 | 60 | 60 | 61 | 1.0167 |
+| 8 | 3 | 88 | 88 | 89 | 1.0114 |
+| 1000 | 144 | 4036 | 4036 | 4037 | 1.0002 |
+| 1505 | 216 | 6052 | 6052 | 6053 | 1.0002 |
+
+The one extra cycle is the read of the header cell, the first time a field of it is named. x86 reads a
+field by naming it, so RT's `open` charges nothing, and a block RAM has to be asked first. That is
+tested parity on those inputs, and not a proof. The random pipelines of `tests/test_walks.py`, the
+forwarding handler and the generated handlers run on both targets as well, which is what covers
+joins, tagged types, arrays and tail recursion modulo cons. `yosys` maps the cell store to block RAM,
+`verilator -Wall` has nothing to say, and `tools/place_and_route.py` routes the checksum on an iCE40 HX8K,
+with an image of 432 cells, at no worse than 81.82 MHz over five seeds, by `nextpnr`'s timing analysis.
+So the largest item has a bound in time: 6053 cycles, or 73.98 microseconds. There are no caches or
+interrupts in the machine for that to depend on, which is what x86 cannot say.
+
+What is not built on this target is everything around the handler. Ingress, egress and admission are
+test code driving the block RAM between items, so a datagram does not reach this machine by itself yet.
 
 ## How the compiler holds itself to the same rules
 
@@ -426,6 +501,10 @@ handler and one ingress, one datagram per turn, bound to the loopback address. A
 pool and queue, but not a program's own predicate, which cannot be declared yet. The control port and
 pausing egress are not in the specification: without a way to look inside and a way to hold egress
 still, on loopback where sends never block, none of the rest could be shown.
+
+On the hardware side, `docs/rt-layer.md` lists what in the RT layer turned out to have come from x86:
+a pointer's 8 bytes, which is why a chain cell holds 7 bytes of payload, six arguments, and a cost model
+in which reading a cell is free until a field is named.
 
 Two limits come from the bound's own arithmetic. A handler's linear program stops at 1,024
 inequalities, and because each call gets its own copy of what it calls, those multiply with the depth
