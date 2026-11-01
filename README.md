@@ -196,6 +196,13 @@ owns it, so a field you still want has to be copied first, with `+(x, 0)`. Secti
 own cell, which depends on exits the compiler has not reached yet, and that is why the
 `@l` annotation exists: the signature declares it, and each exit is checked against it.
 
+Two rules from the later LFPL-O specification are already in force, because a running program
+must not hang or depend on hardware accidents. Every function has to terminate: for some fixed
+set of linear arguments, not counting `Free`, the total number of cells must strictly fall at
+every recursive call. So `fn spin(x: Int64) : Int64 = spin(x);` is refused, while a walk that
+shrinks one argument on some calls and another on the rest is fine as long as their sum falls.
+And shifts are total: a shift by the width or more gives 0, whatever x86 would do with the count.
+
 A few other places simply did not survive contact. Section 5.7 evacuates live registers
 before moving arguments into place, but taken literally that spills a value and reloads
 it while its register still holds it, the very round trip Theorem 7.5 says cannot
@@ -228,7 +235,7 @@ argument's own cell.
 
 The language is also narrower than the model in smaller ways. Pairs are left out because
 section 1 gives them no term form, functions take at most six arguments and must be
-defined before they are called, and shift counts must be literals. On the verification
+defined before they are called. On the verification
 side, the model's term-level rules are realized by the emitted code rather than run by
 an interpreter, the stages themselves are Python rather than LFPL, and the stack bound of
 Theorem 7.3 is computed but has not been measured.
