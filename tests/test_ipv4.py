@@ -871,8 +871,11 @@ class TheHarness(unittest.TestCase):
             subprocess.run(["ip", "netns", "del", os.path.basename(path)], capture_output=True)
         for path in glob.glob("/sys/fs/bpf/lfplspeed*"):
             shutil.rmtree(path, ignore_errors=True)
-        if not self.had_pktgen and os.path.exists("/proc/net/pktgen"):
-            subprocess.run(["rmmod", "pktgen"], capture_output=True)
+        # A deleted namespace goes away a little later, and pktgen is in use until it has.
+        deadline = time.monotonic() + WAIT
+        while not self.had_pktgen and os.path.exists("/proc/net/pktgen") and time.monotonic() < deadline:
+            if subprocess.run(["rmmod", "pktgen"], capture_output=True).returncode:
+                time.sleep(0.1)
 
     def speed(self, *arguments: str) -> subprocess.CompletedProcess:
         with self.pair.inside():
@@ -1048,6 +1051,7 @@ class TheLoader(unittest.TestCase):
         self.assertTrue(self.seen_by_the_stack(frame))
 
     def test_a_program_already_there_is_not_replaced(self):
+        self.addCleanup(shutil.rmtree, self.pair.pin + "-other", True)
         with self.pair.inside():
             xdp_load.attach(FORWARDER_END, self.pair.pin, "drv", 1)
             with self.assertRaisesRegex(xdp_load.LoadError, "attaching XDP"):
@@ -1055,7 +1059,6 @@ class TheLoader(unittest.TestCase):
             xdp_load.detach(FORWARDER_END, self.pair.pin, "drv")
         self.assertFalse(os.path.exists(os.path.join(self.pair.pin + "-other", xdp_load.MAP_FILE)),
                          "a failed attach leaves no map behind for a runtime to find")
-        shutil.rmtree(self.pair.pin + "-other", ignore_errors=True)
 
     def test_the_program_for_returning_frames_drops_them(self):
         frame = model.ipv4_frame(identification=0x4343)
