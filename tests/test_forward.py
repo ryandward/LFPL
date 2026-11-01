@@ -5,6 +5,7 @@ answers `S` with the counters and `Q` by shutting down cleanly. Everything here 
 to a running binary, from outside it.
 """
 import os
+import re
 import resource
 import socket
 import struct
@@ -46,7 +47,8 @@ def egress_block() -> tuple[int, list]:
 class Forwarder:
     """Builds examples/forward.lfpl with a route table, and runs it."""
 
-    def __init__(self, routes: bytes, workdir: str, limit_lock: bool = False):
+    def __init__(self, routes: bytes, workdir: str, limit_lock: bool = False,
+                 build_options: tuple = ()):
         self.out_base, self.outputs = egress_block()
         self.in_port, self.ctl_port = free_port(), free_port()
         table = os.path.join(workdir, "routes.bin")
@@ -55,7 +57,8 @@ class Forwarder:
         exe = os.path.join(workdir, "forward")
         subprocess.run([sys.executable, "-m", "src.lfplo", SOURCE, "-o", exe,
                         "--in-port", str(self.in_port), "--out-port", str(self.out_base),
-                        "--ctl-port", str(self.ctl_port), "--state", f"routes={table}"],
+                        "--ctl-port", str(self.ctl_port), "--state", f"routes={table}",
+                        *build_options],
                        cwd=ROOT, check=True, capture_output=True, text=True)
         self.exe = exe
         limits = (lambda: resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))) if limit_lock else None
@@ -70,9 +73,9 @@ class Forwarder:
     def raw(self, data: bytes) -> None:
         self.tx.sendto(data, ("127.0.0.1", self.in_port))
 
-    def stats(self) -> dict:
+    def stats(self, command: bytes = b"S") -> dict:
         for _ in range(20):
-            self.ctl.sendto(b"S", ("127.0.0.1", self.ctl_port))
+            self.ctl.sendto(command, ("127.0.0.1", self.ctl_port))
             try:
                 reply = self.ctl.recv(256)
             except TimeoutError:
@@ -194,6 +197,171 @@ class ForwardingHandler(unittest.TestCase):
     def test_it_shuts_down_cleanly_when_told_to(self):
         self.closed = True
         self.assertEqual(self.router.close(), 0)
+
+
+class Overload(unittest.TestCase):
+    """Section 6.4. Loopback sends never block, so `P` pauses egress to make the pressure real."""
+
+    ROUTES = bytes((i % 8) for i in range(1024))
+
+    def start(self, *options: str) -> Forwarder:
+        workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(workdir.cleanup)
+        router = Forwarder(self.ROUTES, workdir.name, build_options=options)
+        self.addCleanup(router.close)
+        return router
+
+    def test_a_full_queue_refuses_and_nothing_admitted_is_lost(self):
+        router = self.start("--k-out", "8")
+        router.stats(b"P")
+        for i in range(12):
+            router.send(9, 3, b"%d" % i)
+        paused = router.settle(12)
+        self.assertEqual((paused["served"], paused["forwarded"], paused["full"]), (8, 8, 4))
+        self.assertLess(paused["pool"], paused["capacity"])
+        router.stats(b"R")
+        bodies = [router.outputs[3].recv(64)[5:] for _ in range(8)]
+        self.assertEqual(bodies, [b"%d" % i for i in range(8)], "out of order, or lost")
+        router.outputs[3].settimeout(0.1)
+        with self.assertRaises(TimeoutError):
+            router.outputs[3].recv(64)
+        drained = router.stats()
+        self.assertEqual(drained["pool"], drained["capacity"])
+
+    def test_a_short_pool_refuses_and_recovers(self):
+        # 8 cells of ingress and 32 in the pool, and a queue that could hold far more than that.
+        router = self.start("--n-max", "8", "--cells", "40")
+        largest = b"z" * (7 * 7)
+        router.stats(b"P")
+        for _ in range(7):
+            router.send(9, 2, largest)
+        paused = router.settle(7)
+        self.assertEqual((paused["capacity"], paused["served"], paused["short"]), (32, 4, 3))
+        self.assertEqual(paused["pool"], 0)
+        router.stats(b"R")
+        for _ in range(4):
+            self.assertEqual(router.outputs[2].recv(128)[5:], largest)
+        router.send(9, 2, largest)
+        self.assertEqual(router.outputs[2].recv(128)[5:], largest)
+        drained = router.settle(8)
+        self.assertEqual(drained["pool"], drained["capacity"])
+
+    def test_the_largest_item_fits_and_one_more_cell_is_too_large(self):
+        router = self.start("--n-max", "8", "--cells", "40")
+        router.send(9, 1, b"y" * (7 * 7))
+        self.assertEqual(len(router.outputs[1].recv(128)), 5 + 7 * 7)
+        before = router.stats()
+        router.send(9, 1, b"y" * (7 * 7 + 1))
+        after = router.settle(before["served"] + before["too_large"] + 1)
+        self.assertEqual(after["too_large"] - before["too_large"], 1)
+
+
+class Validation(unittest.TestCase):
+    """Section 8.4: every check runs on every build, and a failure leaves no binary."""
+
+    def build_with_damage(self, damage, exe: str, table: str):
+        from src import lfplo
+        from src.runtime import Options
+
+        real = lfplo._generate
+
+        def damaged(lines, asm_path, options, initial):
+            result = real(lines, asm_path, options, initial)
+            with open(asm_path) as handle:
+                text = handle.read()
+            with open(asm_path, "w") as handle:
+                handle.write(damage(text))
+            return result
+
+        lfplo._generate = damaged
+        try:
+            return lfplo.build(os.path.join(ROOT, SOURCE), exe, Options(41000, 41100, 41001),
+                               {"routes": table})
+        finally:
+            lfplo._generate = real
+
+    def test_a_wrong_handler_leaves_no_binary_and_removes_a_stale_one(self):
+        from src.lfplo import Refused
+
+        with tempfile.TemporaryDirectory() as workdir:
+            exe, table = os.path.join(workdir, "forward"), os.path.join(workdir, "routes.bin")
+            with open(table, "wb") as handle:
+                handle.write(bytes(1024))
+            self.build_with_damage(lambda text: text, exe, table)
+            self.assertTrue(os.path.exists(exe), "the control: an undamaged build must succeed")
+            with self.assertRaisesRegex(Refused, "translation validation"):
+                self.build_with_damage(lambda text: text.replace("and rbx, 1023", "and rbx, 1022"),
+                                       exe, table)
+            self.assertFalse(os.path.exists(exe))
+
+    def test_a_stack_the_compiler_did_not_reserve_leaves_no_binary(self):
+        from src.lfplo import Refused
+
+        with tempfile.TemporaryDirectory() as workdir:
+            exe, table = os.path.join(workdir, "forward"), os.path.join(workdir, "routes.bin")
+            with open(table, "wb") as handle:
+                handle.write(bytes(1024))
+            with self.assertRaisesRegex(Refused, "stack"):
+                self.build_with_damage(
+                    lambda text: text.replace("F_forward equ 0", "F_forward equ 800"), exe, table)
+            self.assertFalse(os.path.exists(exe))
+
+    def test_the_symbolic_check_sees_every_harmful_change_to_the_handler(self):
+        """Damage each instruction every way that still parses. Whatever survives must be on
+        this list, each entry with the reason it does not change what the handler means."""
+        from src import lfplo
+        from src.rtlower import rt_lines
+        from src.runtime import Options
+        from src.symcheck import check_translation
+
+        harmless = {
+            ("mov byte [rsi], 0", "word"),      # also zeroes offset 1, which Drop leaves as padding
+            ("movzx ebx, byte [rsi]", "word"),  # the extra byte never reaches the low 8 bits kept
+            ("movzx ebx, bl", "delete"),        # only bl is stored, so the upper bits never matter
+            ("mov byte [rsi+2], bl", "word"),   # offset 3 of Fwd is padding too
+        }
+        with open(os.path.join(ROOT, SOURCE), "rb") as handle:
+            source = handle.read()
+        with tempfile.TemporaryDirectory() as workdir:
+            asm_path, table = os.path.join(workdir, "p.asm"), os.path.join(workdir, "r.bin")
+            with open(table, "wb") as handle:
+                handle.write(bytes(1024))
+            with open(os.path.join(ROOT, SOURCE), "rb") as handle:
+                lfplo._generate(rt_lines(handle), asm_path, Options(1, 2, 3), {"routes": table})
+            with open(asm_path) as handle:
+                asm = handle.read()
+        self.assertEqual(check_translation(source, asm), [])
+        lines = asm.split("\n")
+        start = lines.index("fn_forward_body:")
+        end = next(i for i, line in enumerate(lines) if line.startswith("F_forward equ"))
+        caught = 0
+        for number in range(start + 1, end):
+            line = lines[number]
+            if not line.startswith("    "):
+                continue
+            for name, new in _damaged(line):
+                text = "\n".join(lines[:number] + ([] if new is None else [new]) + lines[number + 1:])
+                if check_translation(source, text):
+                    caught += 1
+                else:
+                    self.assertIn((line.strip(), name), harmless, f"{line.strip()} -> {new}")
+        self.assertGreater(caught, 50)
+
+
+def _damaged(line: str):
+    """Every small way to get one instruction wrong."""
+    yield "delete", None
+    for found in re.finditer(r"(?<![\w])(\d+)(?![\w])", line):
+        value = int(found.group(1))
+        for other in {value + 1, value - 1 if value else value + 2}:
+            yield f"{value}", line[:found.start()] + str(other) + line[found.end():]
+    registers = {"rdi": "rsi", "rsi": "rdx", "rdx": "rcx", "rcx": "rax", "rax": "rdi", "rbx": "rbp",
+                 "rbp": "rbx", "bpl": "bl", "bl": "bpl", "ebx": "ebp", "ebp": "ebx"}
+    for found in re.finditer(r"\b(" + "|".join(registers) + r")\b", line):
+        yield found.group(1), line[:found.start()] + registers[found.group(1)] + line[found.end():]
+    for old, new in (("ja ", "jb "), ("jbe ", "ja "), ("sub ", "add "), ("byte", "word")):
+        if old in line and "rsp" not in line:
+            yield new.strip(), line.replace(old, new, 1)
 
 
 class Startup(unittest.TestCase):

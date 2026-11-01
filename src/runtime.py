@@ -20,9 +20,11 @@ What the source does not say, this file decides:
                     as its other scalar fields followed by its chain. Any other constructor
                     sends nothing, and its cells go back to the pool.
 
-The control port answers `S` with the counters, walking the free list to count the pool instead
-of trusting a counter, and `Q` by shutting down. It is an ingress source like any other, bound
-to the loopback address as the others are.
+The control port is an ingress source like any other, bound to the loopback address as the rest
+are. `S` answers with the counters, walking the free list to count the pool instead of trusting
+a counter. `P` pauses egress and `R` resumes it, for maintenance, and because loopback sends never
+block, so without it nothing here could show that a full queue refuses. Each answers with the
+counters too, so whoever sent it knows it has happened. `Q` drains and shuts down.
 """
 from __future__ import annotations
 
@@ -74,6 +76,7 @@ class Options:
     ctl_port: int
     n_max: int = 216     # the largest item in cells: 1 header and 215 of 7 bytes, for a 1500 MTU
     k_out: int = 64      # the output queue, a power of two
+    cells: Optional[int] = None  # None: section 3.4's C. Fewer can make admission refuse with Short
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,8 @@ class Image:
     def cell_count(self) -> int:
         """Section 3.4: C = K_in N_max + (R(N_max) + N_max) + K_out O_max N_out + S_cap."""
         n_max = self.options.n_max
+        if self.options.cells is not None:
+            return self.options.cells
         return K_IN * n_max + self.reserve_draws + n_max + self.options.k_out * O_MAX * n_max
 
     @property
@@ -193,6 +198,10 @@ def assembly(image: Image) -> str:
         raise BindingError("section 8.2: K_out must be a power of two")
     if image.body_cells > 1000:
         raise BindingError("section 8.2: N_max is past what one recvmsg can scatter")
+    smallest = K_IN * o.n_max + image.reserve_draws + o.n_max
+    if image.cell_count < smallest:
+        raise BindingError(f"section 3.4: {image.cell_count} cells cannot hold ingress and one "
+                           f"maximal transaction, which take {smallest}")
     lines: list[str] = []
     add = lines.append
     item_count = len(image.item_scalars)
@@ -484,6 +493,8 @@ def assembly(image: Image) -> str:
     add("")
     add("; DRAIN: send what is queued, until it is empty or the socket would block")
     add("drain:")
+    add("    cmp qword [egress_paused], 0")
+    add("    jne .done")
     add("    cmp qword [q_count], 0")
     add("    je .done")
     add("    mov rax, [q_head]")
@@ -567,8 +578,14 @@ def assembly(image: Image) -> str:
     add("    mov al, [control_buffer]")
     add("    cmp al, 81")
     add("    je .quit")
-    add("    cmp al, 83")
-    add("    jne .done")
+    add("    cmp al, 80")
+    add("    jne .not_pause")
+    add("    mov qword [egress_paused], 1")
+    add(".not_pause:")
+    add("    cmp al, 82")
+    add("    jne .answer")
+    add("    mov qword [egress_paused], 0")
+    add(".answer:")
     add("    xor ecx, ecx")
     add("    mov rdi, [pool]")
     add(".walk:")
@@ -592,6 +609,7 @@ def assembly(image: Image) -> str:
     add(".done:")
     add("    ret")
     add(".quit:")
+    add("    mov qword [egress_paused], 0")
     add("    call drain")
     add("    mov eax, 231")
     add("    xor edi, edi")
@@ -664,7 +682,7 @@ def assembly(image: Image) -> str:
     for position in range(k):
         add(f"state_{position}: resq 1")
     for name in ("pool", "pool_count", "slot_head", "q_head", "q_count", "turn", "in_fd", "out_fd",
-                 "ctl_fd"):
+                 "ctl_fd", "egress_paused"):
         add(f"{name}: resq 1")
     add("counters:")
     for name in COUNTERS:

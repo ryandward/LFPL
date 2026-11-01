@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from .rtcheck import Checker, RTError
+from .rtlower import Limit, rt_lines
 from .runtime import BindingError, Image, Options, assembly, bind
 from .x86 import Backend, Starved
 
@@ -30,13 +31,14 @@ class Report:
     handler: str
     reserve: int
     steps: int
+    instructions: int
     stack: int
     cells: int
     image_bytes: int
 
 
 def _generate(lines: Iterable[str], asm_path: str, options: Options,
-              initial: dict[str, str]) -> Image:
+              initial: dict[str, str]) -> tuple[Image, int]:
     """The stream goes through the checker and then the backend, one line at a time, so nothing
     is lowered that has not been typed, and nothing is held that is not in flight."""
     checker = Checker()
@@ -52,7 +54,8 @@ def _generate(lines: Iterable[str], asm_path: str, options: Options,
             raise Refused(f"section 3.1: this runtime serves exactly one handler, and the program "
                           f"declares {len(handlers)}")
         name = handlers[0].name
-        depth = next(f.depth for f in backend.functions.values() if f.name == name)
+        compiled = next(f for f in backend.functions.values() if f.name == name)
+        depth = compiled.depth
         image = bind(checker, name, depth, options, dict(initial))
         for state in image.states:
             if state.initial is None:
@@ -62,7 +65,7 @@ def _generate(lines: Iterable[str], asm_path: str, options: Options,
                 raise Refused(f"state {state.name} needs {state.length * state.element_size} "
                               f"bytes, and {state.initial} has {size}")
         handle.write(assembly(image))
-    return image
+    return image, compiled.instructions
 
 
 def _validate(source: Optional[bytes], asm_path: str, image: Image) -> None:
@@ -106,14 +109,12 @@ def build(source_path: str, exe_path: str, options: Options,
                 if source_path.endswith(".rt"):
                     lines: Iterable[str] = (raw.decode() for raw in handle)
                     source = None
-                    image = _generate(lines, asm_path, options, initial)
+                    image, instructions = _generate(lines, asm_path, options, initial)
                 else:
-                    from .rtlower import rt_lines
-
                     source = handle.read()
                     handle.seek(0)
-                    image = _generate(rt_lines(handle), asm_path, options, initial)
-        except (RTError, BindingError, Starved) as failure:
+                    image, instructions = _generate(rt_lines(handle), asm_path, options, initial)
+        except (RTError, BindingError, Starved, Limit) as failure:
             raise Refused(str(failure)) from failure
         if keep_asm is not None:
             shutil.copy(asm_path, keep_asm)
@@ -121,8 +122,8 @@ def build(source_path: str, exe_path: str, options: Options,
         _link(asm_path, exe_path)
     size = (image.cell_count * 16 + image.stack_bytes
             + sum(s.length * s.element_size for s in image.states))
-    return Report(image.handler, image.reserve_draws, image.steps, image.depth, image.cell_count,
-                  size)
+    return Report(image.handler, image.reserve_draws, image.steps, instructions, image.depth,
+                  image.cell_count, size)
 
 
 def main(argv: list[str]) -> int:
@@ -137,13 +138,14 @@ def main(argv: list[str]) -> int:
                         help="initial contents of a state array, read at link time")
     parser.add_argument("--n-max", type=int, default=216, help="the largest item, in cells")
     parser.add_argument("--k-out", type=int, default=64, help="the output queue's capacity")
+    parser.add_argument("--cells", type=int, help="cells in the image, instead of section 3.4's C")
     parser.add_argument("--asm", help="also write the assembly here")
     args = parser.parse_args(argv)
     initial = {}
     for entry in args.state:
         name, _, path = entry.partition("=")
         initial[name] = path
-    options = Options(args.in_port, args.out_port, args.ctl_port, args.n_max, args.k_out)
+    options = Options(args.in_port, args.out_port, args.ctl_port, args.n_max, args.k_out, args.cells)
     from .ring import Reject
 
     errors: tuple = (Refused, Reject)
@@ -155,8 +157,9 @@ def main(argv: list[str]) -> int:
     except subprocess.CalledProcessError as failure:
         print(f"{args.source}: the assembler or linker failed:\n{failure.stderr}", file=sys.stderr)
         return 1
-    print(f"handler {report.handler}: R(n) = {report.reserve} cells, W(n) = {report.steps} steps, "
-          f"stack {report.stack} bytes, {report.cells} cells, image {report.image_bytes} bytes")
+    print(f"handler {report.handler}: R(n) = {report.reserve} cells, W(n) = {report.steps} steps "
+          f"({report.instructions} instructions), stack {report.stack} bytes, {report.cells} cells, "
+          f"image {report.image_bytes} bytes")
     return 0
 
 
