@@ -235,17 +235,27 @@ State is declared, fixed in size, and threaded through each handler as a linear 
 
 ### 4.6 Structural recursion
 
-**Rule R3.** In every recursive call f(ē) in the body of f, some fixed argument position k must decrease structurally: e\_k is a variable bound by a chain of matches that starts at parameter x\_k. Alternatively, x\_k has type Fin N, and e\_k = x\_k − 1 inside an arm where x\_k ≠ 0.
+**Rule R3 (summed measure).** For each recursive function f, the compiler must find one fixed set S of f's linear parameters such that every recursive call f(ē) in f's body strictly decreases the total μ over S. Alternatively, a parameter x\_k of type Fin N decreases: e\_k = x\_k − 1 inside an arm where x\_k ≠ 0.
 
-The call may be a tail call, or a non-tail call compiled with continuations in the destructured cells (DESCEND and ASCEND in the first specification). Functions must be defined before use, as in Phase 1, so there is no mutual recursion.
+μ composes, so the check is linear arithmetic inside the checker:
+
+- Matching C(d, ȳ) gives μ(x) = 1 + Σ μ(y\_i) over its linear fields.
+- Building gives μ(C@d(ā)) = 1 + Σ μ(a\_i).
+- The result of a call to any other function has unknown μ, so it proves nothing. That holds even for an `@` function, which keeps its root cell but may change its size.
+
+The set is chosen per function. In `rev(l, acc)` only {l} works, because every cell l loses, acc gains. The tree `walk(t, stack, …)` needs {t, stack}: one call shrinks t, another shrinks stack, and every call sends one cell to the free list. Any linear parameter may belong to S, including a free list, since all S has to do is shrink, and a natural number cannot shrink forever. Leaving free lists out of S, as the step 1 implementation does, is conservative but not required for soundness.
+
+For now, recursive calls must be tail calls. Non-tail structural calls, compiled with continuations in the destructured cells (DESCEND and ASCEND in the first specification), are refused until that lowering exists, and section 8.2 lists this as a declared limit. Functions must be defined before use, as in Phase 1, so there is no mutual recursion.
 
 ```latex
-\mu(v) \;=\; \#\{\text{cells reachable from } v\} \quad\text{(finite, since linear data are acyclic)} \qquad \mu(e_k) < \mu(x_k)
+\mu(v) = \#\{\text{cells reachable from } v\} \qquad \exists\, S \subseteq \mathrm{lin}(f).\;\; \forall\, f(\bar e) \text{ in the body of } f:\;\; \sum_{k \in S} \mu(e_k) \;<\; \sum_{k \in S} \mu(x_k)
 ```
 
-**Lemma 4.1 (termination).** Every well-typed LFPL-O function terminates on every input. *Proof:* by induction on definition order, then on μ of the decreasing argument, or on the Fin N value. Each recursive call strictly decreases a natural number, and every call to an earlier function terminates by the outer induction. ∎
+**Lemma 4.1 (termination).** Every well-typed LFPL-O function terminates on every input. *Proof:* by induction on definition order, then on Σ\_{k∈S} μ(x\_k), or on the Fin N value. That number is finite because linear data are acyclic, and each recursive call strictly decreases it. Every call to an earlier function terminates by the outer induction. ∎
 
-R3 rules out the scalar loops Phase 1 accepts. There, `fn spin(x: Int64) : Int64 = spin(x);` compiles to a bare `jmp`.
+The step 1 implementation was tested against 28 combinations of recursive arms whose behavior was simulated independently. It accepted no non-terminating combination, and refused 4 that terminate, so it is conservative there. That is a test, not a proof. Adversarial probes behave the same way: rebuilding the same cell, swapping two arguments, and recursing on the result of an `@` function that grows its argument are all refused.
+
+R3 rules out the scalar loops Phase 1 accepted. At `9593438`, `fn spin(x: Int64) : Int64 = spin(x);` compiled to a bare `jmp`. It is now refused, because spin has no linear parameter to shrink.
 
 ### 4.7 Example: a forwarding handler
 
@@ -498,6 +508,7 @@ With exact last uses, a scalar is moved out before its location is overwritten, 
 | N\_max, K\_in, K\_out, O\_max, N\_out, S\_cap | declared per program | linker |
 | every handler has a linear bound | — | resource analysis |
 | the admission predicate draws nothing and takes constant steps | — | resource analysis |
+| non-tail recursion | refused until DESCEND and ASCEND are built | lowerer |
 
 **(iii) Never:** a refusal caused by the compiler's own choices, such as evaluation order, which register to use, or which value to spill. Theorem T8 states this as completeness, and the fuzzer tests it: any refusal of a generated program that is not (i) or (ii) is a compiler bug.
 
@@ -520,12 +531,23 @@ LFPL-O adds:
 
 Assumption A3 becomes a check on each binary, not a trust in the compiler:
 
-- **Meaning.** A symbolic checker that shares no code with the compiler (`src/symcheck.py` on the Phase 1 main branch) parses the source itself and executes the assembly symbolically. At every `ret`, call and tail jump, it requires each field of every built constructor to hold what the source says.
+- **Meaning.** A symbolic checker that shares no code with the compiler (`src/symcheck.py`) parses the source itself and executes the assembly symbolically. At every `ret`, call and tail jump, it requires each field of every built constructor to hold what the source says.
 - **Bounds.** The resource certificate is checked against the typing rules of section 5.3.
 - **Stack.** The deepest stack depth over the call graph is recomputed and compared with S\_max.
 - **Redundant moves.** The identity-morphism validator runs, as a check on efficiency, not on correctness.
 
 If any of these fails, the compiler emits no binary. The guarantee is then about this binary, validated, rather than about every possible output of an unverified compiler.
+
+### 8.5 The register-transfer layer
+
+Lower does not write x86 directly. `src/rtlower.py` emits a flat, typed register-transfer stream, and an independent checker, `src/rtcheck.py`, types every instruction with the first specification's token rules before any backend runs. The design is in `docs/rt-layer.md`.
+
+- **Explicit ownership.** Registers are unbounded per function, and moves consume their source, so ownership is written into the code instead of being reconstructed beside it.
+- **Atomic constructors.** A constructor is one instruction: it reads all its sources, then writes, and each field's source says STAY, RESTORE or STORE. Writing a value back where it came from is a local type error, and so is claiming RESTORE when a store is needed. That is the first specification's Theorem 6.1, checked locally.
+- **Joins and calls.** Labels apply the merge rule of section 8.3. A call removes every token of a cell whose capability it receives.
+- **Two backends.** x86 becomes register allocation over this stream, which is `src/x86.py`, and RTL maps almost one instruction to one state, which is not built yet.
+
+Of the 12 wrong-code bugs found in Phase 1, 8 are local type errors at this level. The other 4 are facts about x86: a truncated immediate, a spilled operand, the result register lost across a back-edge, and a masked shift count. Those stay with the symbolic checker. The layer keeps the O(D) bound: control flow is structured, so the checker holds token states only for labels still open, at most one per enclosing construct.
 
 ## 9. The RTL target
 
@@ -705,38 +727,53 @@ The guarantee is narrow on purpose: a started program stays defined, bounded and
 
 The compiler and the LP solver are deliberately not on this list. A wrong output from either is caught by validation, and no binary is written.
 
-## 12. Status against the Phase 1 repository
+## 12. Status against the repository
 
-Of the mechanisms this specification needs, Phase 1 already has linear typing, exhaustive matching, translation validation and cell conservation in the compiler. Everything that makes a running program unable to crash is still to be built: termination, total primitives, the fixed image, admission and resource analysis. Checked against `ryandward/LFPL` main at commit `9593438`, by running the compiler on probe programs.
+The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and serves UDP sockets on the loopback address, through the whole of the pipeline below except the parts this table marks as missing. This is `ryandward/LFPL` main at commit `f827822`, where all 297 tests pass with Python 3.14.8.
 
-| Requirement | Phase 1 at `9593438` | Needed |
+| Requirement | Status at `f827822` | Needed |
 | --- | --- | --- |
-| exactly-once linear typing | present | — |
-| exhaustive matching | present: a match missing `C` is refused with "non-exhaustive match on L" | — |
-| structural recursion (R3) | **absent**: `fn spin(x: Int64) : Int64 = spin(x);` compiles to a bare `jmp`, a guaranteed hang. Non-tail recursion is already refused. | the R3 check in `check.py` |
-| total primitives | **partial**: there is no division, and shift counts must be literals but are not range-checked. `<<(x, 70)` compiles to `shl rax, 70`, which NASM accepts without warning even with `-Werror`; the CPU masks the count to 6. | the semantics of section 4.4, and their lowering |
-| arrays and Fin N | absent | section 4.5 |
-| unboxed pairs | absent | section 4.1 |
-| handlers, serving loop, admission | absent: `main(free: Free)` runs once, and `_start` threads every cell into one free list | sections 3 and 6 |
-| resource analysis and certificates | absent | section 5 |
-| stack in the image | absent: `_start` never sets `rsp`, so frames use the OS stack, with thunks for spilling functions | section 7.1 |
-| startup: lock, prefault, signals | absent | section 7.2 |
-| two-pass compilation | absent: one forward pass, with the workarounds the README lists | section 8.1 |
-| translation validation | present: `src/symcheck.py` | extend it to arrays and admission |
-| identity-morphism validator | present: `src/validate.py`; it clears memory facts when a base register changes | — |
-| heap-flatness test | present but order-dependent; it fails when run on its own | branch `fix/heap-test-order` |
-| cell conservation in the compiler ring | present, tested at every step | — |
+| exactly-once linear typing | present in Check, and repeated one level down by `src/rtcheck.py` | nothing |
+| exhaustive matching | present | nothing |
+| structural recursion (R3) | present, with the summed measure, not counting Free, so `spin` is refused | the Fin N case |
+| total primitives | shifts are total, and `idx` and `get` cannot go out of range. There is no division yet. | division with the semantics of section 4.4 |
+| non-tail recursion | refused, as a declared limit | DESCEND and ASCEND |
+| arrays and Fin N | `Array[N] t` of scalars, read with `idx` and `get`. N must be a power of two. A Fin N may live in a cell. | `swap`, linear elements, and any N once division exists |
+| unboxed pairs | present, as flat tuples of at most six, returned and bound and never stored | nothing |
+| handlers, serving loop, admission | one handler and one ingress, over UDP on the loopback address, one datagram per turn. Admission checks TooLarge, Short and Full. Late and Policy cannot be declared yet, and every source refuses by Drop. | several handlers, recvmmsg or AF_XDP, Hold, deadlines, the admission predicate, and state slots of cells |
+| resource analysis and certificates | **absent**. `src/rtcheck.py` measures constant bounds instead: W(n) = d counts the instructions of a handler and what it calls, R(n) = b counts its draws, and a handler that reaches recursion is refused. | section 5, so that a handler can walk its body |
+| stack in the image | present: S_max comes from the call graph, the stack is in the image with a guard page below it, and the depth is recomputed from the assembly | nothing |
+| startup: lock, prefault, signals | present. Each step that can fail exits with its own number, before any input. | nothing |
+| register-transfer layer | present: `src/rtlower.py`, `src/rtcheck.py` and `src/x86.py`, and every Phase 1 generator passes through it | move `tests/test_invariants.py` over, so that `src/lower.py` can go |
+| two-pass compilation | **absent**. A scalar read after its cell was rebuilt or handed over is refused, and it stops about one generated program in six. | section 8.1 |
+| translation validation | present on every build: a failure in `src/symcheck.py` leaves no binary. It covers the handler and its helpers, and it does not read the runtime. | admission |
+| identity-morphism validator | present, but **only in the test suite**: `src/lfplo.py` does not run it, so a build does not yet make the fourth check of section 8.4 | run it on every build |
+| heap-flatness test | present, on both compilers, and it holds when run on its own | nothing |
+| cell conservation in the compiler ring | present on both compilers, with Theorem 7.2's bound checked at every step | nothing |
 | RTL backend | absent | section 9 |
 
-A suggested order. Each step leaves a working system and closes one failure mode:
+The implementation decides some things this text leaves open, or does not mention:
 
-1. **R3 and total shifts.** This closes the hang (F5) and the undefined shift (F2). Both changes are small, in the checker and the lowerer.
-2. **Stack in the image, and the startup sequence.** This closes F3, F4 and F10 on x86-64.
-3. **A serving loop with admission,** using hand-written bounds at first. This closes F6 and F7.
-4. **Resource analysis,** which replaces the hand-written bounds with derived and certified ones.
-5. **Arrays, Fin N and unboxed pairs,** for router tables.
-6. **The two-pass compiler,** which removes the remaining internal refusals (T8).
-7. **The RTL backend,** checked by differential simulation against x86-64.
+- **Literals.** A literal must be a value of the type it meets, or the program is refused. A shift count is the exception, because section 4.4 gives every count a meaning.
+- **The wire format.** An item is a record of scalars with at most one field of a type declared and never defined. On the wire it is those scalars in declaration order, little endian and packed, followed by the bytes of that field, which the runtime holds as a chain of cells. A Fin N cannot be a field of an item, because a sender could then choose an address.
+- **Output.** A constructor with a field `port: Int8` is sent to a base port plus that number, as its other scalars followed by its chain. Any other constructor sends nothing, and its cells return to the pool.
+- **Free.** A program may declare its own, for Phase 1's sake, but a handler's must be exactly `End | More(next: Free)`, because the pool is threaded through that field.
+- **Malformed.** A datagram shorter than an item's scalars is counted as malformed. That is a fifth reason at ingress, beside those of section 6.1, because it never was an item.
+- **The control port.** It is one more ingress source, bound to the loopback address. `S` answers with the counters, `P` pauses egress, `R` resumes it and `Q` shuts down. Pausing exists because loopback sends never block, so without it nothing could show that a full queue refuses.
+- **System calls.** Beyond section 7.3's list, ingress and egress use `recvmsg` and `sendmsg`, scattering a datagram straight into cells, and the control port uses `recvfrom` and `sendto`. Idling is a blocking ingress read with a 1 ms timeout, so `poll` is not needed.
+- **Link-time options.** `--state` gives a state array its initial contents, and `--cells` can make the image smaller than section 3.4's C, which is what makes Short reachable.
+
+The plan, with what is done marked. Arrays and tuples came ahead of resource analysis, because the handler needs them:
+
+1. **R3 and total shifts.** Done. This closed the hang (F5) and the undefined shift (F2).
+2. **The register-transfer layer.** Done, except that `tests/test_invariants.py` still runs against `src/lower.py`. This turned 8 of the 12 Phase 1 bug classes into type errors.
+3. **Stack in the image, and the startup sequence.** Done. This closes F3, F4 and F10 on x86-64.
+4. **A serving loop with admission.** Done, with measured constant bounds instead of hand-written ones. This closes F6 and F7 for a handler that does not recurse.
+5. **Resource analysis,** which replaces the measured bounds with derived and certified ones.
+6. **Arrays, Fin N with R3's Fin N case, unboxed pairs and division,** for router tables. Arrays, Fin N and tuples are done, to the extent the table says. R3's Fin N case, division and `swap` are not.
+7. **DESCEND and ASCEND,** which lift the limit on non-tail recursion.
+8. **The right-to-left pass,** for exact last uses and the inferred result cell. This removes the remaining internal refusals (T8).
+9. **The RTL backend,** built from the register-transfer layer and checked by differential simulation against x86-64.
 
 ## 13. Related work and references
 
@@ -774,6 +811,6 @@ As far as these sources show, none of them keeps recursive data in a fixed block
 ### This project
 
 - The first specification: [Pure LFPL on Bare Silicon: A Formal Execution Model](https://claude.ai/artifact/BEfbkxeqyLUA8WUMdE1zJk).
-- The Phase 1 implementation: [ryandward/LFPL](https://github.com/ryandward/LFPL), at commit `9593438`.
+- The implementation: [ryandward/LFPL](https://github.com/ryandward/LFPL). Phase 1 is commit `9593438`, and section 12 describes commit `f827822`.
 
 The links point to pages found while writing this specification. Claims about each work are limited to what those pages state.
