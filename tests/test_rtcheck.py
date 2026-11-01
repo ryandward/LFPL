@@ -120,6 +120,35 @@ end
         self.refuse("RESTORE", LIST, callee, stream.format(source="r3!"))
         check(LIST, callee, stream.format(source="r3"))
 
+    def test_a_value_from_before_a_rebuild_is_not_what_the_cell_holds_now(self):
+        """The old tail, taken out, then a new tail built in, then the cell opened again. Saying
+        the old tail is still there would skip the store that puts it back."""
+        stream = """
+type t40 record Pair
+ctor c41 t40 - Pair
+field c41 0 8 t16 a
+field c41 8 8 t16 b
+fn f1 g(r0 : t16, r1 : cap) : t40
+    br.null r0, L1, L2
+L1: const r5, #0 : t16
+    const r6, #0 : t16
+    build r1, c41, none, r5, r6
+    ret r1
+L2: take r2, r0[8:8]
+    build r0, c18, none, =, #0
+    br.null r0, L3, L4
+L3: const r6, #0 : t16
+    build r1, c41, none, r2, r6
+    ret r1
+L4: take r3, r0[8:8]
+    build r0, c18, none, =, r2{mark}
+    build r1, c41, none, r0, r3
+    ret r1
+end
+"""
+        self.refuse("RESTORE", LIST, stream.format(mark="!"))
+        check(LIST, stream.format(mark=""))
+
     def test_a_literal_is_not_the_word_of_a_location(self):
         stream = """
 fn f1 g(r0 : t16) : t16

@@ -374,10 +374,14 @@ class Checker:
         return ctor
 
     def _open_cell(self, word: Word, ctor: Ctor) -> Cell:
-        """A dispatched cell: every field of the constructor is full, with word w.o."""
+        """A dispatched cell: every field of the constructor is full, each with a word of its
+        own. That word cannot be just w.o: a cell that has been rebuilt and is opened again holds
+        new values at the same offsets, and a value taken before the rebuild must not pass for
+        what is there now, or RESTORE would skip a store that was needed."""
         locs = {}
+        opening = self.fresh()
         for off, size, ty, _name in ctor.fields:
-            locs[(off, size)] = Loc(True, ("field", word, off), self.norm(ty))
+            locs[(off, size)] = Loc(True, ("field", opening, off), self.norm(ty))
         tag = ("is", int(ctor.tag)) if ctor.tag.isdigit() else None
         return Cell(tag, locs)
 

@@ -135,11 +135,22 @@ def bind(checker: Checker, handler_name: str, depth: int, options: Options,
         states.append(StateSlot(name, norm[1], SIZES[norm[2]], initial.pop(name, None)))
     if initial:
         raise BindingError(f"no state slot named {sorted(initial)[0]}")
+    if len(fn.params) != len(states) + 2:
+        raise BindingError(f"section 3.1: {fn.name} takes {len(fn.params) - 2} state slots, and the "
+                           f"program declares {len(states)}: a slot declared after the handler is "
+                           f"one it never receives")
     decl = checker._decl(item_type)
     if decl is None or decl.kind != "record":
         raise BindingError(f"section 3.1: this runtime receives an item as a record, and "
                            f"{item_type} is not one")
     scalars, chain = _split_fields(checker, decl.name, decl.ctors[0].fields)
+    for _off, _size, ty, name in decl.ctors[0].fields:
+        norm = checker.norm(ty)
+        if isinstance(norm, tuple) and norm[0] == "fin":
+            # A Fin is what makes an array read need no bounds check, and only idx may make one.
+            # Filled from the wire, it would let a sender choose an address.
+            raise BindingError(f"section 4.5: {decl.name}.{name} is a Fin, and an item's fields "
+                               f"come from the wire: take an integer and use idx")
     if sum(size for _o, size in scalars) > HEADER_BYTES_MAX:
         raise BindingError(f"section 3.1: {decl.name}'s header does not fit one cell's fields")
     out_decl = checker._decl(out_type)
@@ -181,8 +192,8 @@ def _out_ctor(checker: Checker, ctor: Ctor) -> OutCtor:
     rest = []
     for entry in ctor.fields:
         if entry[3] == "port":
-            if checker.norm(entry[2]) not in ("i8", "i16"):
-                raise BindingError(f"section 3.1: {ctor.name}.port must be Int8 or Int16")
+            if checker.norm(entry[2]) != "i8":
+                raise BindingError(f"section 3.1: {ctor.name}.port must be Int8")
             port = (entry[0], entry[1])
         else:
             rest.append(entry)
@@ -210,7 +221,7 @@ def assembly(image: Image) -> str:
     if image.cell_count < smallest:
         raise BindingError(f"section 3.4: {image.cell_count} cells cannot hold ingress and one "
                            f"maximal transaction, which take {smallest}")
-    if o.out_base + (1 << 8 * max((c.port[1] for c in image.out if c.port), default=0)) - 1 > 65535:
+    if o.out_base + 255 > 65535:
         raise BindingError(f"section 7.3: egress at {o.out_base} plus a port number can pass 65535")
     lines: list[str] = []
     add = lines.append
@@ -554,9 +565,9 @@ def assembly(image: Image) -> str:
         add("    cmp rax, -11")
         add("    je .done")
         add("    test rax, rax")
-        add("    jns .counted")
+        add(f"    jns .counted_{position}")
         add("    inc qword [cnt_send_errors]")
-        add(".counted:")
+        add(f".counted_{position}:")
         if ctor.chain is not None:
             add(f"    mov rdi, [r12+{ctor.chain}]")
             add("    call free_chain")

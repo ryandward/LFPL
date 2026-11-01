@@ -48,18 +48,19 @@ class Forwarder:
     """Builds examples/forward.lfpl with a route table, and runs it."""
 
     def __init__(self, routes: bytes, workdir: str, limit_lock: bool = False,
-                 build_options: tuple = ()):
+                 build_options: tuple = (), source: str = None):
         self.out_base, self.outputs = egress_block()
         self.in_port, self.ctl_port = free_port(), free_port()
         table = os.path.join(workdir, "routes.bin")
         with open(table, "wb") as handle:
             handle.write(routes)
         exe = os.path.join(workdir, "forward")
-        subprocess.run([sys.executable, "-m", "src.lfplo", SOURCE, "-o", exe,
-                        "--in-port", str(self.in_port), "--out-port", str(self.out_base),
-                        "--ctl-port", str(self.ctl_port), "--state", f"routes={table}",
-                        *build_options],
-                       cwd=ROOT, check=True, capture_output=True, text=True)
+        states = () if source is not None else ("--state", f"routes={table}")
+        self.report = subprocess.run(
+            [sys.executable, "-m", "src.lfplo", source or SOURCE, "-o", exe,
+             "--in-port", str(self.in_port), "--out-port", str(self.out_base),
+             "--ctl-port", str(self.ctl_port), *states, *build_options],
+            cwd=ROOT, check=True, capture_output=True, text=True).stdout
         self.exe = exe
         limits = (lambda: resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))) if limit_lock else None
         self.process = subprocess.Popen([exe], preexec_fn=limits)
@@ -255,6 +256,289 @@ class Overload(unittest.TestCase):
         router.send(9, 1, b"y" * (7 * 7 + 1))
         after = router.settle(before["served"] + before["too_large"] + 1)
         self.assertEqual(after["too_large"] - before["too_large"], 1)
+
+
+class OtherHandlers(unittest.TestCase):
+    """The runtime is written from a handler's types, so one handler proves little about it."""
+
+    def start(self, program: str, *options: str) -> Forwarder:
+        workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(workdir.cleanup)
+        path = os.path.join(workdir.name, "program.lfpl")
+        with open(path, "w") as handle:
+            handle.write(program)
+        resolved = []
+        for option in options:
+            name, _, data = option.partition("=")
+            table = os.path.join(workdir.name, f"{name}.bin")
+            with open(table, "wb") as handle:
+                handle.write(bytes.fromhex(data))
+            resolved += ["--state", f"{name}={table}"]
+        router = Forwarder(bytes(1024), workdir.name, build_options=tuple(resolved), source=path)
+        self.addCleanup(router.close)
+        return router
+
+    def test_no_state_no_body_and_an_output_with_no_cell(self):
+        router = self.start("""
+record Ping { a: Int8, b: Int16 };
+data Reply = Nothing | Send(port: Int8, a: Int8, b: Int16);
+handler ping(h: Ping, free: Free) : (Reply, Free) =
+  match h with Ping(d, a, b) =>
+    if ==(a, 0) then (Nothing, More@d(free))
+    else (Send@d(1, a, b), free)
+  end;
+""")
+        router.raw(struct.pack("<BH", 5, 0x1234))
+        self.assertEqual(router.outputs[1].recv(16), struct.pack("<BH", 5, 0x1234))
+        router.raw(struct.pack("<BH", 0, 7))
+        router.raw(struct.pack("<BH", 5, 7) + b"more than the record holds")
+        now = router.settle(3)
+        self.assertEqual((now["served"], now["forwarded"], now["dropped"], now["too_large"]),
+                         (2, 1, 1, 1))
+        self.assertEqual(now["pool"], now["capacity"])
+
+    def test_two_arrays_and_several_constructors_that_send(self):
+        small = bytes(i * 3 for i in range(16))
+        wide = b"".join(struct.pack("<H", 1000 + i) for i in range(8))
+        router = self.start("""
+data Bytes;
+record Item { kind: Int8, key: Int16, body: Bytes };
+data Out = Left(port: Int8, v: Int8, body: Bytes)
+         | Right(port: Int8, w: Int16, body: Bytes)
+         | Gone(body: Bytes);
+state small : Array[16] Int8;
+state wide : Array[8] Int16;
+handler route(small: Array[16] Int8, wide: Array[8] Int16, h: Item, free: Free)
+    : (Array[16] Int8, Array[8] Int16, Out, Free) =
+  match h with Item(d, kind, key, body) =>
+    if ==(kind, 0) then (small, wide, Gone@d(body), free)
+    else if ==(kind, 1) then
+      let (s2, v) = get(small, idx(key, 16)) in (s2, wide, Left@d(2, v, body), free)
+    else
+      let (w2, v) = get(wide, idx(key, 8)) in (small, w2, Right@d(3, v, body), free)
+  end;
+""", f"small={small.hex()}", f"wide={wide.hex()}")
+        router.raw(struct.pack("<BH", 1, 5) + b"left")
+        self.assertEqual(router.outputs[2].recv(64), bytes((15,)) + b"left")
+        router.raw(struct.pack("<BH", 2, 8 + 3) + b"right")
+        self.assertEqual(router.outputs[3].recv(64), struct.pack("<H", 1003) + b"right")
+        router.raw(struct.pack("<BH", 0, 0) + b"gone" * 50)
+        now = router.settle(3)
+        self.assertEqual((now["forwarded"], now["dropped"]), (2, 1))
+        self.assertEqual(now["pool"], now["capacity"])
+
+    def test_a_reserve_is_drawn_through_a_helper_and_comes_back(self):
+        router = self.start("""
+data Bytes;
+record Hdr { ttl: Int8, body: Bytes };
+data Out = Drop(body: Bytes) | Fwd(port: Int8, ttl: Int8, body: Bytes);
+fn keep(free: Free) : Free = match free with End => End | More(c, rest) => More@c(rest) end;
+handler h(m: Hdr, free: Free) : (Out, Free) =
+  match m with Hdr(d, ttl, body) =>
+    let f = keep(free) in (Fwd@d(1, ttl, body), f)
+  end;
+""")
+        self.assertIn("R(n) = 1 cells", router.report)
+        for ttl in (3, 4, 5):
+            router.raw(bytes((ttl,)) + b"x" * 20)
+            self.assertEqual(router.outputs[1].recv(64), bytes((ttl,)) + b"x" * 20)
+        now = router.settle(3)
+        self.assertEqual(now["pool"], now["capacity"])
+
+
+    def test_an_index_kept_in_a_cell_is_still_an_index(self):
+        table = bytes(i % 8 for i in range(16)).hex()
+        router = self.start("""
+data Bytes;
+record Hdr { ttl: Int8, dst: Int32, body: Bytes };
+data Verdict = Fwd(port: Int8, body: Bytes) | Drop(body: Bytes);
+record Box { at: Fin 16 };
+state t : Array[16] Int8;
+handler h(t: Array[16] Int8, m: Hdr, free: Free) : (Array[16] Int8, Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) =>
+    match free with
+    | End => (t, Drop@d(body), End)
+    | More(c, rest) =>
+        let b = Box@c(idx(dst, 16)) in
+        match b with Box(e, at) =>
+          let (t2, p) = get(t, at) in (t2, Fwd@d(p, body), More@e(rest))
+        end
+    end
+  end;
+""", f"t={table}")
+        self.assertIn("R(n) = 1 cells", router.report)
+        router.send(9, 16 + 5, b"kept")
+        self.assertEqual(router.outputs[5].recv(64), b"kept")
+        now = router.settle(1)
+        self.assertEqual(now["pool"], now["capacity"])
+
+
+class RefusedPrograms(unittest.TestCase):
+    """A program outside the language, or past a limit, gets a reason and no binary."""
+
+    HEADER = """
+data Bytes;
+record Hdr { ttl: Int8, dst: Int32, body: Bytes };
+data Verdict = Drop(body: Bytes) | Fwd(port: Int8, ttl: Int8, dst: Int32, body: Bytes);
+"""
+    GOOD = """
+handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) => (routes, Drop@d(body), free) end;
+"""
+
+    def assert_refused(self, why: str, program: str) -> None:
+        with tempfile.TemporaryDirectory() as workdir:
+            path = os.path.join(workdir, "p.lfpl")
+            with open(path, "w") as handle:
+                handle.write(program)
+            exe = os.path.join(workdir, "p")
+            done = subprocess.run([sys.executable, "-m", "src.lfplo", path, "-o", exe,
+                                   "--in-port", "1", "--out-port", "2", "--ctl-port", "3"],
+                                  cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+            self.assertRegex(done.stderr, why)
+            self.assertNotIn("Traceback", done.stderr)
+            self.assertFalse(os.path.exists(exe))
+
+    def test_the_control_is_accepted(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = os.path.join(workdir, "p.lfpl")
+            with open(path, "w") as handle:
+                handle.write(self.HEADER + "state routes : Array[1024] Int8;" + self.GOOD)
+            done = subprocess.run([sys.executable, "-m", "src.lfplo", path, "-o",
+                                   os.path.join(workdir, "p"), "--in-port", "1", "--out-port", "2",
+                                   "--ctl-port", "3"], cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_a_handler_that_reaches_recursion_has_no_bound(self):
+        self.assert_refused("no\\s+derivable bound", self.HEADER + """
+state routes : Array[1024] Int8;
+data List = Nil | Cons(next: List);
+fn walk(l: List, acc: Free) : Free = match l with Nil => acc | Cons(c, rest) => walk(rest, More@c(acc)) end;
+handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) => match free with
+    | End => (routes, Drop@d(body), End)
+    | More(c, rest) => (routes, Drop@d(body), walk(Cons@c(Nil), rest))
+  end end;
+""")
+
+    def test_a_state_slot_declared_after_the_handler(self):
+        self.assert_refused("never receives", self.HEADER + """
+handler h(m: Hdr, free: Free) : (Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) => (Drop@d(body), free) end;
+state routes : Array[1024] Int8;
+""")
+
+    def test_a_parameter_that_is_not_the_state_slot(self):
+        self.assert_refused("state slot routes", self.HEADER + """
+state routes : Array[1024] Int8;
+handler h(table: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) => (table, Drop@d(body), free) end;
+""")
+
+    def test_a_handler_that_does_not_return_its_state(self):
+        self.assert_refused("returns each state slot", self.HEADER + """
+state routes : Array[1024] Int8;
+handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) => (Drop@d(body), free) end;
+""")
+
+    def test_an_output_this_runtime_cannot_send(self):
+        self.assert_refused("carries scalars", """
+record Hdr { ttl: Int8 };
+data Out = X(port: Int8, rest: Free);
+handler h(m: Hdr, free: Free) : (Out, Free) =
+  match m with Hdr(d, ttl) => (X@d(1, free), End) end;
+""")
+
+    def test_an_index_cannot_come_from_the_wire(self):
+        self.assert_refused("come from the wire", """
+data Bytes;
+record Hdr { at: Fin 1024, body: Bytes };
+data Verdict = Fwd(port: Int8, body: Bytes);
+state routes : Array[1024] Int8;
+handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Verdict, Free) =
+  match m with Hdr(d, at, body) =>
+    let (r2, p) = get(routes, at) in (r2, Fwd@d(p, body), free) end;
+""")
+
+    def test_an_array_cannot_be_stored_in_a_cell(self):
+        self.assert_refused("cannot be stored in a cell", "record R { a: Array[16] Int8 };")
+
+    def test_an_item_that_is_not_a_record(self):
+        self.assert_refused("as a record", """
+data I = A | B(x: Int8);
+handler h(m: I, free: Free) : (I, Free) = (m, free);
+""")
+
+    def test_two_handlers(self):
+        self.assert_refused("exactly one handler", self.HEADER + "state routes : Array[1024] Int8;"
+                            + self.GOOD + self.GOOD.replace("handler h(", "handler g("))
+
+    def test_no_handler(self):
+        self.assert_refused("exactly one handler", "fn f(x: Int64) : Int64 = x;")
+
+    def test_an_index_with_the_wrong_bound(self):
+        self.assert_refused("Fin 1024", self.HEADER + """
+state routes : Array[1024] Int8;
+handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) =>
+    let (r2, p) = get(routes, idx(dst, 512)) in (r2, Fwd@d(p, ttl, dst, body), free) end;
+""")
+
+    def test_an_index_that_is_just_an_integer(self):
+        self.assert_refused("Fin 1024", self.HEADER + """
+state routes : Array[1024] Int8;
+handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) =>
+    let (r2, p) = get(routes, dst) in (r2, Fwd@d(p, ttl, dst, body), free) end;
+""")
+
+    def test_an_array_that_is_not_a_power_of_two(self):
+        self.assert_refused("power of two", self.HEADER + "state routes : Array[1000] Int8;")
+
+    def test_a_bound_that_is_not_a_literal(self):
+        self.assert_refused("literal", self.HEADER + """
+state routes : Array[1024] Int8;
+handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) =>
+    let (r2, p) = get(routes, idx(dst, +(512, 512))) in (r2, Fwd@d(p, ttl, dst, body), free) end;
+""")
+
+    def test_a_body_that_is_forgotten(self):
+        self.assert_refused("never used|linear", self.HEADER + """
+state routes : Array[1024] Int8;
+data Nothing = N(port: Int8);
+handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Nothing, Free) =
+  match m with Hdr(d, ttl, dst, body) => (routes, N@d(1), free) end;
+""")
+
+    def test_a_table_used_twice(self):
+        self.assert_refused("used twice", self.HEADER + """
+state routes : Array[1024] Int8;
+handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) =>
+    let (r2, p) = get(routes, idx(dst, 1024)) in (routes, Fwd@d(p, ttl, dst, body), free) end;
+""")
+
+    def test_a_program_cannot_build_what_the_runtime_owns(self):
+        self.assert_refused("constructor|not a constructor", self.HEADER + """
+state routes : Array[1024] Int8;
+handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Verdict, Free) =
+  match m with Hdr(d, ttl, dst, body) =>
+    match body with Chunk(c, b) => (routes, Drop@d(body), free) end end;
+""")
+
+    def test_egress_that_could_pass_the_last_port(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = os.path.join(workdir, "p.lfpl")
+            with open(path, "w") as handle:
+                handle.write(self.HEADER + "state routes : Array[1024] Int8;" + self.GOOD)
+            done = subprocess.run([sys.executable, "-m", "src.lfplo", path, "-o",
+                                   os.path.join(workdir, "p"), "--in-port", "1", "--out-port",
+                                   "65400", "--ctl-port", "3"], cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(done.returncode, 1, done.stdout)
+            self.assertRegex(done.stderr, "pass 65535")
 
 
 class Validation(unittest.TestCase):

@@ -37,8 +37,10 @@ opens it. An open cell `c` has a tag fact and one token per location:
     c[o:s] = w : t      full: it holds w       c[o:s] ~ w         hole: its bits are still w
 
 A **word** names a value, not bits in a place. `arg i` is parameter i, `c.o` is what offset
-o of an unbuilt cell `c` held on entry, `null` is null, and every computed value gets a
-fresh word. A move keeps the word. A built constructor's word is its cell's, whatever its
+o of a cell `c` held when this dispatch opened it, `null` is null, and every computed value
+gets a fresh word. Each dispatch names its fields anew, because a cell rebuilt and opened again
+holds new values at the same offsets, and a value taken before the rebuild must not pass for
+what is there now. A move keeps the word. A built constructor's word is its cell's, whatever its
 fields are. The result of a call to `f @k` has the word of argument k.
 
 Types `t` are `Int w`, `Bool`, a named type `D`, `Cap`, which is a cell's capability and the

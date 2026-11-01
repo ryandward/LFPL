@@ -314,6 +314,8 @@ class CheckStage(Stage):
         return members
 
     def _type_token(self, kind: int, payload: bytes) -> int:
+        if kind != K_TYPE and not self.lfplo:
+            raise self._reject("Array and Fin belong to LFPL-O: compile this with src.lfplo")
         if kind == K_TARRAY:
             length = struct.unpack_from("<Q", payload)[0]
             element = _ELEMENT_TYPES[payload[8]]
@@ -505,9 +507,12 @@ class CheckStage(Stage):
             self.decl_field_count = 0
         elif cls == LEAF and kind == K_FIELD:
             self._g_push(E_FIELD, payload, x=self.decl_ctor)
-        elif cls == LEAF and kind == K_TYPE:
+        elif cls == LEAF and kind in (K_TYPE, K_TFIN, K_TARRAY):
             field = len(self.G) - 1
-            field_ty = self._type(payload)
+            if kind == K_TARRAY:
+                raise self._reject("section 4.5: an array lives in its own region of the image, "
+                                   "so it cannot be stored in a cell")
+            field_ty = self._type_token(kind, payload)
             if field_ty == T_DIAMOND:
                 raise self._reject("a diamond cannot be stored in a field")
             _, a, b, c, d, x, y, _z = self._g(field)
