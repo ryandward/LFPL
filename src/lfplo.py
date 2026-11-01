@@ -17,7 +17,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
-from .ring import Reject, Ring
+from .ring import FStarved, Reject, Ring
 from .rtcheck import Checker, RTError
 from .rtlower import Limit, rt_lines
 from .runtime import BindingError, Image, Options, assembly, bind
@@ -81,7 +81,7 @@ def compile_program(source: bytes, *, target_cells: int = 1024,
     out: list[str] = []
     checker = Checker()
     backend = Backend(out.append)
-    for line in rt_lines(io.BytesIO(source), on_step):
+    for line in rt_lines(io.BytesIO(source), on_step, phase1=True):
         checker.feed(line)
         backend.feed(line)
     checker.finish()
@@ -95,7 +95,11 @@ def _validate(source: bytes, asm_path: str, image: Image) -> None:
     """Section 8.4. Meaning, and the stack. A build that fails either has no binary."""
     with open(asm_path) as handle:
         asm = handle.read()
-    problems = check_translation(source, asm)
+    try:
+        problems = check_translation(source, asm)
+    except Exception as failure:  # a crash in the oracle is not a pass, and it is not the program's
+        raise Refused(f"translation validation could not finish: {type(failure).__name__}: "
+                      f"{failure}") from failure
     if problems:
         raise Refused("translation validation failed:\n" + "\n".join(f"  {p}" for p in problems))
     deepest = recompute_stack(asm)
@@ -115,11 +119,15 @@ def _link(asm_path: str, exe_path: str) -> None:
     shutil.move(built, exe_path)
 
 
+def _remove_stale(exe_path: str) -> None:
+    if os.path.exists(exe_path):
+        os.unlink(exe_path)
+
+
 def build(source_path: str, exe_path: str, options: Options,
           initial: Optional[dict[str, str]] = None, *, keep_asm: Optional[str] = None) -> Report:
     """Compile. A stale binary is removed first, so failure can never leave one behind."""
-    if os.path.exists(exe_path):
-        os.unlink(exe_path)
+    _remove_stale(exe_path)
     initial = {name: os.path.abspath(path) for name, path in (initial or {}).items()}
     with tempfile.TemporaryDirectory() as work:
         asm_path = os.path.join(work, "program.asm")
@@ -128,7 +136,7 @@ def build(source_path: str, exe_path: str, options: Options,
                 source = handle.read()
                 handle.seek(0)
                 image, instructions = _generate(rt_lines(handle), asm_path, options, initial)
-        except (RTError, BindingError, Starved, Limit) as failure:
+        except (RTError, BindingError, Starved, Limit, FStarved) as failure:
             raise Refused(str(failure)) from failure
         if keep_asm is not None:
             shutil.copy(asm_path, keep_asm)
@@ -148,7 +156,7 @@ def _print_rt(source_path: str) -> int:
                 checker.feed(line)
                 print(line)
         checker.finish()
-    except (Reject, RTError, Limit) as failure:
+    except (Reject, RTError, Limit, FStarved, OSError) as failure:
         print(f"{source_path}: refused: {failure}", file=sys.stderr)
         return 1
     return 0
@@ -178,10 +186,12 @@ def main(argv: list[str]) -> int:
     for entry in args.state:
         name, _, path = entry.partition("=")
         initial[name] = path
-    options = Options(args.in_port, args.out_port, args.ctl_port, args.n_max, args.k_out, args.cells)
     try:
+        _remove_stale(args.output)
+        options = Options(args.in_port, args.out_port, args.ctl_port, args.n_max, args.k_out,
+                          args.cells)
         report = build(args.source, args.output, options, initial, keep_asm=args.asm)
-    except (Refused, Reject) as failure:
+    except (Refused, Reject, BindingError, OSError) as failure:
         print(f"{args.source}: refused: {failure}", file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as failure:

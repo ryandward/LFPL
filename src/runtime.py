@@ -80,6 +80,18 @@ class Options:
     k_out: int = 64      # the output queue, a power of two
     cells: Optional[int] = None  # None: section 3.4's C. Fewer can make admission refuse with Short
 
+    def __post_init__(self) -> None:
+        for name, port in (("ingress", self.in_port), ("the control port", self.ctl_port)):
+            if not 1 <= port <= 65535:
+                raise BindingError(f"section 7.3: {name} at {port} is not a port")
+        if not 1 <= self.out_base <= 65535 - 255:
+            raise BindingError(f"section 7.3: egress at {self.out_base} plus a port number can "
+                               f"pass 65535")
+        if self.n_max < 1:
+            raise BindingError(f"section 8.2: N_max of {self.n_max}: an item is at least one cell")
+        if self.k_out < 1 or self.k_out & self.k_out - 1:
+            raise BindingError(f"section 8.2: K_out of {self.k_out} must be a power of two")
+
 
 @dataclass(frozen=True)
 class Image:
@@ -165,10 +177,13 @@ def bind(checker: Checker, handler_name: str, depth: int, options: Options,
 def _check_reserve(checker: Checker, reserve: str) -> None:
     """The pool and every reserve are threaded through offset 0, as the built-in Free is. A
     program may still declare its own Free, and then it has to have that shape."""
-    decl = checker._decl(checker.norm(reserve))
+    ty = checker.norm(reserve)
+    decl = checker._decl(ty)
     assert decl is not None
     full = [c for c in decl.ctors if c.tag != "null"]
-    if decl.kind != "tagless" or len(full) != 1 or full[0].fields[0][:2] != (0, 8):
+    fields = full[0].fields if len(full) == 1 else []
+    if (decl.kind != "tagless" or len(fields) != 1 or fields[0][:2] != (0, 8)
+            or checker.norm(fields[0][2]) != ty):
         raise BindingError("section 3.1: Free must be End | More(next: Free)")
 
 
@@ -213,16 +228,12 @@ def _is_null(ctor: OutCtor, tagged: bool) -> bool:
 def assembly(image: Image) -> str:
     """The runtime and the image, as NASM, to follow the compiled functions."""
     o = image.options
-    if o.k_out & o.k_out - 1:
-        raise BindingError("section 8.2: K_out must be a power of two")
     if image.body_cells > 1000:
         raise BindingError("section 8.2: N_max is past what one recvmsg can scatter")
     smallest = K_IN * o.n_max + image.reserve_draws + o.n_max
     if image.cell_count < smallest:
         raise BindingError(f"section 3.4: {image.cell_count} cells cannot hold ingress and one "
                            f"maximal transaction, which take {smallest}")
-    if o.out_base + 255 > 65535:
-        raise BindingError(f"section 7.3: egress at {o.out_base} plus a port number can pass 65535")
     lines: list[str] = []
     add = lines.append
     item_count = len(image.item_scalars)

@@ -37,7 +37,7 @@ from __future__ import annotations
 import struct
 from typing import NamedTuple, Optional
 
-from .dyck import (CLOSE, ELEMENT_CODES, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP,
+from .dyck import (CLOSE, ELEMENT_CODES, OP_NAMES, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP,
                    K_CTOR, K_CTORDECL, K_DATA, K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER,
                    K_IDX, K_IF, K_INT, K_LET, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM,
                    K_RECORD, K_RESWORD, K_RTDECL, K_RTDECLMORE, K_STATE, K_TARRAY, K_TFIN,
@@ -50,8 +50,11 @@ CELL_FIELDS_MAX = 16
 LINEAR_BINDERS_MAX = 64
 
 # Type ids. Named types are G positions offset by FIRST_NAMED.
-T_I8, T_I16, T_I32, T_I64, T_BOOL, T_DIAMOND, T_LIT = range(7)
+T_I8, T_I16, T_I32, T_I64, T_BOOL, T_DIAMOND, T_LIT, T_LIT8, T_LIT16, T_LIT32 = range(10)
 FIRST_NAMED = 16
+# A literal whose type nothing has fixed yet, by the bytes it needs. T_LIT is the widest, and
+# the only one without `lfplo`, where a literal has always fitted whatever it met.
+_LITERALS = {T_LIT8: 1, T_LIT16: 2, T_LIT32: 4, T_LIT: 8}
 # Types with no entry in G. A range of ids per kind, so whether a type is linear can be read from
 # its id alone, as it already can for every other type.
 FIRST_ARRAY, FIRST_FIN, FIRST_TUPLE = 0x8000, 0xC000, 0xE000
@@ -59,7 +62,7 @@ TUPLE_MAX = 6  # as many results as x86 has registers for: section 4.1's pairs, 
 _ELEMENT_TYPES = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4}  # dyck's element codes, as the ids just below
 _BUILTIN = {b"Int8": T_I8, b"Int16": T_I16, b"Int32": T_I32, b"Int64": T_I64,
             b"Bool": T_BOOL, b"Diamond": T_DIAMOND}
-_SIZES = {T_I8: 1, T_I16: 2, T_I32: 4, T_I64: 8, T_BOOL: 1, T_LIT: 8}
+_SIZES = {T_I8: 1, T_I16: 2, T_I32: 4, T_I64: 8, T_BOOL: 1, T_LIT: 8, T_LIT8: 8, T_LIT16: 8, T_LIT32: 8}
 
 # G entries: name in the first cell, attributes in the second.
 E_TYPE, E_CTOR, E_FIELD, E_FUNC, E_PARAM, E_STATE = range(6)
@@ -125,10 +128,11 @@ class CheckStage(Stage):
 
     name = "check"
 
-    def __init__(self, g_max: int = 2048, *, lfplo: bool = False) -> None:
+    def __init__(self, g_max: int = 2048, *, lfplo: bool = False, phase1: bool = False) -> None:
         super().__init__()
         self.g_max = g_max
         self.lfplo = lfplo
+        self.phase1 = phase1 or not lfplo  # a program with a main, which _start calls and reads
         self.decl_from = self.decl_to = 0  # the G entries still to be written out as RT lines
         self.decl_text = b""               # the rest of the line being written out
         self.decl_queue: list[bytes] = []  # at most one declaration's few extra lines
@@ -187,7 +191,7 @@ class CheckStage(Stage):
 
     def _rt_type(self, ty: int) -> str:
         names = {T_I8: "i8", T_I16: "i16", T_I32: "i32", T_I64: "i64", T_BOOL: "bool",
-                 T_DIAMOND: "cap", T_LIT: "lit"}
+                 T_DIAMOND: "cap", T_LIT: "lit", T_LIT8: "lit", T_LIT16: "lit", T_LIT32: "lit"}
         return names.get(ty, f"t{ty}")
 
     def _rt_line(self, index: int) -> bytes:
@@ -289,6 +293,9 @@ class CheckStage(Stage):
     def _tuple_type(self, members: list[int], declared: bool = False) -> int:
         if len(members) > TUPLE_MAX:
             raise self._reject(f"a tuple of {len(members)}: at most {TUPLE_MAX}")
+        if any(m >= FIRST_TUPLE for m in members):
+            raise self._reject("a tuple cannot hold a tuple: tuples are flat, because they are "
+                               "only ever registers")
         ty, _new = self._intern(self.TT, FIRST_TUPLE,
                                 struct.pack(f"<{len(members)}H", *(m + 1 for m in members)))
         if declared:
@@ -401,17 +408,26 @@ class CheckStage(Stage):
             x, y = self._tuple_of(a), self._tuple_of(b)
             if len(x) == len(y):
                 return self._tuple_type([self._unify(m, n, where) for m, n in zip(x, y)])
-        if a == T_LIT and b in (T_I8, T_I16, T_I32, T_I64):
-            return b
-        if b == T_LIT and a in (T_I8, T_I16, T_I32, T_I64):
-            return a
+        if a in _LITERALS and b in _LITERALS:
+            return a if _LITERALS[a] > _LITERALS[b] else b
+        if a in _LITERALS and b in (T_I8, T_I16, T_I32, T_I64):
+            return self._literal_meets(a, b, where)
+        if b in _LITERALS and a in (T_I8, T_I16, T_I32, T_I64):
+            return self._literal_meets(b, a, where)
         raise self._reject(f"type mismatch in {where}: {self._show(a)} and {self._show(b)}")
+
+    def _literal_meets(self, literal: int, ty: int, where: str) -> int:
+        """A literal has to be a value of the type it is used at. If it could be more, a register
+        would hold an Int8 of 300, and the same value would be 44 to + and not 44 to ==."""
+        if self.lfplo and _LITERALS[literal] > _SIZES[ty]:
+            raise self._reject(f"a literal in {where} does not fit {self._show(ty)}")
+        return ty
 
     def _show(self, ty: int) -> str:
         for name, value in _BUILTIN.items():
             if value == ty:
                 return name.decode()
-        if ty == T_LIT:
+        if ty in _LITERALS:
             return "integer literal"
         if ty >= FIRST_TUPLE:
             return "(" + ", ".join(self._show(m) for m in self._tuple_of(ty)) + ")"
@@ -424,7 +440,7 @@ class CheckStage(Stage):
         return data[:PAYLOAD_BYTES].rstrip(b"\0").decode()
 
     def _need_int(self, ty: int, where: str) -> None:
-        if ty not in (T_I8, T_I16, T_I32, T_I64, T_LIT):
+        if ty not in (T_I8, T_I16, T_I32, T_I64) and ty not in _LITERALS:
             raise self._reject(f"{where} needs an integer, got {self._show(ty)}")
 
     # --- frames
@@ -667,7 +683,9 @@ class CheckStage(Stage):
             return kind, payload
         if kind in (K_LET, K_WITH):
             self._frame(kind, c1=len(self.B), c2=len(self.N))
-        elif kind in (K_IF, K_MATCH, K_BINOP, K_CMP, K_AND, K_OR, K_NOT):
+        elif kind == K_BINOP:
+            self._frame(kind, a=payload[0], t1=T_LIT)
+        elif kind in (K_IF, K_MATCH, K_CMP, K_AND, K_OR, K_NOT):
             self._frame(kind, t1=T_LIT)
         elif kind == K_TUPLE:
             if not self.lfplo:
@@ -758,7 +776,7 @@ class CheckStage(Stage):
             nparams = len(self.G) - first
             if self.fn_handler:
                 self._check_handler(first, nparams)
-            elif not self.lfplo and self.G.at(func)[1][:PAYLOAD_BYTES].rstrip(b"\0") == b"main":
+            elif self.phase1 and self.G.at(func)[1][:PAYLOAD_BYTES].rstrip(b"\0") == b"main":
                 self._check_main(first, nparams)
             _, _a, b, _c, d, ordinal, _y, _z = self._g(func)
             self._g_set(func, nparams, b, self.fn_at, d, ordinal, self.ret_ty, first)
@@ -777,6 +795,8 @@ class CheckStage(Stage):
                 return kind, P_LET_RT.pack(1, is_linear(ty), size_of(ty), 1)
             return kind, P_LET.pack(1, is_linear(ty), size_of(ty))
         if kind == K_TUPLE:
+            if len(self.TM) - frame[4] >= TUPLE_MAX:
+                raise self._reject(f"a tuple of more than {TUPLE_MAX}")
             self.TM.push(0, struct.pack("<H", self.ty))
             return kind, payload
         if kind == K_IDX:
@@ -964,6 +984,8 @@ class CheckStage(Stage):
             frame = self._top()
             ty = self._type_token(kind, payload)
             if self.K.peek()[0] == K_TTUPLE:
+                if len(self.TM) - frame[4] >= TUPLE_MAX:
+                    raise self._reject(f"a tuple of more than {TUPLE_MAX}")
                 self.TM.push(0, struct.pack("<H", ty))
                 return None
             if frame[0] == 1:
@@ -1022,6 +1044,10 @@ class CheckStage(Stage):
             return kind, P_VAR.pack(src, linear != 255, size_of(ty))
         if kind == K_INT:
             self.ty = T_LIT
+            if self.lfplo:
+                value = struct.unpack_from("<Q", payload)[0]
+                self.ty = (T_LIT8 if value < 1 << 8 else T_LIT16 if value < 1 << 16
+                           else T_LIT32 if value < 1 << 32 else T_LIT)
         elif kind == K_BOOL:
             self.ty = T_BOOL
         elif kind == K_NULLCTOR:
@@ -1037,6 +1063,8 @@ class CheckStage(Stage):
     def _binder(self, payload: bytes):
         frame = self._top()
         if self.K.peek()[0] == K_LET:
+            if len(self.N) - frame[5] >= TUPLE_MAX:
+                raise self._reject(f"more than {TUPLE_MAX} names in one let")
             self.N.push(0, payload)
             return (K_BINDER, b"") if self.lfplo else None
         position = frame[1]
@@ -1144,8 +1172,11 @@ class CheckStage(Stage):
             self.ty = frame[2]
         elif kind == K_BINOP:
             self._need_int(self.ty, "an arithmetic operand")
-            self.ty = self._unify(frame[2], self.ty, "an arithmetic operation")
-            if self.ty == T_LIT:
+            if OP_NAMES[frame[0]] in ("shl", "shr") and self.ty in _LITERALS:
+                self.ty = frame[2]  # section 4.4: a count is not a value of the type, and any has a meaning
+            else:
+                self.ty = self._unify(frame[2], self.ty, "an arithmetic operation")
+            if self.ty in _LITERALS:
                 self.ty = T_I64  # arithmetic on two literals has no context to adopt
             self.K.pop()
             self.child_seen = True
@@ -1175,6 +1206,8 @@ class CheckStage(Stage):
                 self.child_seen = True
                 return kind, bytes((mask,))
         elif kind == K_PACK:
+            if not self.child_seen:
+                raise self._reject("pack needs one expression per width")
             self._need_int(self.ty, "a pack field")
             if frame[5] + 1 != frame[0]:
                 raise self._reject("pack needs one expression per width")

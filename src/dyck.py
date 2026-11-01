@@ -542,11 +542,14 @@ class Parser(Stage):
             self.frames.pop()
             self._emit(cell, LEAF, K_TFIN, payload[:_PACK_FIELDS])
         elif state == S_TT_NEXT:
+            count = self.frames.peek()[1][1]
             if tag == T_COMMA:
-                self._set(S_TT_TYPE)
+                self._set(S_TT_TYPE, min(count + 1, 255))
                 ring.drop(self, cell)
             else:
                 require(T_RPAREN, "',' or ')'")
+                if count == 0:
+                    raise self._fail("a second type: a tuple has at least two members")
                 self.frames.pop()
                 self._emit(cell, CLOSE, K_TTUPLE)
         elif state == S_ST_COLON:
@@ -643,10 +646,13 @@ class Parser(Stage):
             self._set(S_LTB_NEXT)
             self._emit(cell, LEAF, K_BINDER, payload)
         elif state == S_LTB_NEXT:
+            count = self.frames.peek()[1][1]
             if tag == T_COMMA:
-                self._set(S_LTB)
+                self._set(S_LTB, min(count + 1, 255))
                 ring.drop(self, cell)
             else:
+                if count == 0:
+                    raise self._fail("a second name: a tuple has at least two members")
                 next_state(S_LET_EQ, "',' or ')'", T_RPAREN)
         elif state == S_LET_EQ:
             next_state(S_LET_E1, "'='", T_EQ)
@@ -743,10 +749,14 @@ class Parser(Stage):
         elif state == S_ARGS_NEXT:
             if tag == T_COMMA:
                 aux = self.frames.peek()[1][1] + 1
+                if aux > 255:
+                    raise self._fail("')': a construct takes at most 256 arguments")
                 self._set(S_ARG, aux)
                 self._emit(cell, SEP, kind, bytes((aux,)))
             else:
                 require(T_RPAREN, "',' or ')'")
+                if kind == K_TUPLE and self.frames.peek()[1][1] == 0:
+                    raise self._fail("a second member: a tuple has at least two members")
                 self._close_args(cell)
         elif state == S_CTOR_D:
             require(T_IDENT, "the diamond variable after '@'")

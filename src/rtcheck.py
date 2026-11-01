@@ -24,6 +24,7 @@ from typing import Iterable, Optional, Union
 SCALARS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64}
 SIZES = {"i8": 1, "i16": 2, "i32": 4, "i64": 8, "bool": 1}
 OP_NAMES = {"add", "sub", "mul", "and", "or", "xor", "shl", "shr"}
+READ_MODIFY_WRITE = {"add", "sub", "and", "or", "xor"}  # what one x86 instruction does in memory
 CC_NAMES = {"b", "be", "a", "ae", "e", "ne"}
 RESERVE = "Free"
 
@@ -45,6 +46,10 @@ def is_scalar(ty: Type) -> bool:
 
 def is_int(ty: Type) -> bool:
     return ty in SCALARS or ty == "lit"
+
+
+def is_fin(ty: Type) -> bool:
+    return isinstance(ty, tuple) and ty[0] == "fin"
 
 
 @dataclass(frozen=True)
@@ -207,6 +212,16 @@ class Checker:
         self.next_word += 1
         return ("fresh", self.next_word)
 
+    def fits(self, token: Tok, ty: Type, where: str) -> None:
+        """A literal has to be a value of the type it is used at. A register that holds one
+        carries its value in its word, until a join with a different one forgets it."""
+        if token.word[0] != "lit":
+            return
+        value = token.word[1]
+        limit = 2 if ty == "bool" else 1 << SCALARS[ty] if ty in SCALARS else None
+        if limit is not None and value >= limit:
+            raise self.fail(f"{where}: the literal {value} is not a {ty}")
+
     # --- reading tokens
 
     def reg(self, text: str) -> int:
@@ -275,10 +290,14 @@ class Checker:
             raise self.fail(f"{what} must be scalar, and {text} is {token.ty}")
         return token
 
-    def integer(self, text: str, width: int, what: str) -> None:
+    def integer(self, text: str, width: int, what: str, *, count: bool = False) -> None:
+        """An operand at this width. A shift count is not a value of the type: section 4.4 gives
+        any count a meaning, so it only has to be an integer."""
         token = self.scalar(text, what)
         if token.ty != "lit" and SCALARS.get(token.ty) != width:
             raise self.fail(f"{what} {text} is {token.ty}, and the operation is {width} bits")
+        if not count:
+            self.fits(token, f"i{width}", what)
 
     # --- the merge rule
 
@@ -302,12 +321,19 @@ class Checker:
                     raise self.fail(f"r{r} holds {present.ty} on one edge and nothing on another")
                 continue
             ty = self.unify(x.ty, y.ty, f"r{r} at a join") if x.ty != y.ty else x.ty
-            if ty == "cap" and x.word != y.word:
-                raise self.fail(f"r{r} is the capability of two different cells at a join")
             regs[r] = Tok(ty, self._merge_word(x.word, y.word))
         cells = {}
         for word in set(a.cells) & set(b.cells):
             cells[word] = self._merge_cell(word, a.cells[word], b.cells[word])
+        for r, token in regs.items():
+            if token.ty == "cap" and token.word not in cells:
+                # The capability of two different cells: which one is not known here, so all
+                # that survives is an empty cell, and anything still in either would be lost.
+                for edge in (a, b):
+                    self._no_linear_in(edge.cells[edge.regs[r].word], f"r{r} at a join")
+                cells[token.word] = Cell()
+        held = {token.word for token in regs.values() if token.ty == "cap"}
+        cells = {word: cell for word, cell in cells.items() if word in held}
         nulls = a.nulls & b.nulls
         ruled = {}
         for word in set(a.ruled) & set(b.ruled):
@@ -323,6 +349,13 @@ class Checker:
                 assert present is not None
                 if not is_scalar(present.ty) and present.full:
                     raise self.fail(f"a linear location of {word} exists on only one edge")
+                continue
+            if x.ty != y.ty:
+                # Two layouts at one offset. A value owed here would be lost, and a scalar or a
+                # hole simply has no token after the join, because nothing says which it is.
+                if (x.full and not is_scalar(x.ty)) or (y.full and not is_scalar(y.ty)):
+                    raise self.fail(f"[{key[0]}:{key[1]}] of {word} holds {x.ty} on one edge and "
+                                    f"{y.ty} on another")
                 continue
             if x.full != y.full and not is_scalar(x.ty):
                 raise self.fail(f"[{key[0]}:{key[1]}] of {word} is full on one edge and a hole "
@@ -362,6 +395,8 @@ class Checker:
             self.ctors[parts[0]] = ctor
             self.types[parts[1]].ctors.append(ctor)
         elif head == "field":
+            if parts[3] == "cap":
+                raise self.fail(f"field {parts[4]} is a capability: one cannot be stored in a cell")
             self.ctors[parts[0]].fields.append((int(parts[1]), int(parts[2]), parts[3], parts[4]))
         else:
             assert head == "state"
@@ -453,6 +488,8 @@ class Checker:
             self._check_handler_shape(signature)
         if at is not None and not (0 <= int(at) < len(parts)):
             raise self.fail(f"@{at} names no parameter")
+        if at is not None and self._resolve(ret) in self.tuples:
+            raise self.fail(f"@{at} on a function that returns a tuple: which member would it be")
 
     def _check_handler_shape(self, signature: Signature) -> None:
         """Section 3.1: the state, the item and the reserve, in and back out."""
@@ -509,7 +546,11 @@ class Checker:
             raise self.fail(f"const needs a literal, not {literal}")
         value = int(match.group(1))
         norm = self.norm(ty.strip())
-        word = self.fresh()
+        word = self.fresh() if norm != "lit" else ("lit", value)
+        if is_fin(norm):
+            raise self.fail(f"const of {norm}: the only way to make a Fin is idx")
+        if norm in SCALARS or norm == "bool":
+            self.fits(Tok("lit", ("lit", value)), norm, "const")
         if not is_scalar(norm):
             decl = self._decl(norm)
             if decl is None or decl.kind != "tagless" or value != 0:
@@ -542,13 +583,15 @@ class Checker:
             raise self.fail(f"unknown operation {a[1]}")
         width = int(bits)
         self.integer(a[2], width, "an operand")
-        self.integer(a[3], width, "an operand")
+        self.integer(a[3], width, "an operand", count=name in ("shl", "shr"))
         self.set(a[0], Tok(f"i{width}", self.fresh()))
 
     def _comparable(self, left: str, right: str) -> None:
         x, y = self.scalar(left, "a comparison operand"), self.scalar(right, "a comparison operand")
         if x.ty != y.ty and "lit" not in (x.ty, y.ty):
             raise self.fail(f"a comparison of {x.ty} with {y.ty}")
+        self.fits(x, y.ty, "a comparison")
+        self.fits(y, x.ty, "a comparison")
 
     def i_cmp(self, a: list[str]) -> None:
         if a[1] not in CC_NAMES:
@@ -597,6 +640,8 @@ class Checker:
     # --- cells
 
     def i_read(self, a: list[str]) -> None:
+        if not _LOC.match(a[1]):
+            raise self.fail(f"read needs a location, not {a[1]}")
         token = self.operand(a[1], consume=False)
         if not is_scalar(token.ty):
             raise self.fail(f"read of a linear location: {a[1]} has to be taken")
@@ -611,9 +656,9 @@ class Checker:
         self.operand(a[1])
         self.set(a[0], token)
 
-    def _build(self, base: str, ctor_id: str, tag: str, sources: list[str], star: Optional[Word]
-               ) -> tuple[int, Ctor]:
-        """The atomic constructor. `star` is the word `*` must find, or None if it is banned."""
+    def _build(self, base: str, ctor_id: str, tag: str, sources: list[str],
+               star: Optional[Tok]) -> tuple[int, Ctor]:
+        """The atomic constructor. `star` is the value `*` stands for, or None if it is banned."""
         r, word, cell = self.cap(base)
         ctor = self._ctor_of(ctor_id)
         decl = self.types[ctor.type]
@@ -632,13 +677,14 @@ class Checker:
                     raise self.fail(f"{where} says STAY, and [{off}:{size}] holds no full value")
                 if held.ty != ty and not (is_int(held.ty) and is_int(ty)):
                     raise self.fail(f"{where} says STAY over a {held.ty}, and the field is {ty}")
-                named.add(key)
+                self._name_once(named, key, held, where)
             elif source == "*":
                 stars += 1
                 if star is None:
                     raise self.fail(f"{where}: `*` outside tailmod")
-                if held is None or held.full or held.word != star:
+                if held is None or held.full or held.word != star.word:
                     raise self.fail(f"{where}: `*` needs a hole holding the word the call returns")
+                self.unify(star.ty, ty, where)
             elif source.endswith("!"):
                 r_source, token = self.full(source[:-1])
                 if held is None or held.full or held.word != token.word:
@@ -657,15 +703,16 @@ class Checker:
                 if not found.full:
                     raise self.fail(f"{where}: {source} is a hole")
                 self.unify(found.ty, ty, where)
-                named.add(other)
+                self._name_once(named, other, found, where)
             elif _FUNC.match(source):
-                self._computed(source, cell, ty, where)
+                self._computed(source, cell, ty, where, key)
             else:
                 token = self.operand(source)
                 if held is not None and held.word == token.word:
                     raise self.fail(f"{where} stores a value back where it came from: that is "
                                     f"{'`=`' if held.full else 'RESTORE'}, Theorem 6.1")
                 self.unify(token.ty, ty, where)
+                self.fits(token, ty, where)
         if star is not None and stars != 1:
             raise self.fail("tailmod needs exactly one `*`")
         for key, loc in cell.locs.items():
@@ -674,6 +721,13 @@ class Checker:
                                 f"{ctor.name} does not name, so it would be lost")
         self._tag_rule(tag, ctor, decl, cell)
         return r, ctor
+
+    def _name_once(self, named: set, key: tuple[int, int], loc: Loc, where: str) -> None:
+        """A linear value can stay or move once. Two sources naming it would be two owners."""
+        if key in named and not is_scalar(loc.ty):
+            raise self.fail(f"{where}: [{key[0]}:{key[1]}] is a linear {loc.ty}, and another "
+                            f"field already takes it")
+        named.add(key)
 
     @staticmethod
     def _inner(source: str) -> tuple[int, int]:
@@ -684,24 +738,33 @@ class Checker:
     def _literal_fits(self, source: str, ty: Type, where: str) -> None:
         match = _LIT.match(source)
         assert match is not None
+        if is_fin(ty):
+            raise self.fail(f"{where}: a literal cannot be a {ty}: the only way to make one is idx")
         if is_scalar(ty):
+            self.fits(Tok("lit", ("lit", int(match.group(1)))), ty, where)
             return
         decl = self._decl(ty)
         if decl is None or decl.kind != "tagless" or int(match.group(1)) != 0:
             raise self.fail(f"{where}: {source} cannot be a {ty}")
 
-    def _computed(self, source: str, cell: Cell, ty: Type, where: str) -> None:
+    def _computed(self, source: str, cell: Cell, ty: Type, where: str, own: tuple[int, int]) -> None:
         match = _FUNC.match(source)
         assert match is not None
         name, off, size, operand = match.groups()
-        if name not in OP_NAMES:
-            raise self.fail(f"{where}: unknown operation {name}")
+        if name not in READ_MODIFY_WRITE:
+            raise self.fail(f"{where}: {name} is not an operation a field can do to itself")
         key = (int(off), int(size))
+        if key != own:
+            raise self.fail(f"{where}: a computed source works in place, and [{off}:{size}] is not "
+                            f"this field: compute it into a register with op")
         loc = cell.locs.get(key)
-        if loc is None or not loc.full or not is_scalar(loc.ty):
-            raise self.fail(f"{where}: [{off}:{size}] holds no full scalar")
+        if loc is None or not loc.full or not is_int(loc.ty):
+            raise self.fail(f"{where}: [{off}:{size}] holds no full integer")
         self.unify(loc.ty, ty, where)
-        self.scalar(operand, "a computed source's operand")
+        if _LOC.match(operand):
+            raise self.fail(f"{where}: a computed source's operand is a register or a literal")
+        token = self.scalar(operand, "a computed source's operand")
+        self.fits(token, ty, where)
 
     def _tag_rule(self, tag: str, ctor: Ctor, decl: TypeDecl, cell: Cell) -> None:
         if decl.kind != "tagged":
@@ -711,8 +774,6 @@ class Checker:
         known = cell.tag == ("is", int(ctor.tag))
         if tag == "keep" and not known:
             raise self.fail(f"keep: nothing shows the cell already holds tag {ctor.tag}")
-        if tag == "write" and known:
-            raise self.fail(f"write of tag {ctor.tag} over the same tag")
         if tag not in ("keep", "write"):
             raise self.fail(f"{ctor.name} is tagged, so build must say keep or write, not {tag}")
 
@@ -722,6 +783,7 @@ class Checker:
         word = self.S.regs[r].word
         self.S.regs[r] = Tok(("named", self._resolve(ctor.type)), word)
         del self.S.cells[word]
+        self.S.ruled.pop(word, None)  # what a test ruled out was about what the cell used to hold
 
     # --- control
 
@@ -813,6 +875,7 @@ class Checker:
         for operand, ty in zip(operands, signature.params):
             want = self.norm(ty)
             token = self.operand(operand)
+            self.fits(token, want, f"an argument of {signature.name}")
             if want == "cap" or token.ty == "cap":
                 if token.ty != want:
                     raise self.fail(f"argument {operand} is {token.ty}, and {signature.name} "
@@ -826,9 +889,9 @@ class Checker:
         return tokens
 
     def _literal_argument(self, token: Tok, want: Type) -> bool:
-        value = token.word[1]
+        value = token.word[1] if token.word[0] == "lit" else None
         if want == "bool":
-            return value in (0, 1)
+            return value is not None
         if is_scalar(want):
             return is_int(want)
         decl = self._decl(want)
@@ -839,10 +902,12 @@ class Checker:
         cell = self.S.cells.pop(word, None)
         if cell is None:
             raise self.fail(f"{operand} is a capability with no cell behind it")
+        self._no_linear_in(cell, f"{operand} leaves")
+
+    def _no_linear_in(self, cell: Cell, where: str) -> None:
         for key, loc in cell.locs.items():
             if loc.full and not is_scalar(loc.ty):
-                raise self.fail(f"{operand} goes to a callee with a linear value still at "
-                                f"[{key[0]}:{key[1]}]")
+                raise self.fail(f"{where} with a linear value still at [{key[0]}:{key[1]}]")
 
     def _callee(self, ordinal: str) -> Signature:
         signature = self.functions.get(ordinal)
@@ -869,19 +934,27 @@ class Checker:
         word = tokens[signature.at].word if signature.at is not None else self.fresh()
         results = self.tuples.get(self._resolve(signature.ret))
         if results is None:
-            self.set(a[0], Tok(self.norm(signature.ret), word))
+            self._result(a[0], self.norm(signature.ret), word)
             return
         names = _args(a[0].strip("()"))
         if len(names) != len(results):
             raise self.fail(f"{signature.name} returns {len(results)} values")
         for name, ty in zip(names, results):
-            self.set(name, Tok(self.norm(ty), self.fresh()))
+            self._result(name, self.norm(ty), self.fresh())
+
+    def _result(self, register: str, ty: Type, word: Word) -> None:
+        self.set(register, Tok(ty, word))
+        if ty == "cap":  # a capability that comes back is an empty cell, whatever it held before
+            assert self.S is not None
+            self.S.cells[word] = Cell()
 
     def _no_linear_left(self, where: str) -> None:
         assert self.S is not None
         for r, token in self.S.regs.items():
             if not is_scalar(token.ty):
                 raise self.fail(f"{where} with a linear value still in r{r}: {token.ty}")
+        if self.S.cells:
+            raise self.fail(f"{where} with a cell nothing holds: {sorted(self.S.cells)}")
 
     def _word_leaving(self, word: Word, where: str) -> None:
         fn = self.fn
@@ -903,9 +976,12 @@ class Checker:
         for operand, ty in zip(a, wanted):
             r, token = self.full(operand)
             self.unify(token.ty, self.norm(ty), "a result")
+            self.fits(token, self.norm(ty), "a result")
             if not is_scalar(token.ty):
                 assert self.S is not None
                 del self.S.regs[r]
+            if token.ty == "cap":
+                self._hand_over_cell(token.word, operand)
             if results is None:
                 self._word_leaving(token.word, "ret")
         self._no_linear_left("ret")
@@ -936,13 +1012,14 @@ class Checker:
         signature = self._callee(ordinal)
         fn = self.fn
         assert fn is not None
-        if signature.at is None:
-            raise self.fail(f"tailmod of {signature.name}, which is not declared @")
+        if signature is not fn:
+            raise self.fail(f"tailmod of {signature.name} from {fn.name}: `*` links to what the "
+                            f"next iteration of this function builds, so it can only be itself")
         if fn.at is None:
             raise self.fail(f"tailmod in {fn.name}, which is not declared @")
         tokens = self._consume_arguments(signature, operands)
-        star = tokens[signature.at].word
-        r, built = self._build(a[0], a[1], a[2], sources, star)
+        star = Tok(self.norm(signature.ret), tokens[fn.at].word)
+        r, _built = self._build(a[0], a[1], a[2], sources, star)
         assert self.S is not None
         token = self.S.regs[r]
         self._word_leaving(token.word, "tailmod")

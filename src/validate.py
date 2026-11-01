@@ -186,7 +186,7 @@ def recompute_stack(asm: str) -> int:
     handler = re.search(r"^handler_entry equ fn_(\w+)$", asm, re.M)
     for raw in asm.splitlines():
         line = raw.strip()
-        if line.endswith("_body:") and line.startswith("fn_"):
+        if line.endswith("$body:") and line.startswith("fn_"):
             current, calls, tails = line[3:-6], [], []
         elif line.startswith("F_") and current is not None and " equ " in line:
             frame = 8 + int(frames[current])

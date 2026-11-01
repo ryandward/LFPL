@@ -27,7 +27,7 @@ from .dyck import (CC_NAMES, CLOSE, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_C
                    K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
                    K_RTDECLMORE, K_TUPLE, K_TYPE, K_VAR, K_WITH, LEAF, OP_NAMES, OPEN, SEP, Lexer,
                    Parser, ev_class, ev_kind)
-from .ring import FrameStack, Ring, Stage
+from .ring import FrameStack, Reject, Ring, Stage
 from .tokens import PAYLOAD_BYTES
 
 LINE_MORE, LINE_END = 0, 1
@@ -35,6 +35,7 @@ _RT_OPS = {"imul": "mul"}
 _RMW = frozenset(("add", "sub", "and", "or", "xor"))
 UNKNOWN_TAG = 255
 MAX_BINDERS = 128  # LFPL-O section 8.2: names in scope in one function
+MAX_REGISTERS = 65535  # registers one function may write, which a value's two bytes can name
 E_MAX = 4096       # the most cells of text one event may write: a settle of a whole value stack
 
 
@@ -79,6 +80,7 @@ class Value:
 
 
 D_ANY, D_RET, D_REG, D_COND = range(4)
+RETURN_IT = 2  # Frame.push: the value is the function's result, so `ret` it at close
 
 
 class Dest(NamedTuple):
@@ -99,7 +101,7 @@ class Frame:
     dest: int = D_ANY
     count: int = 1
     push: int = 0     # the dest was D_ANY: leave the joined value on the value stack at close
-    noted: int = 0    # an arm has delivered, so `word` and `linear` hold what it delivered
+    noted: int = 0    # an arm has delivered, so this join's Delivered records hold what it did
     d: int = 0
     reg: int = 0      # the scrutinee, or the capability being built
     bmark: int = 0
@@ -112,14 +114,14 @@ class Frame:
     l1: int = 0
     l2: int = 0
     l3: int = 0
-    word: int = 0
+    word: int = 0     # the scrutinee's word, or the capability's
     cell: int = 0
-    linear: int = 0
+    jmark: int = 0    # where this join's Delivered records start
 
     def pack(self) -> bytes:
         return _FRAME.pack(self.kind, self.state, self.dest, self.count, self.push, self.noted,
                            self.d, self.reg, self.bmark, self.vmark, self.gmark, self.umark, self.aux,
-                           self.t, self.f, self.l1, self.l2, self.l3, self.word, self.cell, self.linear)
+                           self.t, self.f, self.l1, self.l2, self.l3, self.word, self.cell, self.jmark)
 
     @staticmethod
     def unpack(data: bytes) -> "Frame":
@@ -220,6 +222,23 @@ class Layout:
 
 
 @dataclass(frozen=True)
+class Delivered:
+    """What an arm left in one member of a destination, for the join to compare. A word survives
+    a join only if every arm delivered that word. A capability keeps its cell the same way."""
+    word: int = 0
+    linear: int = 0
+    cell: int = 0
+    tag: int = UNKNOWN_TAG
+
+    def pack(self) -> bytes:
+        return struct.pack("<IBIB", self.word, self.linear, self.cell, self.tag)
+
+    @staticmethod
+    def unpack(data: bytes) -> "Delivered":
+        return Delivered(*struct.unpack_from("<IBIB", data))
+
+
+@dataclass(frozen=True)
 class Cell:
     number: int
 
@@ -266,8 +285,8 @@ class RTLower(Stage):
         self.fn_handler = False
         self.ret_ty = 0
         self.at: Optional[int] = None
-        self.params = 0
-        self.last_into = (0, 0)    # the word and linearity of what was last delivered to a dest
+        self.param_types: list[int] = []  # at most 6
+        self.last_into: list[Delivered] = [Delivered()]  # what was last delivered, per member
 
     def attach(self, ring: Ring) -> None:
         super().attach(ring)
@@ -278,6 +297,7 @@ class RTLower(Stage):
         self.U = Records(self.stack(), Undo)
         self.L = Records(self.stack(), Layout)
         self.C = Records(self.stack(), Ctor)
+        self.J = Records(self.stack(), Delivered)
 
     def depth(self) -> int:
         return len(self.F)
@@ -307,6 +327,9 @@ class RTLower(Stage):
     def fresh(self, count: int = 1) -> int:
         first = self.next_reg
         self.next_reg += count
+        if self.next_reg > MAX_REGISTERS:
+            raise Limit(f"section 8.2: fn {self.fn_name.decode()} writes more than {MAX_REGISTERS} "
+                        f"registers")
         return first
 
     def new_label(self) -> int:
@@ -415,14 +438,16 @@ class RTLower(Stage):
         if value.kind == V_TUPLE:
             members = [self.V.pop() for _ in range(value.reg)]
             members.reverse()
-            mask = 0
-            for position, member in enumerate(members):
-                self._into(member, d + position)
-                mask |= self.last_into[1] << position
-            self.last_into = (0, mask)
+            arrived = list(members)
+            # A capability moves last: a member read through it needs it where it still is.
+            for position in sorted(range(len(members)), key=lambda i: members[i].kind == V_CAP):
+                self._into(members[position], d + position)
+                arrived[position] = self.last_into[0]
+            self.last_into = arrived
             return
         word = value.word
         linear = bool(value.flags & LINEAR)
+        cell, tag = 0, UNKNOWN_TAG
         if value.kind == V_LIT:
             ty = "bool" if value.flags & BOOL else "lit"
             self.i(f"const r{d}, #{value.n} : {ty}")
@@ -434,16 +459,21 @@ class RTLower(Stage):
             verb = "take" if linear else "read"
             self.i(f"{verb} r{d}, r{value.reg}[{value.off}:{value.size}]")
         elif value.kind == V_CAP:
+            # Nothing names the cell's locations through its new register, so leaving here is
+            # like going to a callee: what it still holds moves out, and a scalar is left behind.
+            self._close_cell(value.cell, frozenset(), len(self.V))
             self.i(f"move r{d}, r{value.reg}")
-            linear = True
+            linear, cell, tag = True, value.cell, value.off
         else:
             assert value.kind == V_REG, value
             if value.reg != d:
                 verb = "move" if value.flags & OWNED else "copy"
                 self.i(f"{verb} r{d}, r{value.reg}")
-        self.last_into = (word, int(linear))
+        self.last_into = [Delivered(word, int(linear), cell, tag)]
 
     def _branch_on(self, value: Value, t: int, f: int) -> None:
+        if value.kind == V_TUPLE:  # delivered here before Check reaches the end of the condition
+            raise Reject("a condition must be Bool, and this is a tuple")
         if value.kind == V_LIT:
             register = self.fresh()
             self._into(value, register)
@@ -481,7 +511,7 @@ class RTLower(Stage):
             self.next_word = 2
             self.next_cell = 1
             self.at = None
-            self.params = 0
+            self.param_types = []
             self.F.push(Frame(kind, dest=D_RET))
             return
         if kind == K_ARM:
@@ -496,12 +526,13 @@ class RTLower(Stage):
             dest, push = self._resolve(dest)
             self.F.push(Frame(K_IF, dest=dest.kind, d=dest.d, count=dest.count, t=dest.t, f=dest.f,
                               push=push, l1=self.new_label(), l2=self.new_label(), l3=self.new_label(),
-                              bmark=len(self.B), gmark=len(self.G), umark=len(self.U)))
+                              bmark=len(self.B), gmark=len(self.G), umark=len(self.U),
+                              jmark=self._open_join(dest)))
         elif kind == K_MATCH:
             dest, push = self._resolve(dest)
             self.F.push(Frame(K_MATCH, dest=dest.kind, d=dest.d, count=dest.count, t=dest.t, f=dest.f,
                               push=push, l3=self.new_label(), vmark=len(self.V), bmark=len(self.B),
-                              gmark=len(self.G), umark=len(self.U)))
+                              gmark=len(self.G), umark=len(self.U), jmark=self._open_join(dest)))
         elif kind in (K_AND, K_OR, K_NOT):
             self._open_logical(kind, dest)
         elif kind == K_WITH:
@@ -525,13 +556,23 @@ class RTLower(Stage):
             self.F.push(Frame(kind, dest=dest.kind, d=dest.d, count=dest.count, t=dest.t, f=dest.f,
                               aux=aux, vmark=len(self.V)))
 
+    def _open_join(self, dest: Dest) -> int:
+        mark = len(self.J)
+        if dest.kind == D_REG:
+            for _ in range(dest.count):
+                self.J.push(Delivered())
+        return mark
+
     def _open_logical(self, kind: int, dest: Dest) -> None:
         """Jumping code. Given labels to jump to, it writes no value at all. Otherwise it needs
         its own, and materializes 1 or 0 at them when it closes."""
         if dest.kind == D_COND:
             self.F.push(Frame(kind, dest=D_COND, t=dest.t, f=dest.f, l3=self.new_label()))
             return
-        resolved, push = self._resolve(dest)
+        if dest.kind == D_RET:
+            resolved, push = Dest(D_REG, self.fresh()), RETURN_IT
+        else:
+            resolved, push = self._resolve(dest)
         self.F.push(Frame(kind, dest=resolved.kind, d=resolved.d, count=resolved.count,
                           t=self.new_label(), f=self.new_label(), l3=self.new_label(),
                           l1=self.new_label(), push=push))
@@ -553,9 +594,9 @@ class RTLower(Stage):
     def _leaf(self, kind: int, payload: bytes) -> None:
         if kind == K_PARAM:
             src, _size, linear, ty = P_PARAM_RT.unpack_from(payload)
-            self.B.push(Binder(Value(V_REG, src, word=self.new_word(), cell=ty,
+            self.B.push(Binder(Value(V_REG, src, word=self.new_word(),
                                      flags=OWNED | (LINEAR if linear else 0))))
-            self.params += 1
+            self.param_types.append(ty)
         elif kind == K_TYPE:
             self.ret_ty = P_TYPE_RT.unpack_from(payload)[0]
         elif kind == K_RESWORD:
@@ -611,7 +652,7 @@ class RTLower(Stage):
                             f"it first: let y = +(x, 0) in ...")
             return value
         if value.kind == V_REG:
-            return replace(value, cell=0, flags=(value.flags & (LINEAR | OWNED)) if linear
+            return replace(value, flags=(value.flags & (LINEAR | OWNED)) if linear
                            else value.flags & LINEAR)
         return value
 
@@ -632,7 +673,7 @@ class RTLower(Stage):
         self.F.set_top(top)
         if top.state == 1:  # a known constructor: the names are its field values
             if kind == 0:
-                self._push_binder(Binder(Value(V_CAP, top.reg, off=UNKNOWN_TAG, word=top.word,
+                self._push_binder(Binder(Value(V_CAP, top.reg, off=top.l1, word=top.word,
                                                cell=top.cell, flags=LINEAR)))
                 return
             match = self.F.at(len(self.F) - 2)
@@ -676,12 +717,15 @@ class RTLower(Stage):
             value = self.B.pop().value
             if value.kind != V_REG or value.flags & LINEAR or not value.flags & OWNED:
                 continue
+            # The last value naming it is the one that owns it, since a tuple moves its members
+            # in order and the earlier ones are copies by then.
             kept = False
-            for index in range(values_from, len(self.V)):
+            for index in range(len(self.V) - 1, values_from - 1, -1):
                 held = self.V.at(index)
                 if held.kind == V_REG and held.reg == value.reg:
                     self.V.set(index, replace(held, flags=held.flags | OWNED))
                     kept = True
+                    break
             if not kept and self.live:
                 self.i(f"drop r{value.reg}")
 
@@ -691,11 +735,21 @@ class RTLower(Stage):
         """Rule of the merge: a join's word survives only if every arm delivered the same one."""
         if frame.dest != D_REG:
             return
-        word, linear = self.last_into
-        if not frame.noted:
-            frame.noted, frame.word, frame.linear = 1, word, linear
-        elif frame.word != word or word == 0:
-            frame.word = self.new_word()
+        for position in range(frame.count):
+            came = self.last_into[position]
+            at = frame.jmark + position
+            if not frame.noted:
+                self.J.set(at, came)
+                continue
+            held = self.J.at(at)
+            if held.word != came.word:
+                held = replace(held, word=self.new_word())
+            if held.cell != came.cell:
+                held = replace(held, cell=0, tag=UNKNOWN_TAG)
+            elif held.tag != came.tag:
+                held = replace(held, tag=UNKNOWN_TAG)
+            self.J.set(at, held)
+        frame.noted = 1
 
     def _rollback(self, frame: Frame) -> None:
         """The next arm starts from the state at the branch."""
@@ -708,14 +762,18 @@ class RTLower(Stage):
     def _close_join(self, frame: Frame) -> None:
         if frame.dest != D_REG:
             return
-        word = frame.word if frame.count == 1 else 0
-        self.last_into = (word, frame.linear)
+        members = [self.J.at(frame.jmark + position) for position in range(frame.count)]
+        self.J.truncate(frame.jmark)
+        self.last_into = members
         if not frame.push:
             return
-        for position in range(frame.count):
-            linear = frame.linear >> position & 1
-            self.V.push(Value(V_REG, frame.d + position, word=word or self.new_word(),
-                              flags=OWNED | (LINEAR if linear else 0)))
+        for position, member in enumerate(members):
+            if member.cell:
+                self.V.push(Value(V_CAP, frame.d + position, off=member.tag, word=member.word,
+                                  cell=member.cell, flags=LINEAR))
+            else:
+                self.V.push(Value(V_REG, frame.d + position, word=member.word,
+                                  flags=OWNED | (LINEAR if member.linear else 0)))
         if frame.count > 1:
             self.V.push(Value(V_TUPLE, frame.count))
 
@@ -724,9 +782,11 @@ class RTLower(Stage):
         if value.kind == V_VIRT:
             top.state = 1
             top.reg = value.reg
-            top.word = value.word  # the constructor
+            top.word = value.word
             top.cell = value.cell
             top.aux = value.off    # how many field values wait on the stack
+            top.l1 = self.C.pop().ctor
+            top.l2 = value.size    # the tag the cell still holds: nothing was built
             self.F.set_top(top)
             return
         self._settle_pending()
@@ -745,12 +805,12 @@ class RTLower(Stage):
         tag, tagged, is_null, arm_index, nctors, ctor = P_ARM_RT.unpack_from(payload)
         match = self.F.top()
         if match.state == 1:
-            if ctor != match.word:
+            if ctor != match.l1:
                 self.dead = 1
                 return
             self.F.push(Frame(K_ARM, state=1, dest=match.dest, d=match.d, count=match.count, t=match.t,
-                              f=match.f, reg=match.reg, cell=match.cell, word=self.new_word(),
-                              bmark=len(self.B)))
+                              f=match.f, reg=match.reg, cell=match.cell, word=match.word,
+                              bmark=len(self.B), l1=match.l2))
             return
         self._rollback(match)
         cell = self.new_cell()
@@ -841,9 +901,13 @@ class RTLower(Stage):
         self.i(f"const r{top.d}, #0 : bool")
         self.jump(top.l1)
         self.label(top.l1)
-        self.last_into = (self.new_word(), 0)
-        if top.push:
-            self.V.push(Value(V_REG, top.d, word=self.last_into[0], flags=OWNED))
+        word = self.new_word()
+        self.last_into = [Delivered(word)]
+        if top.push == RETURN_IT:
+            self.i(f"ret r{top.d}")
+            self.live = False
+        elif top.push:
+            self.V.push(Value(V_REG, top.d, word=word, flags=OWNED))
 
     # --- operators
 
@@ -855,7 +919,7 @@ class RTLower(Stage):
         word = self.new_word()
         value = Value(V_REG, register, word=word, flags=OWNED)
         if top.dest == D_REG:
-            self.last_into = (word, 0)
+            self.last_into = [Delivered(word)]
         else:
             self._deliver(value, top.as_dest())
 
@@ -924,11 +988,8 @@ class RTLower(Stage):
         position = self._as_reg(index)
         element = self.fresh()
         self.i(f"aget r{element}, r{base}, r{position}, {size}")
-        if index.kind != V_REG or index.flags & OWNED:
-            if position != index.reg or index.kind != V_REG:
-                self.i(f"drop r{position}")
-            else:
-                self._release(index)
+        if index.kind != V_REG or index.flags & OWNED:  # a temporary, read for the last time
+            self.i(f"drop r{position}")
         self.V.push(Value(V_REG, base, word=array.word, flags=OWNED | LINEAR))
         self.V.push(Value(V_REG, element, word=self.new_word(), flags=OWNED))
         self._deliver(Value(V_TUPLE, 2), top.as_dest())
@@ -977,7 +1038,7 @@ class RTLower(Stage):
                              flags=OWNED | (LINEAR if linear_mask >> i & 1 else 0))
                        for i in range(results)]
             if top.dest == D_REG:
-                self.last_into = (0, linear_mask)
+                self.last_into = [Delivered(m.word, int(bool(m.flags & LINEAR))) for m in members]
                 return
             for member in members:
                 self.V.push(member)
@@ -989,7 +1050,7 @@ class RTLower(Stage):
         value = Value(V_REG, register, word=word or self.new_word(),
                       flags=OWNED | (LINEAR if linear_mask & 1 else 0))
         if top.dest == D_REG:
-            self.last_into = (value.word, linear_mask & 1)
+            self.last_into = [Delivered(value.word, linear_mask & 1)]
         else:
             self._deliver(value, top.as_dest())
 
@@ -1024,7 +1085,8 @@ class RTLower(Stage):
         parent = self.F.top()
         if parent.kind == K_MATCH and parent.state == 0:
             self.L.truncate(top.l1)
-            self.V.push(Value(V_VIRT, top.reg, count, word=info.ctor, cell=top.cell))
+            self.C.push(info)
+            self.V.push(Value(V_VIRT, top.reg, count, top.l2, top.word, top.cell))
             return
         fields = [self.L.at(top.l1 + i) for i in range(count)]
         self.L.truncate(top.l1)
@@ -1083,10 +1145,12 @@ class RTLower(Stage):
     def _is_hole_of(self, word: int, cell: int, off: int, size: int) -> bool:
         """Does this location of this cell belong to a name whose value this word is? If so the
         value can go back with no store: that is RESTORE."""
+        if not cell:
+            return False
         for index in range(len(self.B) - 1, -1, -1):
             value = self.B.at(index).value
             if (value.cell == cell and value.word == word and value.off == off
-                    and value.size == size and value.kind == V_LOC):
+                    and value.size == size and value.kind in (V_LOC, V_REG)):
                 return True
         return False
 
@@ -1134,9 +1198,11 @@ class RTLower(Stage):
             if (value.kind == V_LOC and value.cell == cell and value.flags & LINEAR
                     and not value.flags & CONSUMED and (value.off, value.size) not in named):
                 self.i(f"take r{binder.refuge}, r{value.reg}[{value.off}:{value.size}]")
-                self._set_binder(index, Binder(Value(V_REG, binder.refuge, word=value.word,
+                self._set_binder(index, Binder(Value(V_REG, binder.refuge, off=value.off,
+                                                     size=value.size, word=value.word, cell=cell,
                                                      flags=OWNED | LINEAR)))
-        self._mark_gone(cell)
+        if cell:
+            self._mark_gone(cell)
 
     # --- with
 
@@ -1217,15 +1283,13 @@ class RTLower(Stage):
             raise AssertionError(f"sep of kind {kind}")
 
     def _header(self) -> None:
-        params = []
-        for index in range(self.params):
-            params.append(f"r{index} : {_type_text(self.B.at(index).value.cell)}")
+        params = [f"r{index} : {_type_text(ty)}" for index, ty in enumerate(self.param_types)]
         word = "handler" if self.fn_handler else "fn"
         at = f" @{self.at}" if self.at is not None else ""
         self.emit(f"{word} f{self.ordinal} {self.fn_name.decode()}({', '.join(params)}) : "
                   f"{_type_text(self.ret_ty)}{at}")
         self.live = True
-        self.next_reg = self.params
+        self.next_reg = len(self.param_types)
         top = self.F.top()
         top.count = 1
         self.F.set_top(top)
@@ -1286,7 +1350,7 @@ _FRAME_CELLS = (_FRAME.size + PAYLOAD_BYTES - 1) // PAYLOAD_BYTES
 # a computed source's operand under it; the names an arm binds, and the undo records one path can
 # hold for them, consumed once and moved once; the layouts, the constructor and the one cell.
 S_LOWER = (_FRAME_CELLS + (2 * _CELL_FIELDS + _ARGUMENTS) + 2 * (_CELL_FIELDS + 1)
-           + 2 * 2 * (_CELL_FIELDS + 1) + _CELL_FIELDS + 2)
+           + 2 * 2 * (_CELL_FIELDS + 1) + _CELL_FIELDS + 2 + _ARGUMENTS)
 S_PARSE = 1
 S_CHECK = 3 + 1 + 2 * (_CELL_FIELDS + 1) + 6 + 2 * _ARGUMENTS
 G_CELLS_PER_ENTRY = 2
@@ -1310,7 +1374,8 @@ def file_bytes(handle: BinaryIO, chunk: int = 4096) -> Iterator[int]:
         yield from block
 
 
-def rt_lines(handle: BinaryIO, on_step: Optional[Callable[[Ring], None]] = None) -> Iterator[str]:
+def rt_lines(handle: BinaryIO, on_step: Optional[Callable[[Ring], None]] = None,
+             *, phase1: bool = False) -> Iterator[str]:
     """The stream, one line at a time, as the ring writes it. Nothing is held in between: the
     ring runs only as far as it takes to produce the next line."""
     pending: list[str] = []
@@ -1322,7 +1387,7 @@ def rt_lines(handle: BinaryIO, on_step: Optional[Callable[[Ring], None]] = None)
             pending.append(text.decode())
             text.clear()
 
-    stages = [Lexer(), Parser(), CheckStage(lfplo=True), RTLower()]
+    stages = [Lexer(), Parser(), CheckStage(lfplo=True, phase1=phase1), RTLower()]
     ring = Ring(required_cells(64), file_bytes(handle), stages, sink, on_step)
     for _ in _steps(ring):
         while pending:

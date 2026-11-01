@@ -384,6 +384,231 @@ end
         self.assertEqual(check(FORWARD, stream).bounds("h")[0], 1)
 
 
+PAIR = """
+type t24 record Pair
+ctor c25 t24 - Pair
+field c25 0 8 t16 l
+field c25 8 8 t16 r
+"""
+TWO = """
+type t20 tagged Two
+ctor c21 t20 0 P
+field c21 8 8 i64 x
+ctor c22 t20 1 Q
+field c22 8 8 t16 next
+"""
+FINS = """
+array t32768 1024 i8
+fin t32769 1024
+type t40 record Box
+ctor c41 t40 - Box
+field c41 0 8 t32769 at
+"""
+
+
+class Ownership(unittest.TestCase):
+    """Streams an earlier version of this checker accepted, each of them a real way to lose a
+    pointer, forge an index, or skip a store. Some compile to a wrong answer if they get through."""
+
+    def refuse(self, pattern: str, *parts: str):
+        with self.assertRaisesRegex(RTError, pattern):
+            check(*parts)
+
+    def test_one_pointer_cannot_end_up_in_two_fields(self):
+        stream = """tuple t50 t24 t16
+fn f1 g(r0 : t24) : t50
+    open r0, c25
+    take r1, r0[0:8]
+    build r0, c25, none, [8:8], =
+    ret r0, r1
+end
+"""
+        self.refuse("already takes it", LIST, PAIR, stream)
+
+    def test_a_capability_cannot_leave_with_pointers_in_its_cell(self):
+        stream = """
+fn f1 g(r0 : t24) : cap
+    open r0, c25
+    ret r0
+end
+"""
+        self.refuse("still at", LIST, PAIR, stream)
+
+    def test_a_join_does_not_pick_one_edges_idea_of_a_location(self):
+        erased = """
+fn f0 g(r0 : t20) : t20
+    br.tag r0, 0, L1, L2
+L1: jump L3
+L2: open r0, c22
+    jump L3
+L3: build r0, c21, write, #0
+    ret r0
+end
+"""
+        forged = """
+fn f0 g(r0 : t20) : t16
+    br.tag r0, 1, L1, L2
+L1: jump L3
+L2: open r0, c21
+    jump L3
+L3: take r1, r0[8:8]
+    ret r1
+end
+"""
+        self.refuse("on one edge and", LIST, TWO, erased)
+        self.refuse("on one edge and", LIST, TWO, forged)
+
+    def test_what_a_test_ruled_out_does_not_survive_a_rebuild(self):
+        stream = """tuple t50 t16 t16 t20
+fn f0 g(r0 : t20) : t50
+    br.tag r0, 0, L1, L2
+L1: const r3, #0 : t16
+    const r4, #0 : t16
+    build r0, c21, keep, =
+    ret r3, r4, r0
+L2: open r0, c22
+    take r1, r0[8:8]
+    build r0, c21, write, #12345
+    open r0, c22
+    take r2, r0[8:8]
+    build r0, c21, write, #1
+    ret r1, r2, r0
+end
+"""
+        self.refuse("still possible", LIST, TWO, stream)
+
+    def test_only_idx_makes_an_index(self):
+        for body in ("const r1, #99999999 : t32769\n    aget r2, r0, r1, 1\n    ret r0, r2",):
+            self.refuse("only way to make", FINS, f"""tuple t50 t32768 i8
+fn f0 g(r0 : t32768) : t50
+    {body}
+end
+""")
+        self.refuse("only way to make", FINS, """
+fn f0 g(r0 : t40) : t40
+    open r0, c41
+    build r0, c41, none, #99999999
+    ret r0
+end
+""")
+        self.refuse("no full integer", FINS, """
+fn f0 g(r0 : t40) : t40
+    open r0, c41
+    build r0, c41, none, add([0:8], #99999999)
+    ret r0
+end
+""")
+
+    def test_the_value_a_star_stands_for_has_a_type(self):
+        stream = """
+type t40 tagless Tree
+ctor c41 t40 null Oz
+ctor c42 t40 - Oc
+field c42 0 8 i64 ohead
+field c42 8 8 t44 otail
+type t44 tagless Third
+ctor c45 t44 null Tz
+ctor c46 t44 - Tc
+field c46 0 8 i64 thead
+field c46 8 8 t44 ttail
+fn f1 g(r0 : t16) : t40 @0
+    br.null r0, L2, L3
+L3: tailmod r0, c42, none, =, *, f1, r0[8:8]
+L2: const r1, #0 : t40
+    ret r1
+end
+"""
+        self.refuse("against", LIST, stream)
+
+    def test_a_capability_cannot_be_stored_in_a_field(self):
+        self.refuse("capability", "type t40 record Hold\nctor c41 t40 - Hold\nfield c41 0 8 cap h\n")
+
+    def test_a_function_that_returns_a_tuple_cannot_be_declared_at(self):
+        stream = """tuple t50 t16 t16
+fn f1 g(r0 : t16, r1 : t16) : t50 @0
+    ret r1, r0
+end
+"""
+        self.refuse("returns a tuple", LIST, stream)
+
+    def test_tailmod_can_only_link_to_itself(self):
+        stream = """
+fn f0 inner(r0 : t16) : t16 @0
+    br.null r0, L1, L2
+L1: const r1, #0 : t16
+    ret r1
+L2: tailmod r0, c18, none, add([0:8], #1), *, f0, r0[8:8]
+end
+fn f1 outer(r0 : t16) : t16 @0
+    br.null r0, L1, L2
+L1: const r1, #0 : t16
+    ret r1
+L2: tailmod r0, c18, none, =, *, f0, r0[8:8]
+end
+"""
+        self.refuse("can only be itself", LIST, stream)
+
+    def test_a_computed_source_works_in_place_and_one_instruction_can_do_it(self):
+        stream = """
+fn f1 g(r0 : t16) : t16
+    br.null r0, L1, L2
+L1: const r5, #0 : t16
+    ret r5
+L2: build r0, c18, none, {source}, =
+    ret r0
+end
+"""
+        self.refuse("cannot|not an operation", LIST, stream.format(source="shl([0:8], #1)"))
+        self.refuse("works in place", LIST, stream.format(source="add([8:8], #1)"))
+        check(LIST, stream.format(source="add([0:8], #1)"))
+
+    def test_a_literal_must_be_a_value_of_the_type_it_meets(self):
+        stream = """
+fn f0 k(r0 : i8) : i8
+    ret r0
+end
+fn f1 g(r0 : i8) : i8
+{body}
+end
+"""
+        self.refuse("not a i8", stream.format(body="    tail f0, #300"))
+        self.refuse("not a i8", stream.format(body="    op r1, add/8, r0, #300\n    ret r1"))
+        self.refuse("not a i8", stream.format(
+            body="    br e, r0, #300, L1, L2\nL1: ret r0\nL2: ret r0"))
+        self.refuse("not a i8", stream.format(body="    const r1, #300 : lit\n    tail f0, r1"))
+        check(stream.format(body="    op r1, shl/8, r0, #300\n    ret r1"))  # a count is not a value
+
+    def test_a_capability_that_comes_back_from_a_call_is_an_empty_cell(self):
+        stream = """
+fn f0 idd(r0 : cap) : cap
+    ret r0
+end
+fn f1 g(r0 : cap) : t16
+    call r1, f0, r0
+    build r1, c18, none, #1, #0
+    ret r1
+end
+"""
+        check(LIST, stream)
+
+    def test_two_capabilities_chosen_at_a_join_are_an_empty_cell(self):
+        stream = """tuple t50 t16 t16
+fn f1 g(r0 : cap, r1 : cap, r2 : bool) : t50
+    br ne, r2, #0, L1, L2
+L1: move r3, r0
+    move r4, r1
+    jump L3
+L2: move r3, r1
+    move r4, r0
+    jump L3
+L3: build r3, c18, none, #1, #0
+    build r4, c18, none, #2, #0
+    ret r3, r4
+end
+"""
+        check(LIST, stream)
+
+
 class Independence(unittest.TestCase):
     def test_the_checker_imports_nothing_from_the_compiler(self):
         with open(os.path.join(ROOT, "src", "rtcheck.py")) as handle:

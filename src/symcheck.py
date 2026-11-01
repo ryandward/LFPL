@@ -672,6 +672,23 @@ def _norm(ty):
     return {"Int8": 1, "Int16": 2, "Int32": 4, "Int64": 8}.get(ty, ty)
 
 
+def _joined(a, b):
+    """The type of a value two arms produced: a literal has none, so the other arm decides."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        return tuple(_joined(x, y) for x, y in zip(a, b))
+    return a
+
+
+def _size_of_type(ty) -> int:
+    if isinstance(ty, int):
+        return ty
+    return 1 if ty == "Bool" else 8
+
+
 def _element(array_type: str) -> tuple[object, int]:
     """The element type of `Array[N]:t`, normalized, and its size."""
     element = array_type.split(":")[1]
@@ -722,7 +739,7 @@ class SourceMeaning:
             cond = self.truth(self.ev(e[1], env)[0])
             a, ta, _ = self.ev(e[2], env)
             b, tb, _ = self.ev(e[3], env)
-            return T.select(cond, a, b), (ta if ta is not None else tb), None
+            return T.select(cond, a, b), _joined(ta, tb), None
         if kind == "ctor":
             return self._ctor(e, env)
         if kind == "match":
@@ -780,12 +797,10 @@ class SourceMeaning:
                 if node[0] == "tuple":
                     member = node[1][position]
                 else:  # a call's results: each is a value of its own, named by its position
-                    size = member_ty if isinstance(member_ty, int) else 8
-                    member = T.intern(("member", leaf, position, size))
+                    member = T.intern(("member", leaf, position, _size_of_type(member_ty)))
                 inner[name] = (member, member_ty, None)
             result, arm_ty, _ = self.ev(body, inner)
-            if result_ty[0] is None:
-                result_ty[0] = arm_ty
+            result_ty[0] = _joined(result_ty[0], arm_ty)
             return result
 
         return T.lift(on_leaf, term), result_ty[0], None
@@ -881,8 +896,7 @@ class SourceMeaning:
                 for binder, value in zip(arm[1][1:], fields):
                     inner[binder] = value
             result, arm_ty, _ = self.ev(arm[2], inner)
-            if result_ty[0] is None:
-                result_ty[0] = arm_ty
+            result_ty[0] = _joined(result_ty[0], arm_ty)
             return result
 
         def opaque_fields(ctor: Ctor, pointer: int) -> list:
@@ -1004,7 +1018,7 @@ def parse_assembly(asm: str) -> tuple[dict, dict]:
             continue
         if line.endswith(":"):
             name = line[:-1]
-            if name.startswith("fn_") and name.endswith("_body"):
+            if name.startswith("fn_") and name.endswith(("_body", "$body")):
                 current = bodies.setdefault(name[3:-5], [])
             elif name.startswith("fn_") or name == "_start" or name.startswith("."):
                 current = None
@@ -1032,12 +1046,13 @@ class State:
     flags: Optional[tuple]
     cond: int
     tags: dict
-    dead: set
+    dead: dict     # a cell a callee owns -> the condition under which it does
     frame: int = 0  # how many `sub rsp` have not yet met their `add rsp`
+    deep: dict = field(default_factory=dict)  # the same, for a value and whatever it still reaches
 
     def copy(self) -> "State":
         return State(dict(self.regs), dict(self.mem), self.flags, self.cond,
-                     dict(self.tags), set(self.dead), self.frame)
+                     dict(self.tags), dict(self.dead), self.frame, dict(self.deep))
 
 
 @dataclass(frozen=True)
@@ -1069,16 +1084,37 @@ class FunctionCheck:
 
     # --- memory: distinct pointer leaves are distinct cells, by linearity
 
-    def _dead(self, S: State, pointer: int) -> bool:
-        if pointer in S.dead:
-            return True
-        node = self.T.nodes[pointer]
-        return node[0] == "load" and self._dead(S, node[1])
+    def _dead(self, S: State, pointer: int) -> int:
+        """When does a callee own this? A value given to one takes along whatever it still
+        reaches. A cell given as a capability does not, because linearity moved everything out of
+        it first: a pointer read from it earlier is not the callee's. The answer is a condition,
+        because one arm can give a cell to a callee while another keeps it."""
+        T = self.T
+        owned = T.either(S.dead.get(pointer, T.ZERO), S.deep.get(pointer, T.ZERO))
+        node = T.nodes[pointer]
+        if node[0] == "load":
+            owned = T.either(owned, self._reached_from_deep(S, node[1]))
+        return owned
+
+    def _reached_from_deep(self, S: State, pointer: int) -> int:
+        T = self.T
+        owned = S.deep.get(pointer, T.ZERO)
+        node = T.nodes[pointer]
+        if node[0] == "load":
+            owned = T.either(owned, self._reached_from_deep(S, node[1]))
+        return owned
 
     def _read(self, S: State, pointer: int, off: int, size: int) -> int:
         T = self.T
-        if pointer != self.rsp and self._dead(S, pointer):
-            return T.undef("read of a cell a callee now owns")
+        if pointer != self.rsp:
+            owned = self._dead(S, pointer)
+            if owned != T.ZERO:
+                return T.select(owned, T.undef("read of a cell a callee now owns"),
+                                self._read_memory(S, pointer, off, size))
+        return self._read_memory(S, pointer, off, size)
+
+    def _read_memory(self, S: State, pointer: int, off: int, size: int) -> int:
+        T = self.T
         found = S.mem.get((pointer, off, size))
         if found is not None:
             return found
@@ -1197,11 +1233,10 @@ class FunctionCheck:
                 at = node[1]
         return False
 
-    def _tag_of(self, S: State, pointer: int, tag_leaf: int, info: TypeInfo) -> Optional[int]:
+    def _tag_of(self, fact: Optional[tuple], tag_leaf: int, info: TypeInfo) -> Optional[int]:
         T = self.T
         if T.is_const(tag_leaf):
             return T.value(tag_leaf)
-        fact = S.tags.get(pointer)
         if fact is None:
             return 0 if len(info.ctors) == 1 else None
         if fact[0] == "is":
@@ -1224,32 +1259,77 @@ class FunctionCheck:
         becomes the struct its memory now holds, so it compares with the source's."""
         if ty not in self.types:
             return term
-        return self.T.lift(lambda leaf: self._reify_leaf(S, leaf, ty), term)
+        return self._reify_on(S, term, ty, S.cond, frozenset())
 
-    def _reify_leaf(self, S: State, leaf: int, ty: str) -> int:
+    def _on_paths(self, term: int, path: int, fn: Callable[[int, int], int]) -> int:
+        """fn on each leaf this value can be, on a path that can happen. Following memory has
+        to stop at impossible paths: a location merged from two arms names what it holds on
+        each, and going through one arm's pointer into the other arm's contents can walk around
+        a cycle that no execution has, since linear data are acyclic."""
+        T = self.T
+        node = T.nodes[term]
+        if node[0] != "ite":
+            return fn(term, path)
+        test = T._node(node[1], T.ONE, T.ZERO)
+        hi_path, lo_path = T.both(path, test), T.both(path, T.neg(test))
+        hi = T.ZERO if hi_path == T.ZERO else self._on_paths(node[2], hi_path, fn)
+        lo = T.ZERO if lo_path == T.ZERO else self._on_paths(node[3], lo_path, fn)
+        return T.select(test, hi, lo)
+
+    def _reify_on(self, S: State, term: int, ty, path: int, within: frozenset) -> int:
+        if ty not in self.types:
+            return term
+        return self._on_paths(term, path, lambda leaf, p: self._reify_leaf(S, leaf, ty, p, within))
+
+    def _reify_leaf(self, S: State, leaf: int, ty: str, path: int, within: frozenset) -> int:
         T = self.T
         if leaf == T.ZERO or not self._touched(S, leaf):
             return leaf
-        if self._dead(S, leaf):
-            return T.undef("a callee owns this cell")
+        owned = self._dead(S, leaf)
+        if owned != T.ZERO:
+            alive = T.both(path, T.neg(owned))
+            gone = T.undef("a callee owns this cell")
+            if alive == T.ZERO:
+                return gone
+            return T.select(owned, gone, self._reify_alive(S, leaf, ty, alive, within))
+        return self._reify_alive(S, leaf, ty, path, within)
+
+    def _reify_alive(self, S: State, leaf: int, ty: str, path: int, within: frozenset) -> int:
+        T = self.T
+        if leaf in within:
+            return T.undef("a cell that holds itself")
+        within = within | {leaf}
         info = self.types[ty]
         if info.ctors[0].tag is None:
             ctor = [c for c in info.ctors if not c.is_null][0]
-            return self._reify_fields(S, leaf, ctor, False)
-        content = self._read(S, leaf, 0, 1)
+            return self._reify_fields(S, leaf, ctor, False, path, within)
+        return self._reify_tagged(S, leaf, info, S.tags.get(leaf), path, within)
 
-        def on_tag(tag_leaf: int) -> int:
-            tag = self._tag_of(S, leaf, tag_leaf, info)
+    def _reify_tagged(self, S: State, leaf: int, info: TypeInfo, fact: Optional[tuple], path: int,
+                      within: frozenset) -> int:
+        """What this tagged cell holds. A fact that came through a join is one fact per arm, and
+        the arm's own condition chooses, which is the shape the source's match has too."""
+        T = self.T
+        if fact is not None and fact[0] == "cond":
+            _kind, cond, first, second = fact
+            hi_path, lo_path = T.both(path, cond), T.both(path, T.neg(cond))
+            hi = T.ZERO if hi_path == T.ZERO else self._reify_tagged(S, leaf, info, first, hi_path, within)
+            lo = T.ZERO if lo_path == T.ZERO else self._reify_tagged(S, leaf, info, second, lo_path, within)
+            return T.select(cond, hi, lo)
+
+        def on_tag(tag_leaf: int, p: int) -> int:
+            tag = self._tag_of(fact, tag_leaf, info)
             ctor = next((c for c in info.ctors if c.tag == tag), None)
             if ctor is None:
                 return T.undef(f"tag of {T.show(leaf)} is {T.show(tag_leaf)}")
-            return self._reify_fields(S, leaf, ctor, T.is_const(tag_leaf))
+            return self._reify_fields(S, leaf, ctor, T.is_const(tag_leaf), p, within)
 
-        return T.lift(on_tag, content)
+        return self._on_paths(self._read(S, leaf, 0, 1), path, on_tag)
 
-    def _reify_fields(self, S: State, cell: int, ctor: Ctor, tag_written: bool) -> int:
+    def _reify_fields(self, S: State, cell: int, ctor: Ctor, tag_written: bool, path: int,
+                      within: frozenset) -> int:
         T = self.T
-        terms = [self.reify(S, self._read(S, cell, off, size), _norm(fty))
+        terms = [self._reify_on(S, self._read(S, cell, off, size), _norm(fty), path, within)
                  for _f, fty, off, size in ctor.fields]
         layout = [(off, size) for _f, _t, off, size in ctor.fields]
 
@@ -1301,24 +1381,28 @@ class FunctionCheck:
                         key=("call", callee.name))
         for term, (_name, ty) in zip(args, callee.params):
             if _norm(ty) in self.types or ty == "Diamond":
-                for _cond, leaf in T.paths(term):
-                    self._hand_over(S, leaf)
+                for cond, leaf in T.paths(term):
+                    if ty == "Diamond":
+                        S.dead[leaf] = T.either(S.dead.get(leaf, T.ZERO), cond)
+                    else:
+                        self._hand_over(S, leaf, cond)
         if callee.at is not None:
             for cond, leaf in T.paths(args[callee.at]):
                 word = self._pointer_of(leaf)
                 self._rewrite(S, word, T.select(cond, result, word))
         return result
 
-    def _hand_over(self, S: State, leaf: int) -> None:
-        """The callee owns this cell and everything inside it from now on."""
-        node = self.T.nodes[leaf]
+    def _hand_over(self, S: State, leaf: int, cond: int) -> None:
+        """The callee owns this cell and everything inside it from now on, if cond holds."""
+        T = self.T
+        node = T.nodes[leaf]
         if node[0] == "struct":
-            S.dead.add(node[3])
+            # This cell was rebuilt, so what it used to reach has moved out already.
+            S.dead[node[3]] = T.either(S.dead.get(node[3], T.ZERO), cond)
             for _o, _s, inner in node[4]:
-                if not self.T.is_const(inner):
-                    S.dead.add(inner)
-        elif not self.T.is_const(leaf):
-            S.dead.add(leaf)
+                self._hand_over(S, inner, cond)
+        elif not T.is_const(leaf):
+            S.deep[leaf] = T.either(S.deep.get(leaf, T.ZERO), cond)
 
     # --- the obligations
 
@@ -1340,14 +1424,18 @@ class FunctionCheck:
                     return False
                 return True
             node = T.nodes[atom]
-            hi_sigma = sigma
+            hi_sigma: Optional[dict] = sigma
             if node[0] == "eq":  # on this path, x really is that constant
                 x, y = node[1], node[2]
                 if T.is_const(x) or T.is_const(y):
-                    hi_sigma = dict(sigma)
                     leaf, value = (y, x) if T.is_const(x) else (x, y)
-                    hi_sigma[leaf] = value
-            return (walk(T.cof(c, atom, True), T.cof(g, atom, True), T.cof(w, atom, True), hi_sigma)
+                    if sigma.get(leaf, value) != value:  # it cannot be two constants at once
+                        hi_sigma = None
+                    else:
+                        hi_sigma = dict(sigma)
+                        hi_sigma[leaf] = value
+            return ((hi_sigma is None or walk(T.cof(c, atom, True), T.cof(g, atom, True),
+                                              T.cof(w, atom, True), hi_sigma))
                     and walk(T.cof(c, atom, False), T.cof(g, atom, False), T.cof(w, atom, False), sigma))
 
         walk(cond, got, want, {})
@@ -1386,16 +1474,22 @@ class FunctionCheck:
             for key in set(merged.mem) | set(other.mem):
                 mem[key] = T.select(c, self._read(merged, *key), self._read(other, *key))
             tags = {}
-            for pointer in set(merged.tags) & set(other.tags):
-                x, y = merged.tags[pointer], other.tags[pointer]
+            for pointer in set(merged.tags) | set(other.tags):
+                x, y = merged.tags.get(pointer), other.tags.get(pointer)
                 if x == y:
                     tags[pointer] = x
-                elif x[0] == "not" and y[0] == "not":
+                elif x is not None and y is not None and x[0] == "not" and y[0] == "not":
                     tags[pointer] = ("not", x[1] & y[1])
+                else:  # each arm knows its own, and the arm's condition says which applies
+                    tags[pointer] = ("cond", c, x, y)
+            dead = {p: T.select(c, merged.dead.get(p, T.ZERO), other.dead.get(p, T.ZERO))
+                    for p in set(merged.dead) | set(other.dead)}
+            deep = {p: T.select(c, merged.deep.get(p, T.ZERO), other.deep.get(p, T.ZERO))
+                    for p in set(merged.deep) | set(other.deep)}
             if merged.frame != other.frame:
                 self.problems.append(Problem(self.fn.name, "a join", "two edges with different frames"))
             merged = State(regs, mem, merged.flags if merged.flags == other.flags else None,
-                           T.either(c, other.cond), tags, merged.dead | other.dead, merged.frame)
+                           T.either(c, other.cond), tags, dead, merged.frame, deep)
         return merged
 
     # --- the walk over the function, in emitted order
@@ -1407,7 +1501,7 @@ class FunctionCheck:
         regs = {}
         for position, (_name, ty) in enumerate(fn.params):
             regs[_PARAMS[position]] = T.intern(("arg", position, FIELD_SIZES.get(ty, 8)))
-        current: Optional[State] = State(regs, {}, None, T.ONE, {}, set())
+        current: Optional[State] = State(regs, {}, None, T.ONE, {}, {})
         pending: dict[str, list] = {}
         placed: set[str] = set()
         reached: list[int] = []
@@ -1589,7 +1683,7 @@ def _clobber_sets(bodies: dict) -> dict:
 
 def check_translation(source: bytes, asm: str) -> list[Problem]:
     """Every problem found in `asm` as a translation of `source`; [] means agreement."""
-    program = SourceParser(source.decode())
+    program = SourceParser(source.decode("latin-1"))
     program.parse()
     program.builtin_reserve()
     bodies, aliases = parse_assembly(asm)
@@ -1607,8 +1701,9 @@ def check_translation(source: bytes, asm: str) -> list[Problem]:
             check = FunctionCheck(terms, SourceMeaning(terms, program), fn, body, aliases, clobbers)
             try:
                 problems.extend(check.run())
-            except TooLarge as reason:
-                problems.append(Problem(name, "whole function", str(reason), inconclusive=True))
+            except (TooLarge, RecursionError) as reason:
+                problems.append(Problem(name, "whole function", f"could not decide: {reason}",
+                                        inconclusive=True))
     finally:
         sys.setrecursionlimit(limit)
     return problems

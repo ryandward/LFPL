@@ -373,6 +373,30 @@ handler h(t: Array[16] Int8, m: Hdr, free: Free) : (Array[16] Int8, Verdict, Fre
         self.assertEqual(now["pool"], now["capacity"])
 
 
+    def test_a_cell_given_to_a_helper_and_the_next_one_rebuilt(self):
+        router = self.start("""
+record H { a: Int8 };
+data O = N | S(port: Int8, a: Int8);
+record Bx { h: Int8 };
+fn sink(b: Bx, f: Free) : Free = match b with Bx(c, h) => More@c(f) end;
+handler h(m: H, free: Free) : (O, Free) =
+  match m with H(d, a) =>
+    match free with
+    | End => (N, More@d(End))
+    | More(c0, r1) => match r1 with
+       | End => (N, More@d(More@c0(End)))
+       | More(c1, r2) => let f = sink(Bx@c0(a), r2) in (S@d(1, 7), More@c1(f))
+       end
+    end
+  end;
+""")
+        self.assertIn("R(n) = 2 cells", router.report)
+        router.raw(b"\x03")
+        self.assertEqual(router.outputs[1].recv(16), b"\x07")
+        now = router.settle(1)
+        self.assertEqual(now["pool"], now["capacity"])
+
+
 class RefusedPrograms(unittest.TestCase):
     """A program outside the language, or past a limit, gets a reason and no binary."""
 
@@ -450,6 +474,61 @@ data Out = X(port: Int8, rest: Free);
 handler h(m: Hdr, free: Free) : (Out, Free) =
   match m with Hdr(d, ttl) => (X@d(1, free), End) end;
 """)
+
+    def test_a_free_of_any_other_shape(self):
+        """The runtime threads the pool through a reserve, so with any other shape a datagram
+        could choose the address it writes through, or cells would never come back."""
+        item = """record Hdr { v: Int64 };
+data Out = Drop | Send(port: Int8);
+"""
+        self.assert_refused("Free must be", item + """data Free = End | More(v: Int64);
+handler h(m: Hdr, free: Free) : (Out, Free) =
+  match m with Hdr(d, v) => let w = +(v, 0) in match free with
+    | End => (Drop, More@d(w))
+    | More(c, old) => (Send@d(1), More@c(w)) end end;
+""")
+        self.assert_refused("Free must be", """data Bytes;
+record Hdr { body: Bytes };
+data Out = Drop | Send(port: Int8);
+data Free = End | More(next: Free, b: Bytes);
+handler h(m: Hdr, free: Free) : (Out, Free) =
+  match m with Hdr(d, body) => (Drop, More@d(free, body)) end;
+""")
+        self.assert_refused("Free must be", item + """data Free = End | More(at: Fin 16);
+handler h(m: Hdr, free: Free) : (Out, Free) =
+  match m with Hdr(d, v) => (Send@d(1), free) end;
+""")
+
+    def test_options_that_cannot_describe_a_binary(self):
+        for option, value, why in (("--n-max", "0", "at least one cell"), ("--k-out", "0", "power of two"),
+                                   ("--k-out", "3", "power of two"), ("--ctl-port", "-1", "not a port"),
+                                   ("--in-port", "70000", "not a port"), ("--out-port", "0", "pass 65535")):
+            with self.subTest(option=option, value=value), tempfile.TemporaryDirectory() as workdir:
+                source = os.path.join(workdir, "p.lfpl")
+                with open(source, "w") as handle:
+                    handle.write(self.HEADER + "state routes : Array[1024] Int8;" + self.GOOD)
+                exe = os.path.join(workdir, "p")
+                with open(exe, "w") as handle:
+                    handle.write("a stale binary")
+                arguments = {"--in-port": "1", "--out-port": "2", "--ctl-port": "3", option: value}
+                done = subprocess.run([sys.executable, "-m", "src.lfplo", source, "-o", exe,
+                                       *(item for pair in arguments.items() for item in pair)],
+                                      cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertRegex(done.stderr, why)
+                self.assertNotIn("Traceback", done.stderr)
+                self.assertFalse(os.path.exists(exe), "a failed build left the stale binary")
+
+    def test_files_that_are_not_there(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            exe = os.path.join(workdir, "p")
+            for arguments in (["/nonexistent.lfpl"], [SOURCE, "--state", "routes=/nonexistent"]):
+                done = subprocess.run([sys.executable, "-m", "src.lfplo", *arguments, "-o", exe,
+                                       "--in-port", "1", "--out-port", "2", "--ctl-port", "3"],
+                                      cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertNotIn("Traceback", done.stderr)
+                self.assertFalse(os.path.exists(exe))
 
     def test_an_index_cannot_come_from_the_wire(self):
         self.assert_refused("come from the wire", """
@@ -617,7 +696,7 @@ class Validation(unittest.TestCase):
                 asm = handle.read()
         self.assertEqual(check_translation(source, asm), [])
         lines = asm.split("\n")
-        start = lines.index("fn_forward_body:")
+        start = lines.index("fn_forward$body:")
         end = next(i for i, line in enumerate(lines) if line.startswith("F_forward equ"))
         caught = 0
         for number in range(start + 1, end):

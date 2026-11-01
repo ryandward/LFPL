@@ -83,7 +83,8 @@ Each rule reads: tokens required `-->` tokens left. Tokens not named are untouch
 ### Values
 
     const d, #n : t     free d                  -->  d = fresh : t
-                        t is scalar, or a tagless D with n = 0, in which case the word is null
+                        t is scalar but not Fin, or a tagless D with n = 0, in which case the word
+                        is null. Everywhere, a literal must be a value of the type it meets.
     move d, s           s = w : t, free d       -->  free s, d = w : t
     copy d, s           s = w : t, free d       -->  s = w : t, d = w : t         t scalar only
     drop s              s = w : t               -->  free s                       t scalar only
@@ -123,14 +124,17 @@ a mask.
           r             r = w : t, and l_i does not already hold w    STORE
           #n            a literal                          STORE
           [l]           c[l] = w : t, another location     STORE, read before anything is written
-          f([l], b)     c[l] scalar, b an operand          op on the old value; l = l_i is in place
+          f([l], b)     l = l_i, c[l] an integer, b a register or literal: one instruction in place.
+                        f is add, sub, and, or or xor. Anything else computes into a register first.
 
-        tag is `keep`, which needs c.tag = C's tag, or `write`, which needs that it is not.
-        A tagless constructor or a record has no tag and says neither.
+        tag is `keep`, which needs c.tag = C's tag, or `write`, which is always sound, and only
+        wasted if the tag was already there. A tagless constructor or a record has no tag and
+        says neither. Building forgets what any test ruled out about the cell.
 
         Every location of the old layout that a new field or the tag overlaps must be a hole
         or a full scalar, which it erases. A full linear location anywhere in the cell that
-        no source names is a type error: it has to be taken first.
+        no source names is a type error: it has to be taken first. So is one that two sources
+        name, which would give it two owners.
 
         -->  p = c : D, and every token of the open cell is gone, which closes the stale-read
         window. Reading from c afterwards has no token to use.
@@ -159,8 +163,11 @@ so is claiming a store was unnecessary when it was needed.
 **The merge rule.** At a label, a word or tag fact survives only if every incoming edge
 agrees on it. A word that disagrees becomes a fresh one, which can never satisfy `r!`, and a
 tag that disagrees becomes unknown, which forces `write`. Scalar registers free on any edge
-are free at the label. Any other disagreement, such as a linear register or location that is
-full on one edge and not another, is a type error. At this level no moves are needed: both
+are free at the label. A location with two types has no token after the label, and neither
+does anything else that only one edge has. A register that is the capability of two different
+cells becomes an empty cell, so neither cell can still own anything. Any other disagreement,
+such as a linear register or location that is full on one edge and not another, or a location
+that holds a linear value on one edge and something else on another, is a type error. At this level no moves are needed: both
 arms already deliver into the same register. A backend whose homes can differ from edge to
 edge still needs them; see `label` in the x86 lowering.
 
@@ -176,9 +183,11 @@ edge still needs them; see `label` in the x86 lowering.
     tail f, o_1 ... o_n      the same consumption, then control leaves
     ret s                    s = w : t  -->  control leaves
     ret s_1, ..., s_m        the same for a function whose result is a tuple. A tuple is never
-                             stored: it exists only as these registers.
+                             stored: it exists only as these registers. Such a function cannot
+                             be declared `@k`, because `@k` says which one cell comes back.
     tailmod p, C, tag, s_1 ... s_n, f, o_1 ... o_m
-        in this order: consume o_1 ... o_m, then build, then consume p, then jump to f
+        in this order: consume o_1 ... o_m, then build, then consume p, then jump to f.
+        f is this function itself: nothing else's next iteration links back to this cell.
 
 In `tailmod`, exactly one source is `*`, and the order above matters twice. The call's
 operands are consumed first, because an operand may be a location of the cell being built,
@@ -191,7 +200,8 @@ which is the word `@k` returns. Without that step `p` would still be full when c
 leaves, and the exit rule below would refuse every `tailmod`. This is LFPL-O's tail recursion
 modulo cons, with no store to that field.
 
-Every exit needs all linear tokens gone. The checker therefore repeats exactly-once
+A capability that leaves by `ret` needs what `call` needs of a Cap operand. One that comes back
+from a call is an empty cell. Every exit needs all linear tokens gone. The checker therefore repeats exactly-once
 linearity on its own, one level below Check. In a function declared `@k`, the value leaving
 must have the word of parameter k, or be null where that word is known to be null, and the
 caller receives parameter k's original word however many iterations ran.

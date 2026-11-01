@@ -454,22 +454,18 @@ class Backend:
             self._store(dest, Reg(TRANSIT))
 
     def _emit_computed(self, dest: object, src: Func) -> None:
-        assert isinstance(dest, Mem)
+        """rtcheck only lets a computed source work in place, so this is one instruction."""
+        assert isinstance(dest, Mem) and src.place == dest, (dest, src)
         size = src.place.size
-        if src.place == dest and src.op in ("add", "sub", "and", "or", "xor"):
-            if isinstance(src.operand, Imm):
-                value = _masked(src.operand.value, size)
-                if size == 8 and value >= 1 << 31:
-                    self._load(TRANSIT, src.operand)
-                    self.ins(src.op, self.mem(dest), TRANSIT)
-                else:
-                    self.ins(src.op, self.mem(dest), str(value))
+        if isinstance(src.operand, Imm):
+            value = _masked(src.operand.value, size)
+            if size == 8 and value >= 1 << 31:
+                self._load(TRANSIT, src.operand)
+                self.ins(src.op, self.mem(dest), TRANSIT)
             else:
-                self.ins(src.op, self.mem(dest), self.sub(src.operand.name, size))
-            return
-        self._load(TRANSIT, src.place)
-        self._apply(src.op, TRANSIT, size, src.operand)
-        self._store(dest, Reg(TRANSIT))
+                self.ins(src.op, self.mem(dest), str(value))
+        else:
+            self.ins(src.op, self.mem(dest), self.sub(src.operand.name, size))
 
     # --- the fold
 
@@ -520,8 +516,9 @@ class Backend:
         self._reset_function()
         self.fn = Function(name, ret, int(at) if at else None)
         self.ordinal = ordinal
-        self.out(f"fn_{name} equ fn_{name}_body")
-        self.place(f"fn_{name}_body")
+        # `$` cannot be in a name, so one function's body label cannot be another's entry.
+        self.out(f"fn_{name} equ fn_{name}$body")
+        self.place(f"fn_{name}$body")
         self.ins("sub", "rsp", f"F_{name}")
         for position, part in enumerate(_args(params)):
             _register, _, ty = part.partition(" : ")
