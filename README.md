@@ -22,6 +22,11 @@ and this code is its executable reference. It is written in Python on purpose. T
 first phase exists to make the rules runnable, so they can be checked and argued with
 before anything is built on them; Python is not meant to be the end state.
 
+A second specification, LFPL-O, asks what those rules buy a long-running service: a program
+that, once started, never crashes, hangs or leaks, and that refuses work at its boundary
+when demand exceeds what it can guarantee. The first program of that kind now runs here, a
+packet forwarder on real sockets, and it comes later in this page.
+
 ## What a program looks like
 
 Here is a function that adds one to every element of a list, in place:
@@ -93,6 +98,63 @@ each cell back as you read it, and `main` returns the leftovers along with its a
 That feels strict at first, but it is what makes the guarantee worth having: when the
 program finishes, every cell is accounted for.
 
+## A program that serves
+
+An LFPL-O program has no `main`. It has a handler, which the runtime applies to one item at a
+time, threading a fixed-size state from each item to the next. This is the forwarding handler
+from section 4.7 of that specification, compiled exactly as it is written there, from
+`examples/forward.lfpl`:
+
+```
+data Bytes;
+record Hdr { ttl: Int8, dst: Int32, body: Bytes };
+data Verdict = Drop(body: Bytes) | Fwd(port: Int8, ttl: Int8, dst: Int32, body: Bytes);
+state routes : Array[1024] Int8;
+
+handler forward(routes: Array[1024] Int8, h: Hdr, free: Free)
+    : (Array[1024] Int8, Verdict, Free) =
+  match h with Hdr(d, ttl, dst, body) =>
+    if <=(ttl, 1) then (routes, Drop@d(body), free)
+    else let (routes2, port) = get(routes, idx(dst, 1024)) in
+         (routes2, Fwd@d(port, -(ttl, 1), dst, body), free)
+  end;
+```
+
+A packet's header cell becomes its verdict, in place, so the handler draws nothing from its
+reserve. `idx` reduces the address into range, and its type says so, which is why the table
+lookup needs no bounds check and has none. `data Bytes;` is declared and never defined: the
+runtime builds that chain of cells, and all a program can do with it is pass it on.
+
+```
+head -c 1024 /dev/zero > routes.bin
+python3 -m src.lfplo examples/forward.lfpl -o forward \
+    --in-port 9000 --out-port 9100 --ctl-port 9001 --state routes=routes.bin
+./forward
+```
+
+The compiler reports what it derived, and it refuses a handler for which it cannot derive it:
+
+```
+handler forward: R(n) = 0 cells, W(n) = 11 steps (23 instructions), stack 8 bytes, 14256 cells, image 233216 bytes
+```
+
+What comes out is a static binary with no libc in it. A datagram is `[ttl][dst, little endian][body]`,
+and a forwarded one leaves for port `9100 + port` with its `ttl` one lower. That layout is not
+parsed anywhere: `recvmsg` scatters each datagram straight into cells through an iovec naming
+the header cell's fields and each body cell's payload, so the wire format follows from the
+item's declared type, and `sendmsg` gathers the same way. The control port answers `S` with
+its counters, counting the pool by walking the free list, and `Q` shuts it down.
+
+The point of all this is where it can refuse, because each refusal happens before any work has
+been done on what it refuses. The compiler refuses a program, and leaves no binary. The process
+refuses to start, exiting with the number of the step that failed, if it cannot lock its image
+into memory. And admission refuses one item, counting why, when it is too large, the pool is
+short or the output queue is full; the item's cells never left ingress, so nothing else moves.
+Once a handler starts it finishes. All the memory is laid out at link time and touched once at
+startup, and the stack is inside that image with a guard page below it, so a flood changes the
+refusal count and nothing else. `tests/test_forward.py` checks each of these against a
+running binary, from outside it, including pausing egress so that a queue really does fill.
+
 ## How the compiler holds itself to the same rules
 
 Most compilers read a whole file into a syntax tree, which costs memory in proportion
@@ -103,8 +165,8 @@ to the file. This one never builds that tree. Its stages sit in a closed ring an
     +------------------- empty cells ------------------+
     v                                                  |
   Ingest --> Lex --> Parse --> Check --> Lower --> Egress
-   bytes    tokens   events    types     machine   written
-                                         code      out
+   bytes    tokens   events    types     RT        written
+                                         lines     out
 ```
 
 In place of a tree, `src/dyck.py` emits a stream of bracketed events: open a construct,
@@ -116,15 +178,51 @@ its memory follows how deeply the source nests rather than how long it is. Only 
 table of global names grows with the program, and nesting past a declared limit is a
 syntax error, which is what lets the ring be sized in advance.
 
-`src/check.py` does the linear typing as a fold over those events, and `src/lower.py`
-turns them into instructions. Lower is built on one idea: every expression is compiled
-knowing where its value is wanted, whether that is a particular register, a field of a
-cell, or a pair of jump targets. Values therefore appear where they will be used, and
-much of what other compilers need an optimizer for never happens at all. A comparison
-under an `if` becomes a compare and a branch with no boolean ever materialized, and a
-constructor taken apart immediately by a `match` produces no code. The registers, slots,
-flags and cell capabilities it trades in are modeled in `src/tokens.py`, and
-`src/ring.py` is the machine that moves cells between stages.
+`src/check.py` does the linear typing as a fold over those events, and Lower turns them into
+instructions. Lower is built on one idea: every expression is compiled knowing where its value
+is wanted, whether that is a particular register, a field of a cell, or a pair of jump targets.
+Values therefore appear where they will be used, and much of what other compilers need an
+optimizer for never happens at all. A comparison under an `if` becomes a compare and a branch
+with no boolean ever materialized, and a constructor taken apart immediately by a `match`
+produces no code. `src/ring.py` is the machine that moves cells between stages.
+
+There are two Lowers at the moment, and the difference between them is the most important
+thing that has happened to this code. The first, `src/lower.py`, wrote x86 directly, so a single
+pass over the program had to decide ownership, register allocation and instruction selection
+all at once, and it kept miscompiling in ways that were hard to see. The second,
+`src/rtlower.py`, knows nothing about x86. It writes [a small typed language of register
+transfers](docs/rt-layer.md), with as many registers as it likes and moves that consume their
+source, and you can read what it wrote:
+
+```
+$ python3 -m src.lfplo examples/forward.lfpl --rt
+...
+handler f0 forward(r0 : t32768, r1 : t21, r2 : t16) : t57344
+    open r1, c6
+    br be, r1[0:1], #1, L2, L3
+L2:
+    build r1, c11, write, =
+    ret r0, r1, r2
+L3:
+    idx r4, 1024, r1[4:4]
+    aget r5, r0, r4, 1
+    drop r4
+    op r6, sub/8, r1[0:1], #1
+    build r1, c13, write, r5, r6, =, =
+    drop r6
+    ret r0, r1, r2
+end
+```
+
+`build` is one atomic instruction, and each `=` is a field that stays where it is: `dst` and
+`body` here are not moved, and that is a fact the instruction states, not an optimization.
+`src/rtcheck.py` types every line of this before anything else happens, sharing no code with
+the writer, using token rules like the ones for cells above. Saying a field stays when it was
+overwritten is a type error, and so is storing a value back where it came from, reading a cell
+after it has been rebuilt, or losing a pointer the new constructor does not name. Most of the bugs
+that hand-written tests and fuzzing found in the first Lower are local type errors at this
+level. Then `src/x86.py`, which is the only code that knows about fifteen registers, spills
+and frames, turns the stream into assembly.
 
 Python allocates, of course, so what this reference enforces is the model. Tokens,
 events and frames live in a real array of 16-byte cells, and a cell refuses a 16th byte
@@ -172,6 +270,15 @@ is rejected for any reason other than a limit the language declares.
 `src/validate.py` asks a narrower question. It reads the assembly as text and rejects the
 redundant moves the model says cannot occur. That is a check for waste rather than for
 correctness, since a lost store leaves nothing redundant behind and passes it.
+
+Every generator runs through both Lowers, and running them through the new one found six bugs
+in it the moment it was tried on anything but the handler. For a handler, the checks are not
+something you run afterwards. `src/lfplo.py` runs the type check on every line, the symbolic check
+on the result and an independent recomputation of the stack on the assembly, and any failure
+removes the binary, including one left by an earlier build. The test suite damages the compiled
+handler one instruction at a time, in every way that still parses, and requires the check to
+catch all of it, apart from a short list of changes that do not alter what it means, each with
+the reason written beside it.
 
 ```
 python3 -m unittest discover -s tests -t .
@@ -226,16 +333,39 @@ arm of a conditional while it is still needed after the join.
 
 ## What is not here yet
 
-The largest gap is non-tail recursion over a structure, the model's DESCEND and ASCEND,
-which is rejected for now. A tree therefore cannot be walked by recursing into both
+The forwarding handler is the first LFPL-O program, and it asks for less than the specification
+offers. Its bounds are constants, measured from the code: a handler is refused if recursion can
+be reached from it, because the resource analysis that would give a recursive body a bound
+`c·n + d` does not exist. So a handler cannot yet walk its own body, and a checksum is out of
+reach. Arrays hold scalars, have a power-of-two length until division exists, and can be read
+but not written, because `swap` and state slots are not built. There is one handler and one
+ingress, one datagram per turn, bound to the loopback address. Admission checks size, pool and
+queue, but not deadlines or a program's own predicate, since neither can be declared yet. The
+control port and pausing egress are not in the specification: without a way to look inside and
+a way to hold egress still, on loopback where sends never block, none of the rest could be shown.
+
+Two parts deserve less trust than the rest. The runtime in `src/runtime.py` is assembly that no
+check reads, which section 11.3 of the specification accepts on the grounds that it is small and
+fixed, and the tests judge it only by what it does. And the symbolic check builds whole syntax
+trees: it runs after the compiler has finished, so the memory bound is the compiler's and not
+its own.
+
+`src/lower.py` is still there because `tests/test_invariants.py` was written against its exact
+output and has not moved, and `python3 -m src.lower` still runs the first examples. The new path
+passes every generator, but it does not yet match the old one's output everywhere: a constructor
+bound by `let` and then matched is built before it is taken apart, a `match` on a known null still
+tests it, `pack` does not fold constants, and every function adjusts its frame even when the frame
+is empty, because the frame's size is not known until the right-to-left pass exists.
+
+The largest gap in the language itself is non-tail recursion over a structure, the model's DESCEND
+and ASCEND, which is rejected for now. A tree therefore cannot be walked by recursing into both
 children, although the reader in `tests/test_fuzz.py` shows that a tail-recursive walk
 with a worklist built from the tree's own cells does the same job in constant stack.
 Tail recursion modulo cons exists only in the `@` form, where the result is the
 argument's own cell.
 
-The language is also narrower than the model in smaller ways. Pairs are left out because
-section 1 gives them no term form, functions take at most six arguments and must be
-defined before they are called. On the verification
+The language is also narrower than the model in smaller ways. Functions take at most six
+arguments and must be defined before they are called. On the verification
 side, the model's term-level rules are realized by the emitted code rather than run by
 an interpreter, the stages themselves are Python rather than LFPL, and the stack bound of
 Theorem 7.3 is computed but has not been measured.

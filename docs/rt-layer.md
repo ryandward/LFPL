@@ -328,8 +328,8 @@ stream says, and that the stream means what the source says.
     Lex -> Parse -> Check -> Lower -> RT check -> x86 backend -> symcheck, validate
                                               \-> RTL backend -> differential simulation
 
-`src/rtcheck.py` shares no code with Lower, and a failure means no output. A build order: emit
-RT from Lower, check it, and send it through an x86 backend that must keep every current test
-green. Then build the RTL backend. Arrays and division are new instructions with total
-meanings; unboxed pairs are a second result on `call` and `ret`; DESCEND and ASCEND are a pair
-that saves live registers into the destructured cell.
+`src/rtcheck.py` shares no code with Lower, and a failure means no output. `src/rtlower.py`
+writes the stream, and `src/x86.py` lowers it. Every Phase 1 generator passes through this path
+and the section 4.7 handler is built by it. What is left: moving `tests/test_invariants.py` over
+so `src/lower.py` can go, then the RTL backend. Division and `swap` are new instructions with total
+meanings, and DESCEND and ASCEND are a pair that saves live registers into the destructured cell.

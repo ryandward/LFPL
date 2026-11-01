@@ -66,6 +66,8 @@ class Forwarder:
         self.tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.ctl.settimeout(2.0)
+        if not limit_lock:
+            self.stats()  # it answers, so its sockets are bound and a first packet is not lost
 
     def send(self, ttl: int, dst: int, body: bytes = b"") -> None:
         self.tx.sendto(struct.pack("<BI", ttl, dst) + body, ("127.0.0.1", self.in_port))
@@ -126,7 +128,6 @@ class ForwardingHandler(unittest.TestCase):
         self.router = Forwarder(self.ROUTES, self.workdir.name)
         self.addCleanup(self._finish)
         self.closed = False
-        time.sleep(0.05)
 
     def _finish(self):
         if not self.closed:

@@ -147,14 +147,29 @@ def build(source_path: str, exe_path: str, options: Options,
                   image.cell_count, size)
 
 
+def _print_rt(source_path: str) -> int:
+    checker = Checker()
+    try:
+        with open(source_path, "rb") as handle:
+            for line in rt_lines(handle):
+                checker.feed(line)
+                print(line)
+        checker.finish()
+    except (Reject, RTError, Limit) as failure:
+        print(f"{source_path}: refused: {failure}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="lfplo", description=__doc__.splitlines()[0])
     parser.add_argument("source")
-    parser.add_argument("-o", dest="output", required=True)
-    parser.add_argument("--in-port", type=int, required=True)
-    parser.add_argument("--out-port", type=int, required=True,
+    parser.add_argument("--rt", action="store_true", help="print the checked RT stream, and stop")
+    parser.add_argument("-o", dest="output")
+    parser.add_argument("--in-port", type=int)
+    parser.add_argument("--out-port", type=int,
                         help="egress goes to this port plus the handler's port number")
-    parser.add_argument("--ctl-port", type=int, required=True)
+    parser.add_argument("--ctl-port", type=int)
     parser.add_argument("--state", action="append", default=[], metavar="NAME=FILE",
                         help="initial contents of a state array, read at link time")
     parser.add_argument("--n-max", type=int, default=216, help="the largest item, in cells")
@@ -162,6 +177,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--cells", type=int, help="cells in the image, instead of section 3.4's C")
     parser.add_argument("--asm", help="also write the assembly here")
     args = parser.parse_args(argv)
+    if args.rt:
+        return _print_rt(args.source)
+    if None in (args.output, args.in_port, args.out_port, args.ctl_port):
+        parser.error("a build needs -o, --in-port, --out-port and --ctl-port")
     initial = {}
     for entry in args.state:
         name, _, path = entry.partition("=")
