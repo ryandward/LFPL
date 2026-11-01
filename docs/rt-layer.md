@@ -7,7 +7,8 @@ language between Check and every backend. Lower writes register transfers with u
 registers and moves that consume their source. A small checker types each instruction with
 the first specification's token rules. x86 and RTL each lower from the result.
 
-Nothing here is built yet. This is the design to agree on first.
+`src/rtcheck.py` and `src/x86.py` implement this, and `src/rtlower.py` writes it. The old
+`src/lower.py` stays only until the new path carries everything it does.
 
 ## What it is, and is not
 
@@ -40,8 +41,32 @@ o of an unbuilt cell `c` held on entry, `null` is null, and every computed value
 fresh word. A move keeps the word. A built constructor's word is its cell's, whatever its
 fields are. The result of a call to `f @k` has the word of argument k.
 
-Types `t` are `Int w`, `Bool`, a named type `D`, or `Cap`, which is a cell's capability: the
-source language's diamond.
+Types `t` are `Int w`, `Bool`, a named type `D`, `Cap`, which is a cell's capability and the
+source language's diamond, `Array[N] t`, which is linear, and `Fin N`, which is scalar. A literal
+whose width nothing has fixed yet has type `lit`, and it unifies with any `Int w`.
+
+## The text format
+
+The stream is text, one instruction per line, so each reader parses it for itself and no code
+is shared between the writer and the checker. Types and constructors are named by the id Check
+gave them, and declarations come first:
+
+    type t17 record Hdr
+    type t16 abstract Bytes
+    type t22 tagged Verdict
+    alias t16 t40                   a forward declaration t16 turned out to mean t40
+    array t32768 1024 i8            Array[1024] Int8
+    fin t32769 1024                 Fin 1024
+    tuple t32770 t32768 t22 t30     the result of a function that returns several things
+    ctor c18 t17 - Hdr              id, type, tag or `-` or `null`, name
+    field c18 0 1 i8 ttl            offset, size, type, name
+    state routes t32768
+
+Scalar types are `i8 i16 i32 i64 bool lit`. `cap` is the capability. Function headers carry the
+ordinal the callers use, the name, and the types:
+
+    fn f3 inc(r0 : t30) : t30 @0
+    handler f4 forward(r0 : t32768, r1 : t17, r2 : t30) : t32770
 
 ## Operands
 
@@ -68,6 +93,18 @@ Each rule reads: tokens required `-->` tokens left. Tokens not named are untouch
 `f` is add, sub, mul, and, or, xor, shl or shr, with the meaning LFPL-O section 4.4 gives
 them at width W, so `shl` and `shr` are 0 when the count reaches W. No instruction has a
 flags side effect, because there are no flags here.
+
+### Arrays
+
+    idx d, N, a         a : Int W, free d       -->  d = fresh : Fin N
+    aget d, a, i, s     a = w : Array[N] t, i : Fin N, t scalar of s bytes, free d
+                                                -->  a = w : Array[N] t, d = fresh : t
+
+`idx` is `a mod N`. `aget` needs no bounds check because `i` cannot be out of range: the only
+way to get a `Fin N` is `idx` or a parameter of that type, and the type carries the same N as
+the array. Consuming a and giving it back in the source's `get` is a renaming at this level, so
+the register stays full. N must be a power of two until division exists, because `idx` is then
+a mask.
 
 ### Cells
 
@@ -126,13 +163,16 @@ edge still needs them; see `label` in the x86 lowering.
 ### Calls and exits
 
     call d, f, o_1 ... o_n   free d  -->  d = w : ret(f)
-        w is the word of o_k if f is declared `@k`, otherwise fresh.
+        w is the word of o_k if f is declared `@k`, otherwise fresh. A function that returns
+        a tuple is called with `call (d_1, ..., d_m), f, ...`, each d_i fresh at its type.
         A linear operand is consumed. A Cap operand also needs every linear location of its
         cell to be a hole, and every token of that cell goes away: the callee owns it now.
         All other tokens survive, because registers here are not clobbered.
 
     tail f, o_1 ... o_n      the same consumption, then control leaves
     ret s                    s = w : t  -->  control leaves
+    ret s_1, ..., s_m        the same for a function whose result is a tuple. A tuple is never
+                             stored: it exists only as these registers.
     tailmod p, C, tag, s_1 ... s_n, f, o_1 ... o_m
         in this order: consume o_1 ... o_m, then build, then consume p, then jump to f
 
@@ -155,7 +195,19 @@ caller receives parameter k's original word however many iterations ran.
 A non-tail recursive `call` is a type error until DESCEND and ASCEND exist.
 
 Functions are written `fn f(r0 : t0, ...) : t [@k]`, closed by `end`. Parameters start full
-with word `arg i`, and every other register starts free.
+with word `arg i`, and every other register starts free. A handler is a function whose
+signature section 3.1 fixes: the state arrays, the item and the reserve go in, and the state,
+the output and the reserve come out.
+
+### Bounds
+
+The same pass that types the stream measures it, because it is already reading every
+instruction of every function. A function with no recursion has no back-edge, so the number of
+instructions in its body, plus those of what it calls, bounds every path through it. A
+`br.null` on a `Free` register is a draw from the reserve, so counting those bounds its cells.
+A recursive function has no bound here, and a handler that reaches one is refused until the
+resource analysis of LFPL-O section 5 exists. So a handler's `R(n)` and `W(n)` are constants
+for now: `R(n) = b`, `W(n) = d`.
 
 ## Phantom construction
 
@@ -183,6 +235,8 @@ partial result is ever special. All the failures Phase 1 reports about registers
                            broken through the scratch registers. f([l], b) with l = l_i is one
                            read-modify-write instruction. A 64-bit literal goes through scratch.
                            `write` is mov byte [p], tag, after every source has been read.
+    idx                    mov d, a; and d, N - 1
+    aget                   a sized mov through [a + i * s]
     br                     cmp; jcc, with the fall-through chosen by the next label
     br.null                test p, p; jcc
     br.tag                 cmp byte [p], k; jne
@@ -201,7 +255,8 @@ partial result is ever special. All the failures Phase 1 reports about registers
                            the cell must be read before any store lands, and the cell's pointer
                            must last until the last store through it
     ret                    mov rax, s; ret. In an `@k` function, the entry word saved at the
-                           prologue goes in rax instead.
+                           prologue goes in rax instead. A tuple comes back in rax, rdx, rcx,
+                           rsi, rdi and r8, in that order.
 
 The prologue is `sub rsp, F_f`, with F_f defined by an `equ` at `end`, so thunks go away. The
 annotations of LFPL-O section 8.1 that exist only for registers, namely need(e), next-use
