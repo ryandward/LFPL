@@ -54,4 +54,23 @@ Sizes are of the whole frame on the wire, with its 4-byte frame check sequence, 
 ## Speed
 
 `tools/speed.py` is the only thing in this repository that reports a rate, and it refuses to on a virtual
-pair. No such rate exists yet, because the card has not arrived. `README.md` says when that changes.
+pair. No such rate exists yet, because the card has not arrived. When it does, with two ports cabled to
+each other and a driver with native XDP:
+
+```
+sudo python3 tools/speed.py --generator PORT_A --forwarder PORT_B
+```
+
+This moves the first port into a namespace and runs pktgen from it, and runs each forwarder on the second
+port, pinned to a different physical core, with the frame going back out the port it came in on. It reports
+the rate at 64 and 1500 bytes for the C baseline with `--match`, LFPL-O, and the C baseline with its table,
+and how they compare where the comparison means something: if the baseline keeps up with everything it is
+offered, its rate is the generator's or the link's, and it says so rather than give a ratio.
+
+pktgen sends one destination unless told otherwise, so a table lookup hits the same entry every time and
+costs almost nothing. `--random-destinations` is what shows what the table costs, and it slows the generator,
+so look at whether the offered rate still saturates the forwarder.
+
+Each run says whether the kernel gave it zero-copy, since a driver can have native XDP without it, and that
+decides most of the number. Everything here is what has been written for a card without one to run on, so
+expect the first run to find something.

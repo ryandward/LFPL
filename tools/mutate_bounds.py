@@ -27,8 +27,9 @@ VERILOG_TESTS = ["tests.test_rtverilog.TheEmittersOwnArithmetic", "tests.test_rt
                  "tests.test_rtverilog.Synthesis"]
 FORWARDER_TESTS = ["tests.test_ipv4.TheTwoAgree", "tests.test_ipv4.TheRings", "tests.test_ipv4.OtherHandlers",
                    "tests.test_ipv4.WhatItCosts", "tests.test_ipv4.RefusalsAtStartup", "tests.test_ipv4.TheLoader",
-                   "tests.test_ipv4.TheTable", "tests.test_ipv4.WithoutRoot", "tests.test_ipv4.Binding",
-                   "tests.test_ipv4.TheProgramsBytes"]
+                   "tests.test_ipv4.TheTable", "tests.test_ipv4.TheBaselinesRoutes",
+                   "tests.test_ipv4.WithoutRoot", "tests.test_ipv4.Binding",
+                   "tests.test_ipv4.TheProgramsBytes", "tests.test_ipv4.TheHarness"]
 # Running code first, so that a verdict says whether a mutant is caught by what a binary does, and
 # not only by the numbers in a unit test.
 TESTS = ["tests.test_walks.RandomWalks", "tests.test_walks.TheDearestWayThrough", "tests.test_walks.TheEndArm",
@@ -324,21 +325,49 @@ MUTANTS = {
         "return self.item.cells + self.reserve\n", "return self.item.cells\n", FORWARDER_TESTS),
     "xdp: what is left of the reserve does not come back": ("src/runtime_xdp.py",
         'add("    test r13, r13")\n    add("    jz .given_back")', 'add("    jmp .given_back")', FORWARDER_TESTS),
-    "xdp: state does not come back": ("src/runtime_xdp.py",
-        'add(f"    mov [state_{position}], {RESULTS[position]}")', 'pass', FORWARDER_TESTS),
+    "xdp: the state is not handed to the program": ("src/runtime_xdp.py",
+        'add(f"    mov {PARAMS[position]}, [state_{position}]")', 'pass', FORWARDER_TESTS),
+    "xdp: an image of any size is built": ("src/runtime_xdp.py",
+        "if image.bytes > MAX_IMAGE_BYTES:", "if False:", FORWARDER_TESTS),
     "xdp: a constructor without a frame is bound": ("src/runtime_xdp.py",
         'if frame is None:\n        raise BindingError', 'if False:\n        raise BindingError', FORWARDER_TESTS),
     "xdp: an output may write what the item lacks": ("src/runtime_xdp.py",
         'if source is None:', 'if source is None:\n            continue\n        if False:', FORWARDER_TESTS),
     "xdp: a missing map is not a refusal": ("src/runtime_xdp.py",
-        'syscall(321, "js .refuse_map", str(BPF_OBJ_GET), "obj_attr", "24")',
-        'syscall(321, "", str(BPF_OBJ_GET), "obj_attr", "24")', FORWARDER_TESTS),
+        'syscall(321, "js .refuse_map", str(BPF_OBJ_GET), "obj_attr", "24")\n'
+        '    add("    mov [update_attr], eax")\n'
+        '    syscall(321, "jnz .refuse_map", str(BPF_MAP_UPDATE_ELEM), "update_attr", "32")',
+        'syscall(321, "", str(BPF_OBJ_GET), "obj_attr", "24")\n'
+        '    add("    mov [update_attr], eax")\n'
+        '    syscall(321, "", str(BPF_MAP_UPDATE_ELEM), "update_attr", "32")', FORWARDER_TESTS),
     "xdp: the socket is not put in the map": ("src/runtime_xdp.py",
         'syscall(321, "jnz .refuse_map", str(BPF_MAP_UPDATE_ELEM), "update_attr", "32")', 'pass', FORWARDER_TESTS),
     "xdp: the packet memory is outside what startup touches": ("src/runtime_xdp.py",
         'add(f"umem: resb {frames * CHUNK}")\n    add(f"bss_end_page: resb {PAGE}")\n    add("bss_end:")',
         'add(f"bss_end_page: resb {PAGE}")\n    add("bss_end:")\n    add(f"umem: resb {frames * CHUNK}")', FORWARDER_TESTS),
+    "xdp: a frame the kernel dropped is not counted": ("src/runtime_xdp.py",
+        'for number in (EAGAIN, ENOBUFS):', 'for number in (EAGAIN, ENOBUFS, 16):', FORWARDER_TESTS),
+    # --- the harness: only what can be shown without a card
+    "speed: a window where the forwarder heard nothing is a result": ("tools/speed.py",
+        'if after["frames"] == before["frames"]:', 'if False:', FORWARDER_TESTS),
+    "speed: a virtual port can give a rate": ("tools/speed.py",
+        'if not args.plumbing:\n        for port in (args.generator, args.forwarder):\n            if not has_a_device(port):',
+        'if False:\n        for port in (args.generator, args.forwarder):\n            if not has_a_device(port):',
+        FORWARDER_TESTS),
+    "speed: a port with no carrier is not waited for": ("tools/speed.py",
+        'while "LOWER_UP" not in link(port, namespace)["flags"]:', 'while False:', FORWARDER_TESTS),
+    "speed: a signal does not put things back": ("tools/speed.py",
+        "signal.signal(number, _leave)", "pass", FORWARDER_TESTS),
+    "speed: a program is left on the generator's port": ("tools/speed.py",
+        "xdp_load.detach_program(args.generator, self.mode)", "pass", FORWARDER_TESTS),
     # --- the loader
+    "xdp: a program already there is replaced": ("tools/xdp_load.py",
+        "set_xdp(interface, program_fd, _mode_flag(mode) | XDP_FLAGS_UPDATE_IF_NOEXIST)\n    except (LoadError, OSError):",
+        "set_xdp(interface, program_fd, _mode_flag(mode))\n    except (LoadError, OSError):", FORWARDER_TESTS),
+    "xdp: a failed attach leaves its map for a runtime to find": ("tools/xdp_load.py",
+        "if os.path.exists(path):\n            os.unlink(path)\n        raise", "raise", FORWARDER_TESTS),
+    "xdp: returning frames are passed on": ("tools/xdp_load.py",
+        "_instruction(0xb7, dst=0, immediate=XDP_DROP)", "_instruction(0xb7, dst=0, immediate=XDP_PASS)", FORWARDER_TESTS),
     "xdp: what no socket wants is dropped": ("tools/xdp_load.py",
         "XDP_PASS = 2", "XDP_PASS = 1", FORWARDER_TESTS),
     "xdp: the program reads the wrong field for the queue": ("tools/xdp_load.py",
@@ -363,9 +392,9 @@ MUTANTS = {
     "ipv4: the total is read with its bytes swapped": ("examples/ipv4.lfpl",
         "pack<8,8>(low8(total), low8(>>(total, 8)))", "pack<8,8>(low8(>>(total, 8)), low8(total))", FORWARDER_TESTS),
     "ipv4: the checksum is not checked": ("examples/ipv4.lfpl",
-        "else ==(fold(fold(sum)), 65535);", "else true;", FORWARDER_TESTS),
-    "ipv4: the check folds once": ("examples/ipv4.lfpl",
-        "else ==(fold(fold(sum)), 65535);", "else ==(fold(sum), 65535);", FORWARDER_TESTS),
+        "else ==(fold(sum), 65535);", "else true;", FORWARDER_TESTS),
+    "ipv4: the check does not fold": ("examples/ipv4.lfpl",
+        "else ==(fold(sum), 65535);", "else ==(sum, 65535);", FORWARDER_TESTS),
     "ipv4: a word is left out of the sum": ("examples/ipv4.lfpl",
         "+(pack<16>(total), +(pack<16>(id),", "+(pack<16>(total), +(0,", FORWARDER_TESTS),
     "ipv4: the TTL goes down by 2": ("examples/ipv4.lfpl", "-(ttl, 1), 2,", "-(ttl, 2), 2,", FORWARDER_TESTS),
@@ -388,21 +417,22 @@ MUTANTS = {
     "ipv4: the source MAC loses its 1": ("examples/ipv4.lfpl", "+(<<(mac_end, 24), 65536)", "<<(mac_end, 24)", FORWARDER_TESTS),
     "ipv4: an expired frame is called malformed": ("examples/ipv4.lfpl",
         "(Expired@d1(frame), More@d2", "(Malformed@d1(frame), More@d2", FORWARDER_TESTS),
-    # --- the baseline, which is an oracle only if it is right
+    # --- the baseline, which is an oracle only if it is right. There is no mutant for its check that a
+    # frame has 34 bytes: a shorter one fails the check of its total length anyway, whatever is in it.
     "c: a TTL of 1 is forwarded": ("baseline/ipv4_forward.c", "if (ttl <= 1)", "if (ttl < 1)", FORWARDER_TESTS),
-    "c: a frame too short to read is read": ("baseline/ipv4_forward.c",
-        "    if (length < HEADER_BYTES)\n        return MALFORMED;\n", "", FORWARDER_TESTS),
     "c: the ethertype is not checked": ("baseline/ipv4_forward.c",
         "    if (read16(frame + 12) != ETHERTYPE_IPV4_LE)\n        return MALFORMED;\n", "", FORWARDER_TESTS),
     "c: the version byte is not checked": ("baseline/ipv4_forward.c",
         "    if (ip[0] != VERSION_AND_LENGTH)\n        return MALFORMED;\n", "", FORWARDER_TESTS),
     "c: a total past the frame passes": ("baseline/ipv4_forward.c", "total > length - 14", "total > length - 13", FORWARDER_TESTS),
+    # (void) keeps each of these three compiling, because -Werror refusing it would say nothing.
     "c: the checksum is not checked": ("baseline/ipv4_forward.c",
-        "    if (fold(fold(sum)) != 0xFFFF)\n        return MALFORMED;\n", "", FORWARDER_TESTS),
-    "c: the checksum is not patched": ("baseline/ipv4_forward.c", "    memcpy(frame + 24, &checksum, 2);\n", "", FORWARDER_TESTS),
+        "    if (fold(sum) != 0xFFFF)\n        return MALFORMED;\n", "    (void)sum;\n", FORWARDER_TESTS),
+    "c: the checksum is not patched": ("baseline/ipv4_forward.c",
+        "    memcpy(frame + 24, &checksum, 2);\n", "    (void)checksum;\n", FORWARDER_TESTS),
     "c: the MACs are not rewritten": ("baseline/ipv4_forward.c", "    memcpy(frame, hop_macs[hop], 12);\n", "", FORWARDER_TESTS),
     "c: routes are not sorted": ("baseline/ipv4_forward.c",
-        "    qsort(routes, used, sizeof routes[0], compare_length);\n", "", FORWARDER_TESTS),
+        "    qsort(routes, used, sizeof routes[0], compare_length);\n", "    (void)compare_length;\n", FORWARDER_TESTS),
     "c: a new second level starts empty": ("baseline/ipv4_forward.c",
         "        for (uint32_t i = 0; i < TBL8_GROUP; i++)\n            tbl8[group * TBL8_GROUP + i] = tbl24[top];\n", "", FORWARDER_TESTS),
     "c: the second level is not looked at": ("baseline/ipv4_forward.c",
@@ -413,6 +443,10 @@ MUTANTS = {
     "c: no route is not refused": ("baseline/ipv4_forward.c",
         "    if (hop == NO_ROUTE)\n        return MALFORMED;\n", "    if (hop == NO_ROUTE)\n        hop = 0;\n", FORWARDER_TESTS),
     "c: match is off at 128": ("baseline/ipv4_forward.c", "first < 128 ? 1", "first <= 128 ? 1", FORWARDER_TESTS),
+    "c: a line of the routes that does not parse is skipped": ("baseline/ipv4_forward.c",
+        'fail("a line of the routes file does not parse");', 'continue;', FORWARDER_TESTS),
+    "c: octets are not checked": ("baseline/ipv4_forward.c",
+        "a > 255 || b > 255 || c > 255 || d > 255 || ", "", FORWARDER_TESTS),
 }
 
 

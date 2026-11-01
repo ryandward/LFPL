@@ -8,11 +8,14 @@ Nothing here measures speed. A virtual pair says what a frame turns into, and th
 frames, but how fast it goes says nothing about a card. tools/speed.py is for that, and it refuses to
 give a rate on a virtual pair.
 """
+import dataclasses
 import glob
+import json
 import os
 import re
 import resource
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -37,8 +40,10 @@ SOURCE = os.path.join(ROOT, "examples", "ipv4.lfpl")
 BASELINE = os.path.join(ROOT, "baseline", "ipv4_forward.c")
 CONSTRUCTORS = ("Malformed", "Expired", "Send")
 LFPLO_COUNTERS = runtime_xdp.counter_names(CONSTRUCTORS)
-C_COUNTERS = ("frames", "forwarded", "malformed", "expired", "full", "completed", "kernel_dropped", "zerocopy")
-WORK = 90  # W(5), which is what the report gives: 18 steps a cell, and an item is always 5 cells
+C_COUNTERS = ("frames", "forwarded", "malformed", "expired", "full", "completed", "kernel_dropped", "zerocopy",
+              "send_errors")
+WORK = 85  # W(5), which is what the report gives: 17 steps a cell, and an item is always 5 cells
+DEAREST = 81  # the most steps any frame in the corpus takes
 FORWARDER_END, TESTER_END = "vfwd", "vpeer"
 CTL_PORT = 47100
 WAIT = 5.0
@@ -91,6 +96,10 @@ class VirtualPair:
         return xdp_load.in_namespace(self.path)
 
     def close(self) -> None:
+        # Whatever a failed test left running in here would keep the namespace alive after it was deleted.
+        left = subprocess.run(["ip", "netns", "pids", self.name], capture_output=True, text=True).stdout.split()
+        for pid in left:
+            os.kill(int(pid), signal.SIGKILL)
         subprocess.run(["ip", "netns", "del", self.name], capture_output=True)
         shutil.rmtree(self.pin, ignore_errors=True)
 
@@ -110,8 +119,12 @@ class Running:
             self.tester.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 24)
             self.control = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.control.settimeout(0.05)
-        self.discard_stray()
-        self.wait_until_serving()
+        try:
+            self.discard_stray()
+            self.wait_until_serving()
+        except BaseException:  # a forwarder left running would keep the namespace alive
+            self.stop()
+            raise
 
     def discard_stray(self) -> None:
         self.tester.setblocking(False)
@@ -200,14 +213,15 @@ class Running:
 def verdict_of_lfplo(before: dict, after: dict) -> str:
     moved = [name for name in ("out_Send", "out_Expired", "out_Malformed", "malformed", "short", "full")
              if after[name] != before[name]]
-    return {"out_Send": model.FORWARD, "out_Expired": model.EXPIRED, "out_Malformed": model.MALFORMED,
-            "malformed": model.MALFORMED}[moved[0]] if len(moved) == 1 else f"counters moved: {moved}"
+    verdicts = {"out_Send": model.FORWARD, "out_Expired": model.EXPIRED, "out_Malformed": model.MALFORMED,
+                "malformed": model.MALFORMED}
+    return verdicts.get(moved[0], f"counters moved: {moved}") if len(moved) == 1 else f"counters moved: {moved}"
 
 
 def verdict_of_c(before: dict, after: dict) -> str:
     moved = [name for name in ("forwarded", "expired", "malformed", "full") if after[name] != before[name]]
-    return {"forwarded": model.FORWARD, "expired": model.EXPIRED, "malformed": model.MALFORMED}[moved[0]] \
-        if len(moved) == 1 else f"counters moved: {moved}"
+    verdicts = {"forwarded": model.FORWARD, "expired": model.EXPIRED, "malformed": model.MALFORMED}
+    return verdicts.get(moved[0], f"counters moved: {moved}") if len(moved) == 1 else f"counters moved: {moved}"
 
 
 def exchange(running: Running, frame: bytes, judge) -> tuple:
@@ -227,7 +241,9 @@ class TheTwoAgree(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.work = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.work, True)
         cls.pair = VirtualPair()
+        cls.addClassCleanup(cls.pair.close)
         cls.cases = model.corpus()
         lfplo, _asm, _report = build_lfplo(cls.work, "ipv4", cls.pair.pin)
         baseline = build_baseline(cls.work)
@@ -241,18 +257,15 @@ class TheTwoAgree(unittest.TestCase):
                 ("c", [baseline, "--ifname", FORWARDER_END, "--map", os.path.join(cls.pair.pin, xdp_load.MAP_FILE),
                        "--ctl-port", str(CTL_PORT), "--match"], C_COUNTERS, verdict_of_c)):
             running = Running(cls.pair, command, names)
-            start = running.ask()  # what finding out it was serving took, which can differ
-            cls.results[name] = [exchange(running, frame, judge) for _name, _verdict, frame in cls.cases]
-            cls.leftover[name] = not running.nothing_more_arrives()
-            now = running.ask()
-            cls.counters[name] = {counter: now[counter] - start[counter] for counter in now}
-            cls.final[name] = now
-            cls.status[name] = running.stop()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.pair.close()
-        shutil.rmtree(cls.work, ignore_errors=True)
+            try:
+                start = running.ask()  # what finding out it was serving took, which can differ
+                cls.results[name] = [exchange(running, frame, judge) for _name, _verdict, frame in cls.cases]
+                cls.leftover[name] = not running.nothing_more_arrives()
+                now = running.ask()
+                cls.counters[name] = {counter: now[counter] - start[counter] for counter in now}
+                cls.final[name] = now
+            finally:
+                cls.status[name] = running.stop()
 
     def against_the_model(self, forwarder: str) -> None:
         for (name, _verdict, frame), (verdict, sent) in zip(self.cases, self.results[forwarder]):
@@ -306,7 +319,7 @@ class TheTwoAgree(unittest.TestCase):
         self.assertEqual(now["frames"], now["served"] + now["malformed"] + now["short"] + now["full"])
         self.assertEqual(now["kernel_dropped"], 0)
         self.assertEqual(now["bad_port"], 0)
-        self.assertEqual(now["kick_errors"], 0)
+        self.assertEqual(now["send_errors"], 0)
         self.assertEqual(now["admitted_cells"], 5 * now["served"])
 
     def test_both_shut_down_clean(self):
@@ -445,6 +458,67 @@ class TheRings(unittest.TestCase):
         running.discard_stray()
         self.assertEqual(exchange(running, frame, verdict_of_lfplo), model.forward(frame, model.by_top_bits),
                          "with its frames back, it serves again")
+
+    def test_the_kernel_is_woken_between_batches_while_frames_keep_coming(self):
+        """poll wakes the kernel too, but poll is only for when nothing has arrived. With frames waiting
+        on rx there is no idle turn, so if the wake at the end of a batch is missing, tx is never sent
+        and everything past its first 8 frames is refused. Stopped, the forwarder lets rx fill first,
+        which makes that the case for the whole run without needing a fast sender."""
+        running = self.start("--frames", "4096", "--k-out", "8")
+        start = running.ask()
+        running.process.send_signal(signal.SIGSTOP)
+        burst = 640  # 10 batches
+        try:
+            for number in range(burst):
+                running.tester.send(model.ipv4_frame(identification=number))
+        finally:
+            running.process.send_signal(signal.SIGCONT)
+        deadline = time.monotonic() + WAIT
+        while running.ask()["frames"] < start["frames"] + burst and time.monotonic() < deadline:
+            time.sleep(0.001)
+        now = running.settle(start["frames"] + burst)
+        self.assertEqual(now["frames"] - start["frames"], burst)
+        self.assertEqual(now["kernel_dropped"], 0)
+        self.assertEqual(now["forwarded"] + now["full"], burst, "each was sent, or refused for want of room")
+        self.assertGreaterEqual(now["forwarded"], 5 * 8, "the ring emptied again and again, with no idle turn")
+
+    def dropped_by_the_port(self) -> int:
+        with self.pair.inside():
+            shown = subprocess.run(["ip", "-j", "-s", "link", "show", "dev", FORWARDER_END],
+                                   capture_output=True, text=True, check=True).stdout
+        return json.loads(shown)[0]["stats64"]["tx"]["dropped"]
+
+    def test_a_frame_the_kernel_drops_for_a_link_that_is_down_is_counted(self):
+        """Copy mode takes the frame off tx, finds no carrier, and says EBUSY. It gives the frame's address
+        back as it would for one it sent, so the error is all the runtime can know. But poll sends from tx too,
+        and when that drops one nobody is told, so send_errors is at least 1 and not exactly 3. The port's own
+        count has all of them, and a card's zero-copy path has no such drop."""
+        running = self.start("--frames", "64", "--k-out", "8")
+        running.ask(b"P")
+        for number in range(3):
+            running.tester.send(model.ipv4_frame(identification=number))
+        deadline = time.monotonic() + WAIT
+        while running.ask()["forwarded"] < 3 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        dropped = self.dropped_by_the_port()
+        with self.pair.inside():
+            run("ip", "link", "set", TESTER_END, "down")
+        running.ask(b"R")
+        deadline = time.monotonic() + WAIT
+        while running.ask()["completed"] < 3 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        now = running.ask()
+        self.assertGreaterEqual(now["send_errors"], 1)
+        self.assertEqual(now["completed"], 3, "and they all came back")
+        self.assertEqual(self.dropped_by_the_port() - dropped, 3)
+        with self.pair.inside():
+            run("ip", "link", "set", TESTER_END, "up")
+        running.tester.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)  # the far end's socket saw it go down
+        running.discard_stray()
+        frame = model.ipv4_frame(identification=0x7777)
+        self.assertEqual(exchange(running, frame, verdict_of_lfplo), model.forward(frame, model.by_top_bits),
+                         "with the link back, it serves again")
+        self.assertEqual(running.ask()["frames"], running.ask()["forwarded"] + running.ask()["returned"])
 
     def test_quitting_sends_what_is_queued(self):
         running = self.start("--frames", "64", "--k-out", "8")
@@ -610,13 +684,10 @@ class WhatItCosts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.work = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.work, True)
         cls.pair = VirtualPair()
+        cls.addClassCleanup(cls.pair.close)
         cls.exe, cls.asm, cls.report = build_lfplo(cls.work, "ipv4_steps", cls.pair.pin, "--count-steps")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.pair.close()
-        shutil.rmtree(cls.work, ignore_errors=True)
 
     def test_no_frame_takes_more_steps_than_the_bound_and_the_dearest_comes_close(self):
         running = Running(self.pair, [self.exe], LFPLO_COUNTERS)
@@ -633,7 +704,7 @@ class WhatItCosts(unittest.TestCase):
                     self.assertEqual(after["steps"], before["steps"], "a refused frame runs nothing")
                 running.discard_stray()
             self.assertLessEqual(dearest, WORK)
-            self.assertGreater(dearest, WORK * 3 // 4, f"{dearest} steps: a bound far above what runs says little")
+            self.assertEqual(dearest, DEAREST, "README.md quotes this, and it decides the bound's worth")
         finally:
             running.stop()
 
@@ -658,6 +729,40 @@ class WhatItCosts(unittest.TestCase):
             running.stop()
 
 
+class TheTwoAreOneShape(unittest.TestCase):
+    """docs/workload.md says the two forwarders are alike but for what they are, and a speed comparison
+    means nothing if that has drifted. These run in the fast tier."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(BASELINE) as handle:
+            cls.c = handle.read()
+
+    def define(self, name: str) -> int:
+        return int(re.search(rf"^#define {name} (\d+)u", self.c, re.M).group(1))
+
+    def test_the_packet_memory_and_the_rings(self):
+        defaults = runtime_xdp.XdpOptions("eth0", "/x", 9000)
+        self.assertEqual(self.define("FRAME_SIZE"), runtime_xdp.CHUNK)
+        self.assertEqual(self.define("FRAMES"), defaults.frames)
+        self.assertIn("#define RING_SIZE FRAMES", self.c)
+        self.assertEqual(self.define("TX_SIZE"), defaults.k_out)
+
+    def test_the_batch_and_the_looks_at_the_control_port(self):
+        self.assertEqual(self.define("BATCH"), runtime_xdp.BATCH)
+        self.assertEqual(int(re.search(r"\+\+turn % (\d+)", self.c).group(1)), runtime_xdp.CONTROL_EVERY)
+
+    def test_the_header_the_item_reads(self):
+        with open(SOURCE, "rb") as handle:
+            checker = Checker()
+            for line in rt_lines(handle):
+                checker.feed(line)
+        checker.finish()
+        fn = next(f for f in checker.functions.values() if f.handler)
+        self.assertEqual(self.define("HEADER_BYTES"), runtime_xdp._item(checker, checker.norm(fn.params[-2])).header_bytes)
+        self.assertEqual(self.define("HEADER_BYTES"), model.HEADER_BYTES)
+
+
 class TheHarnessesArithmetic(unittest.TestCase):
     """tools/speed.py's reasoning, which can be checked without a card. These run in the fast tier."""
 
@@ -666,8 +771,18 @@ class TheHarnessesArithmetic(unittest.TestCase):
         self.assertEqual(speed.pktgen_size(1500), 1496)
 
     def test_rates_are_per_second_of_the_window(self):
-        rate = speed.rates(2.0, 2000, 1000, 500, 2 * speed.CLOCK_TICKS)
-        self.assertEqual((rate.offered, rate.forwarded, rate.back, rate.core_busy), (1000, 500, 250, 1.0))
+        rate = speed.rates(2.0, 2000, 1000, 500, 0.75)
+        self.assertEqual((rate.offered, rate.forwarded, rate.back, rate.core_busy), (1000, 500, 250, 0.75))
+
+    def test_the_median_round_is_a_round_that_happened(self):
+        rounds = [("c", 64, speed.Rates(1000, forwarded, forwarded, 1.0), {"round": forwarded})
+                  for forwarded in (900, 700, 800)]
+        rounds.append(("lfplo", 64, speed.Rates(1000, 500, 500, 1.0), {"round": 1}))
+        results = {row[0]: row for row in speed.median_rounds(rounds)}
+        self.assertEqual(results["c"][2].forwarded, 800)
+        self.assertEqual(results["c"][3], {"round": 800}, "its counters, and not another's")
+        self.assertEqual(results["c"][4], 200 / 800, "how far apart they were")
+        self.assertEqual(results["lfplo"][4], 0)
 
     def test_a_forwarder_that_keeps_up_was_not_the_limit(self):
         self.assertFalse(speed.Rates(1000, 1000, 1000, 0.5).saturated)
@@ -715,6 +830,19 @@ class TheHarnessesArithmetic(unittest.TestCase):
             with self.assertRaisesRegex(speed.Refused, "not there"):
                 speed.check_cores(0, 99, sysfs)
 
+    def test_cores_are_chosen_apart_and_the_forwarder_keeps_its_own(self):
+        with tempfile.TemporaryDirectory() as work:
+            sysfs = self.fake_cpus(work, {0: (0, 0), 1: (0, 1), 2: (0, 2), 3: (0, 0), 4: (0, 1), 5: (0, 2)})
+            self.assertEqual(speed.assign_cores(None, None, None, [0, 1, 2, 3, 4, 5], sysfs), (5, 4, 3),
+                             "three threads of three cores, from the far end")
+            self.assertEqual(speed.assign_cores(0, None, None, [0, 1, 2, 3, 4, 5], sysfs), (0, 5, 4))
+            self.assertEqual(speed.assign_cores(None, None, None, [0, 1, 3, 4], sysfs), (4, 3, 3),
+                             "with two cores, the interrupts share with the generator")
+            with self.assertRaisesRegex(speed.Refused, "shares a core with the forwarder"):
+                speed.assign_cores(0, 1, 3, [0, 1, 2, 3, 4, 5], sysfs)
+            with self.assertRaisesRegex(speed.Refused, "two physical cores"):
+                speed.assign_cores(None, None, None, [0, 3], sysfs)
+
     def test_only_a_port_with_a_device_can_give_a_rate(self):
         with tempfile.TemporaryDirectory() as work:
             os.makedirs(os.path.join(work, "enp1s0", "device"))
@@ -725,7 +853,8 @@ class TheHarnessesArithmetic(unittest.TestCase):
 
 @needs_root
 class TheHarness(unittest.TestCase):
-    """tools/speed.py on a virtual pair, where the point is that it gives no rate."""
+    """tools/speed.py on a virtual pair, where the point is that it gives no rate, and that a run that
+    went wrong is not reported as one."""
 
     # Anything a rate could be written as. Its plumbing mode prints counts, and no count per anything.
     RATE = re.compile(r"/s\b|pps|per second|packets per|[0-9] ?[kKM]pps", re.I)
@@ -733,7 +862,17 @@ class TheHarness(unittest.TestCase):
     def setUp(self):
         self.pair = VirtualPair()
         self.addCleanup(self.pair.close)
+        self.addCleanup(self.sweep)
         self.had_pktgen = os.path.exists("/proc/net/pktgen")
+
+    def sweep(self) -> None:
+        """If the harness did not put things back, the test has failed, and this is not to be left on the machine."""
+        for path in glob.glob("/run/netns/lfplspeed*"):
+            subprocess.run(["ip", "netns", "del", os.path.basename(path)], capture_output=True)
+        for path in glob.glob("/sys/fs/bpf/lfplspeed*"):
+            shutil.rmtree(path, ignore_errors=True)
+        if not self.had_pktgen and os.path.exists("/proc/net/pktgen"):
+            subprocess.run(["rmmod", "pktgen"], capture_output=True)
 
     def speed(self, *arguments: str) -> subprocess.CompletedProcess:
         with self.pair.inside():
@@ -764,6 +903,9 @@ class TheHarness(unittest.TestCase):
                 # had been refused as anything else, this run would have failed: see check_the_counters.
                 self.assertGreater(int(forwarded), 0, "the generator's frames got through")
                 self.assertLessEqual(int(forwarded), int(took))
+        for name, size, back in re.findall(r"(\S+) at (\d+) bytes: .* its port had (\d+) back", done.stdout):
+            with self.subTest(forwarder=name, size=size):
+                self.assertGreater(int(back), 0, "and came back to the generator's port")
         # and it left things as it found them
         with self.pair.inside():
             self.assertGreater(socket.if_nametoindex(TESTER_END), 0)
@@ -772,6 +914,60 @@ class TheHarness(unittest.TestCase):
         self.assertEqual(set(os.listdir("/run/netns")), before)
         self.assertEqual(glob.glob("/sys/fs/bpf/lfplspeed*"), [])
         self.assertEqual(os.path.exists("/proc/net/pktgen"), self.had_pktgen, "and the module as it was")
+
+    def assert_left_as_found(self) -> None:
+        with self.pair.inside():
+            self.assertGreater(socket.if_nametoindex(TESTER_END), 0)
+            links = subprocess.run(["ip", "-d", "link", "show"], capture_output=True, text=True).stdout
+        self.assertNotIn(" xdp", links, "no program is left attached")
+        self.assertNotRegex(links, "PROMISC", "and no port left promiscuous")
+        self.assertEqual(glob.glob("/sys/fs/bpf/lfplspeed*"), [])
+        self.assertEqual(glob.glob("/run/netns/lfplspeed*"), [])
+        self.assertEqual(os.path.exists("/proc/net/pktgen"), self.had_pktgen)
+
+    def test_ports_that_are_not_cabled_together_are_a_failure_and_not_a_rate(self):
+        """The generator sends and the forwarder hears nothing. That must not come out as a rate of zero."""
+        with self.pair.inside():
+            run("ip", "link", "add", "vgen", "type", "veth", "peer", "name", "vgenpeer")
+            run("ip", "link", "set", "vgen", "up")
+            run("ip", "link", "set", "vgenpeer", "up")
+        done = self.speed("--generator", "vgen", "--forwarder", FORWARDER_END, "--plumbing")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("the forwarder took none", done.stderr)
+        self.assert_left_as_found()
+
+    def test_a_port_with_no_carrier_is_a_failure_and_says_so(self):
+        with self.pair.inside():
+            run("ip", "link", "set", FORWARDER_END, "down")
+        # Its peer is the generator here, and it has no carrier until the far end is up.
+        done = self.speed("--generator", TESTER_END, "--forwarder", "vnone", "--plumbing")
+        self.assertEqual(done.returncode, 2, "there is no such port")
+        done = self.speed("--generator", TESTER_END, "--forwarder", FORWARDER_END, "--plumbing", "--carrier-wait", "0.5",
+                          "--seconds", "0.1")
+        self.assertEqual(done.returncode, 0, "the harness brings up its own forwarder port")
+        with self.pair.inside():
+            run("ip", "link", "add", "vlone", "type", "veth", "peer", "name", "vlonepeer")
+            run("ip", "link", "set", "vlone", "up")
+        done = self.speed("--generator", "vlone", "--forwarder", FORWARDER_END, "--plumbing", "--carrier-wait", "0.5")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("has no carrier", done.stderr)
+        self.assert_left_as_found()
+
+    def test_told_to_stop_it_puts_things_back(self):
+        """A dropped session sends SIGHUP, and that must not strand the port in a namespace."""
+        with self.pair.inside():
+            process = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "speed.py"), "--generator", TESTER_END,
+                                        "--forwarder", FORWARDER_END, "--plumbing"], cwd=ROOT,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        seen = ""
+        for line in process.stdout:
+            seen += line
+            if "lfplo at 64" in line:  # well into the run, with pktgen going
+                process.send_signal(signal.SIGHUP)
+                break
+        rest, _ = process.communicate(timeout=60)
+        self.assertEqual(process.returncode, 128 + signal.SIGHUP, seen + rest)
+        self.assert_left_as_found()
 
     def test_what_pktgen_sends_is_the_workload_at_the_size_it_says(self):
         loaded = not self.had_pktgen
@@ -849,6 +1045,25 @@ class TheLoader(unittest.TestCase):
         with self.pair.inside():
             xdp_load.detach(FORWARDER_END, self.pair.pin, "drv")
         self.assertFalse(os.path.exists(self.pair.pin), "and detaching leaves nothing behind")
+        self.assertTrue(self.seen_by_the_stack(frame))
+
+    def test_a_program_already_there_is_not_replaced(self):
+        with self.pair.inside():
+            xdp_load.attach(FORWARDER_END, self.pair.pin, "drv", 1)
+            with self.assertRaisesRegex(xdp_load.LoadError, "attaching XDP"):
+                xdp_load.attach(FORWARDER_END, self.pair.pin + "-other", "drv", 1)
+            xdp_load.detach(FORWARDER_END, self.pair.pin, "drv")
+        self.assertFalse(os.path.exists(os.path.join(self.pair.pin + "-other", xdp_load.MAP_FILE)),
+                         "a failed attach leaves no map behind for a runtime to find")
+        shutil.rmtree(self.pair.pin + "-other", ignore_errors=True)
+
+    def test_the_program_for_returning_frames_drops_them(self):
+        frame = model.ipv4_frame(identification=0x4343)
+        with self.pair.inside():
+            xdp_load.attach_drop(FORWARDER_END, "drv")
+        self.assertFalse(self.seen_by_the_stack(frame), "dropped before the stack sees it")
+        with self.pair.inside():
+            xdp_load.detach_program(FORWARDER_END, "drv")
         self.assertTrue(self.seen_by_the_stack(frame))
 
     def test_an_interface_that_is_not_there_is_an_error_with_a_message(self):
@@ -944,19 +1159,48 @@ class TheCommandLine(unittest.TestCase):
         self.assertIn("needs -o, --map and --ctl-port", self.refused("--xdp", "eth0", "--ctl-port", "9000"))
 
 
+class TheBaselinesRoutes(unittest.TestCase):
+    """A table missing routes would call good frames malformed, and look like a slower forwarder."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.work = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.work, True)
+        cls.exe = build_baseline(cls.work)
+
+    def refusal(self, routes: str) -> str:
+        path = os.path.join(self.work, "routes")
+        with open(path, "w") as handle:
+            handle.write(routes)
+        done = subprocess.run([self.exe, "--ifname", "nosuchif", "--map", "/nosuchmap", "--ctl-port", "9000",
+                               "--routes", path], capture_output=True, text=True, timeout=WAIT)
+        self.assertEqual(done.returncode, 1)
+        return done.stderr
+
+    def test_a_line_that_does_not_parse_is_refused_wherever_it_is(self):
+        for routes in ("# a comment\n10.0.0.0/8 1\n", "10.0.0.0/8 1\nnonsense\n", "10.0.0.0/8\n", "10.0.0.0/8 1 2\n"):
+            with self.subTest(routes=routes):
+                self.assertIn("does not parse", self.refusal(routes))
+
+    def test_what_is_out_of_range_is_refused(self):
+        for routes in ("256.0.0.0/8 1\n", "10.0.0.0/33 1\n", "10.0.0.0/8 64\n", "10.0.0.-1/8 1\n"):
+            with self.subTest(routes=routes):
+                self.assertIn("out of range", self.refusal(routes))
+
+    def test_a_good_file_gets_past_the_table(self):
+        self.assertNotIn("routes", self.refusal("10.0.0.0/8 1\n0.0.0.0/0 2\n10.1.2.3/32 3\n"))
+
+
 class WithoutRoot(unittest.TestCase):
     """What a binary shows without being allowed to serve."""
 
     @classmethod
     def setUpClass(cls):
         cls.work = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.work, True)
         cls.exe, cls.asm_path, cls.report = build_lfplo(cls.work, "ipv4", "/sys/fs/bpf/none", "--frames", "16")
         with open(cls.asm_path) as handle:
             cls.asm = handle.read()
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.work, ignore_errors=True)
 
     def test_the_report_gives_the_bounds(self):
         self.assertIn(f"handler ipv4: R(n) = 0 cells, W(n) = {WORK // 5} n steps", self.report)
@@ -1171,6 +1415,12 @@ record Item { next: Loop, frame: Frame };
 record Out { frame: Frame };
 fn drain(l: Loop, acc: Free) : Free = match l with Loop(d, a, next) => drain(next, More@d(acc)) end;
 """ + HANDLER % "Out" + """ match i with Item(d, next, frame) => (Out@d(frame), drain(next, free)) end;""")
+
+    def test_an_image_past_what_the_code_can_reach_is_refused(self):
+        image = bound_image(ITEM + self.GOOD_OUT + HANDLER % "Out" + self.GOOD_BODY)
+        too_many = dataclasses.replace(image.options, frames=1 << 20)
+        with self.assertRaisesRegex(BindingError, "needs an image of"):
+            runtime_xdp.assembly(dataclasses.replace(image, options=too_many))
 
     def test_options_are_checked_at_the_boundary(self):
         for arguments, pattern in ((("eth0", "/x", 0), "not a port"), (("", "/x", 9000), "cannot name an interface"),

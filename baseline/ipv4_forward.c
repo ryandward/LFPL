@@ -57,7 +57,7 @@
 enum verdict { FORWARD, MALFORMED, EXPIRED };
 
 struct counters {
-    uint64_t frames, forwarded, malformed, expired, full, completed, kernel_dropped, zerocopy;
+    uint64_t frames, forwarded, malformed, expired, full, completed, kernel_dropped, zerocopy, send_errors;
 };
 
 struct ring {
@@ -123,8 +123,13 @@ static void load_routes(const char *path) {
     static uint64_t routes[65536][3];
     size_t used = 0;
     unsigned a, b, c, d, length, hop;
-    while (fscanf(file, "%u.%u.%u.%u/%u %u", &a, &b, &c, &d, &length, &hop) == 6) {
-        if (used == 65536 || length > 32 || hop >= MAX_HOPS)
+    char line[128];
+    while (fgets(line, sizeof line, file)) {
+        int end = 0;
+        /* Refused and not skipped: a table missing routes would call good frames malformed. */
+        if (sscanf(line, "%u.%u.%u.%u/%u %u %n", &a, &b, &c, &d, &length, &hop, &end) != 6 || line[end] != '\0')
+            fail("a line of the routes file does not parse");
+        if (used == 65536 || a > 255 || b > 255 || c > 255 || d > 255 || length > 32 || hop >= MAX_HOPS)
             fail("a route is out of range, or there are too many");
         routes[used][0] = a << 24 | b << 16 | c << 8 | d;
         routes[used][1] = length;
@@ -186,7 +191,8 @@ static inline enum verdict forward(uint8_t *frame, uint32_t length) {
     uint32_t sum = 0;
     for (unsigned at = 0; at < 20; at += 2)
         sum += read16(ip + at);
-    if (fold(fold(sum)) != 0xFFFF)
+    /* At most 0x9FFF6, so one fold gives at most 0x10008, and what is above 0xFFFF cannot fold to it. */
+    if (fold(sum) != 0xFFFF)
         return MALFORMED;
     uint32_t ttl = ip[8];
     if (ttl <= 1)
@@ -233,6 +239,13 @@ static inline uint32_t observe(const uint32_t *where) {
 
 static inline void refill(struct ring *fill, uint64_t address) {
     ((uint64_t *)fill->descriptors)[fill->cached_producer++ & RING_MASK] = address;
+}
+
+/* EAGAIN and ENOBUFS leave the rest on tx for the next turn. EBUSY is a frame the kernel took and dropped.
+ * In copy mode poll sends from tx as well and cannot say so, so this is a lower bound: see tx_dropped. */
+static void wake_tx(int xsk) {
+    if (sendto(xsk, NULL, 0, MSG_DONTWAIT, NULL, 0) < 0 && errno != EAGAIN && errno != ENOBUFS)
+        count.send_errors++;
 }
 
 int main(int argc, char **argv) {
@@ -383,9 +396,12 @@ int main(int argc, char **argv) {
             publish(fill.producer, fill.cached_producer);
             publish(tx.producer, tx.cached_producer);
             if (observe(tx.flags) & XDP_RING_NEED_WAKEUP)
-                sendto(xsk, NULL, 0, MSG_DONTWAIT, NULL, 0);
-        } else if (tx.cached_producer != observe(tx.consumer) && observe(tx.flags) & XDP_RING_NEED_WAKEUP) {
-            sendto(xsk, NULL, 0, MSG_DONTWAIT, NULL, 0); /* copy mode sends only so many at a time */
+                wake_tx(xsk);
+        } else {
+            if (tx.cached_producer != observe(tx.consumer) && observe(tx.flags) & XDP_RING_NEED_WAKEUP)
+                wake_tx(xsk); /* copy mode sends only so many at a time */
+            if (observe(fill.flags) & XDP_RING_NEED_WAKEUP)
+                poll(&waiting, 1, 0); /* a card out of frames stops looking at fill until it is woken */
         }
         if (!worked)
             poll(&waiting, 1, 1);

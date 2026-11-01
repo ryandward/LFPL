@@ -23,7 +23,8 @@ TIER = ("tests.test_simplex",
         "tests.test_ipv4_model",
         "tests.test_ipv4.Binding",
         "tests.test_ipv4.TheProgramsBytes",
-        "tests.test_ipv4.TheHarnessesArithmetic")
+        "tests.test_ipv4.TheHarnessesArithmetic",
+        "tests.test_ipv4.TheTwoAreOneShape")
 SIMULATORS = frozenset(("iverilog", "vvp", "yosys", "verilator"))
 
 

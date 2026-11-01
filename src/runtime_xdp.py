@@ -35,13 +35,13 @@ What the source does not say, this file decides:
                 egress has written them to the frame, so one transaction's cells are all there are.
 
 System calls, at startup: rt_sigprocmask, rt_sigaction, mlockall, mprotect, socket, setsockopt,
-getsockopt, mmap, ioctl, bind and bpf. In service: poll with a 1 ms timeout when idle, sendto to wake the
-kernel when it says it needs waking, recvfrom on the control port, and on `S`, getsockopt and sendto.
+getsockopt, mmap, ioctl, bind and bpf. In service: poll when idle, and to wake a kernel that says fill needs
+it, sendto to wake one that says tx does, recvfrom on the control port, and on `S`, getsockopt and sendto.
 The serving loop makes no system call for a frame while the card keeps up.
 
 The control port answers as src/runtime.py's does. `S` answers with the counters, walking the free list
-to count the pool. `P` stops publishing to tx, so that it fills, and `R` starts again. `Q` sends what is
-queued, for as long as the kernel keeps taking it, and exits.
+to count the pool. `P` stops publishing to tx, so that it fills, and `R` starts again. `Q` waits for what is
+queued to be sent, for as long as the kernel keeps sending it, and exits.
 """
 from __future__ import annotations
 
@@ -72,7 +72,7 @@ XDP_OPTIONS_ZEROCOPY = 1
 SIOCGIFINDEX = 0x8933
 BPF_MAP_UPDATE_ELEM, BPF_OBJ_GET = 2, 7
 MSG_DONTWAIT = 64
-EAGAIN, EBUSY, ENOBUFS = 11, 16, 105
+EAGAIN, ENOBUFS = 11, 105
 POLLIN = 1
 MAP_SHARED_POPULATE = 0x8001
 RING_OFFSETS_BYTES = 32 # producer, consumer, descriptors, flags: four 64-bit offsets, for each ring
@@ -83,11 +83,12 @@ RINGS = ((RX, 0, 0, 16), (TX, 0x80000000, 1, 16), (FILL, 0x100000000, 2, 8),
          (COMPLETION, 0x180000000, 3, 8))
 
 # frames counts every frame taken from rx, and every one ends in forwarded, or in returned, which is
-# back on fill. completed is how many of the forwarded have been sent. kernel_dropped is the socket's
-# own count of what it could not deliver, as XDP_STATISTICS gives it when asked. Each constructor of
-# the output has a counter too, out_<name>, after these.
+# back on fill. completed is how many of the forwarded the kernel has finished with. send_errors is what
+# waking it to send has reported, and it is a lower bound: see flush_tx. kernel_dropped is the socket's
+# own count of what it could not deliver, as XDP_STATISTICS gives it when asked. Each constructor of the
+# output has a counter too, out_<name>, after these.
 COUNTERS = ("capacity", "pool", "frames", "served", "forwarded", "dropped", "malformed", "short", "full",
-            "bad_port", "kick_errors", "returned", "completed", "admitted_cells", "budget_steps", "steps",
+            "bad_port", "send_errors", "returned", "completed", "admitted_cells", "budget_steps", "steps",
             "kernel_dropped", "zerocopy")
 _SCRATCH = {8: "r10", 4: "r10d", 2: "r10w", 1: "r10b"}
 
@@ -368,9 +369,6 @@ def assembly(image: XdpImage) -> str:
     if image.bytes > MAX_IMAGE_BYTES:
         raise BindingError(f"section 8.2: {image.handler} needs an image of {image.bytes} bytes, and "
                            f"this runtime takes at most {MAX_IMAGE_BYTES}")
-    if item.header_bytes > CHUNK:
-        raise BindingError(f"section 3.1: {image.handler}'s item has {item.header_bytes} bytes of "
-                           f"headers, and a frame's memory is {CHUNK}")
     lines: list[str] = []
     add = lines.append
     k = len(image.states)
@@ -645,6 +643,12 @@ def assembly(image: XdpImage) -> str:
     add("    jmp serve")
     add(".idle:")
     add("    call flush_tx")
+    add("    ; a card in zero-copy mode that ran out of frames stops looking at fill until it is woken")
+    add("    mov rax, [fill_flags_at]")
+    add(f"    test dword [rax], {XDP_RING_NEED_WAKEUP}")
+    add("    jz .fill_awake")
+    syscall(7, "", "waiting", "1", "0")
+    add(".fill_awake:")
     add("    cmp dword [reaped], 0")
     add("    jne serve")
     syscall(7, "", "waiting", "1", str(IDLE_MILLISECONDS))
@@ -685,7 +689,11 @@ def assembly(image: XdpImage) -> str:
     add("    ret")
     add("")
     add("; Publish tx, and wake the kernel if it says it needs waking and there is something to send.")
-    add("; Nothing is lost if a wake fails for want of room: the next turn tries again.")
+    add("; EAGAIN and ENOBUFS mean it sent what it could and left the rest on tx, for the next turn. Any other")
+    add("; error is counted, and that includes EBUSY, when it has taken a frame off tx and dropped it because")
+    add("; the link is down. That frame is gone, and its address still comes back on the completion ring. In")
+    add("; copy mode, poll sends from tx as well and has nowhere to say so, so this counts some of those frames")
+    add("; and not all: the port's own tx_dropped has every one.")
     add("flush_tx:")
     add("    cmp qword [egress_paused], 0")
     add("    jne .done")
@@ -708,10 +716,10 @@ def assembly(image: XdpImage) -> str:
     add("    syscall")
     add("    test rax, rax")
     add("    jns .done")
-    for number in (EAGAIN, EBUSY, ENOBUFS):
+    for number in (EAGAIN, ENOBUFS):
         add(f"    cmp rax, -{number}")
         add("    je .done")
-    add("    inc qword [cnt_kick_errors]")
+    add("    inc qword [cnt_send_errors]")
     add(".done:")
     add("    ret")
     add("")
@@ -773,8 +781,8 @@ def assembly(image: XdpImage) -> str:
     add(".send_what_is_queued:")
     add("    call flush_tx")
     add("    call reap")
-    add("    mov rax, [tx_cons_at]")
-    add("    mov eax, [rax]")
+    add("    ; completion and not tx's consumer: a card can have taken a frame and not yet sent it")
+    add("    mov eax, [comp_cons]")
     add("    cmp eax, [tx_prod]")
     add("    je .leave")
     add("    dec qword [patience]")

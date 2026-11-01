@@ -20,15 +20,17 @@ data Out = Malformed(frame: Frame)
          | Expired(frame: Frame)
          | Send(port: Int8, ttl: Int8, dmac_hi: Int32, rest: Tx1);
 
-# End-around carry. Two folds bring a sum of ten 16-bit words down to 16 bits.
+# End-around carry.
 fn fold(s: Int64) : Int64 = +(&(s, 65535), >>(s, 16));
 
+# Ten 16-bit words add up to at most 0x9FFF6, so one fold gives at most 0x10008. Anything above 0xFFFF
+# would fold again to at most 9, and so could not have been 0xFFFF: one fold is enough to tell.
 fn well_formed(ethertype: Int16, version: Int8, total: Int64, length: Int16, sum: Int64) : Bool =
   if !=(ethertype, 8) then false            # 08 00 on the wire
   else if !=(version, 69) then false        # version 4, 5 words of header
   else if <(total, 20) then false
   else if >(+(total, 14), pack<16>(length)) then false
-  else ==(fold(fold(sum)), 65535);
+  else ==(fold(sum), 65535);
 
 # RFC 1624, equation 3, on the word holding the TTL and the protocol: HC' = ~(~HC + ~m + m').
 # The TTL is that word's low byte here, so m' = m - 1, and ~m + m' is 0xFFFE whatever m is. Added to

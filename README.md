@@ -355,12 +355,12 @@ unchanged, and it derives what it always does:
 python3 tools/xdp_load.py attach eth1 --pin /sys/fs/bpf/lfplo          # as root
 python3 -m src.lfplo examples/ipv4.lfpl -o ipv4 --xdp eth1 --map /sys/fs/bpf/lfplo/xsks --ctl-port 9001
 
-handler ipv4: R(n) = 0 cells, W(n) = 18 n steps, stack 80 bytes, 5 cells, image 8392784 bytes
+handler ipv4: R(n) = 0 cells, W(n) = 17 n steps, stack 80 bytes, 5 cells, image 8392784 bytes
 ```
 
-An item here is always 5 cells, so that bound is 90 steps, and the dearest frame in the test corpus takes
-86. `tools/xdp_load.py` is a separate step because loading a program into the kernel has no place in a
-serving loop. It writes six BPF instructions as bytes, so no C compiler is involved there either, and it
+An item here is always 5 cells, so that bound is 85 steps, and the dearest frame in the test corpus takes
+81. `tools/xdp_load.py` is a separate step because loading a program into the kernel has no place in a
+serving loop. It writes five BPF instructions as bytes, so no C compiler is involved there either, and it
 pins the map the runtime registers with. If that map is not there, the runtime refuses to start, and each
 step of startup that can fail exits with its own number.
 
@@ -386,6 +386,8 @@ sudo env PATH="$PATH" python3 -m unittest tests.test_ipv4
 Speed is another matter, because a virtual pair's rate says how fast the kernel copies memory. So
 `tools/speed.py`, which runs pktgen on one port of a card and the forwarder on the other, cabled together,
 refuses to give a rate on a virtual pair, and until a card is here there is no such number to report.
+What it can show here is that it goes through every step, puts everything back, and calls a run that went
+wrong a failure: uncabled ports, a port with no carrier, or being told to stop.
 
 ## How the compiler holds itself to the same rules
 
