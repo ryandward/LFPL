@@ -1,4 +1,4 @@
-/* The C baseline: docs/workload.md on AF_XDP, on one core.
+/* The C baseline: experimental/workload.md on AF_XDP, on one core.
  *
  * This is the ceiling LFPL-O is measured against, and the oracle for its outputs. It is plain and
  * direct on purpose: it reads the frame where it lies, batches like any AF_XDP program, and has no
@@ -8,10 +8,10 @@
  *     ipv4_forward --ifname IF --map PINNED --ctl-port PORT [--routes FILE | --match]
  *
  * --routes gives a DIR-24-8 table, built at startup: lines of `a.b.c.d/len hop`. --match replaces the
- * table with what examples/ipv4.lfpl does, the top two bits of the destination's first octet, which
+ * table with what experimental/ipv4.lfpl does, the top two bits of the destination's first octet, which
  * is how the two are compared frame by frame.
  *
- * tools/xdp_load.py attaches the XDP program and pins the socket map this registers with. The control
+ * experimental/xdp_load.py attaches the XDP program and pins the socket map this registers with. The control
  * port takes `S`, answered with the counters below as 64-bit words, and `Q`, which stops it.
  */
 #define _GNU_SOURCE
@@ -36,7 +36,7 @@
 #define SOL_XDP 283
 #endif
 
-/* The same shape as src/runtime_xdp.py's defaults, so that the two are compared like for like. */
+/* The same shape as experimental/runtime_xdp.py's defaults, so that the two are compared like for like. */
 #define FRAME_SIZE 2048u
 #define FRAMES 4096u
 #define RING_SIZE FRAMES /* fill, rx and completion: a frame is on one ring at a time */

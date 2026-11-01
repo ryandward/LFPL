@@ -1,6 +1,6 @@
-"""Measure the forwarders on a real card: docs/workload.md, in packets per second.
+"""Measure the forwarders on a real card: experimental/workload.md, in packets per second.
 
-    sudo python3 tools/speed.py --generator PORT --forwarder PORT [--forwarder-core N] [--generator-core N]
+    sudo python3 experimental/speed.py --generator PORT --forwarder PORT [--forwarder-core N] [--generator-core N]
                                 [--generator-irq-core N] [--seconds S] [--rounds N]
                                 [--random-destinations] [--skb]
 
@@ -10,8 +10,8 @@ other port, and sends each frame back out the port it came in on, so what it for
 generator's port and is counted there. Each forwarder is run at 64 and at 1500 bytes on the wire, which
 to pktgen is 60 and 1496, because the card adds the 4 bytes of the frame check sequence.
 
-    c         baseline/ipv4_forward.c, with --match, built with cc -O3 -march=native
-    lfplo     examples/ipv4.lfpl
+    c         experimental/ipv4_forward.c, with --match, built with cc -O3 -march=native
+    lfplo     experimental/ipv4.lfpl
     c-table   the baseline again with a DIR-24-8 table, to see what a real table costs
 
 A rate is only worth having if it came from a card. A virtual pair's rate says how fast the kernel copies
@@ -55,8 +55,7 @@ from typing import Optional
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from src import runtime_xdp  # noqa: E402
-from tools import xdp_load  # noqa: E402
+from experimental import runtime_xdp, xdp_load  # noqa: E402
 
 FCS_BYTES = 4
 WIRE_SIZES = (64, 1500)
@@ -500,15 +499,15 @@ class Run:
         args = self.args
         map_path = os.path.join(self.pin, xdp_load.MAP_FILE)
         lfplo = os.path.join(self.work, "lfplo")
-        report = subprocess.run([sys.executable, "-m", "src.lfplo", "examples/ipv4.lfpl", "-o", lfplo,
+        report = subprocess.run([sys.executable, "-m", "experimental.build", "experimental/ipv4.lfpl", "-o", lfplo,
                                  "--xdp", args.forwarder, "--map", map_path, "--ctl-port", str(CTL_PORT)],
                                 cwd=ROOT, capture_output=True, text=True)
         if report.returncode:
-            raise Failed(f"examples/ipv4.lfpl did not build: {report.stderr}")
+            raise Failed(f"experimental/ipv4.lfpl did not build: {report.stderr}")
         print(f"  {report.stdout.strip()}", flush=True)
         baseline = os.path.join(self.work, "ipv4_forward")
         run("cc", "-O3", "-march=native", "-Wall", "-Wextra", "-o", baseline,
-            os.path.join(ROOT, "baseline", "ipv4_forward.c"))
+            os.path.join(ROOT, "experimental", "ipv4_forward.c"))
         routes = os.path.join(self.work, "routes")
         with open(routes, "w") as handle:
             handle.write(ROUTES)

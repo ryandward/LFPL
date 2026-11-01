@@ -48,8 +48,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator
 
-from .rtcheck import Bound, Checker, Ctor
-from .runtime import (CELL, MAX_IMAGE_BYTES, PAGE, PARAMS, RESULTS, RUNTIME_DEPTH, BindingError,
+from src.rtcheck import Bound, Checker, Ctor
+from src.runtime import (CELL, MAX_IMAGE_BYTES, PAGE, PARAMS, RESULTS, RUNTIME_DEPTH, BindingError,
                       StateSlot, _be16, _check_reserve, dispatch_on, fixed_image_startup, handler_slots,
                       pool_routines)
 
@@ -96,7 +96,7 @@ _SCRATCH = {8: "r10", 4: "r10d", 2: "r10w", 1: "r10b"}
 @dataclass(frozen=True)
 class XdpOptions:
     interface: str
-    map_path: str        # the pinned socket map, from tools/xdp_load.py
+    map_path: str        # the pinned socket map, from experimental/xdp_load.py
     ctl_port: int
     frames: int = 4096   # F, the frames in the packet memory, and the size of fill, rx and completion
     k_out: int = 2048    # the size of tx

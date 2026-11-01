@@ -1,4 +1,4 @@
-# The fixed workload of docs/workload.md, without the table: arrays can do that later.
+# The fixed workload of experimental/workload.md, without the table: arrays can do that later.
 #
 # An item is the frame's first 34 bytes, read as little-endian fields in wire order, so a word of the
 # IP header here is that word with its bytes swapped. An Internet checksum does not mind that, so

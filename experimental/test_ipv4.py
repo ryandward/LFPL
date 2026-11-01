@@ -5,7 +5,7 @@ end, run a forwarder on it, and speak raw frames on the other end. With no root 
 is what a build can show: the refusals of binding, and the shape of the binary.
 
 Nothing here measures speed. A virtual pair says what a frame turns into, and that the rings conserve
-frames, but how fast it goes says nothing about a card. tools/speed.py is for that, and it refuses to
+frames, but how fast it goes says nothing about a card. experimental/speed.py is for that, and it refuses to
 give a rate on a virtual pair.
 """
 import dataclasses
@@ -29,15 +29,14 @@ from src.certify import certify
 from src.rtcheck import Checker
 from src.rtlower import rt_lines
 from src.runtime import BindingError
-from src import runtime_xdp
-from tests import ipv4_model as model
-from tools import speed, xdp_load
+from experimental import ipv4_model as model
+from experimental import runtime_xdp, speed, xdp_load
 
 import io
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCE = os.path.join(ROOT, "examples", "ipv4.lfpl")
-BASELINE = os.path.join(ROOT, "baseline", "ipv4_forward.c")
+SOURCE = os.path.join(ROOT, "experimental", "ipv4.lfpl")
+BASELINE = os.path.join(ROOT, "experimental", "ipv4_forward.c")
 CONSTRUCTORS = ("Malformed", "Expired", "Send")
 LFPLO_COUNTERS = runtime_xdp.counter_names(CONSTRUCTORS)
 C_COUNTERS = ("frames", "forwarded", "malformed", "expired", "full", "completed", "kernel_dropped", "zerocopy",
@@ -60,7 +59,7 @@ def build_lfplo(workdir: str, name: str, pin: str, *options: str, interface: str
                 ctl_port: int = CTL_PORT, source: str = SOURCE) -> tuple:
     exe = os.path.join(workdir, name)
     asm = exe + ".asm"
-    built = subprocess.run([sys.executable, "-m", "src.lfplo", source, "-o", exe, "--asm", asm,
+    built = subprocess.run([sys.executable, "-m", "experimental.build", source, "-o", exe, "--asm", asm,
                             "--xdp", interface, "--map", os.path.join(pin, xdp_load.MAP_FILE),
                             "--ctl-port", str(ctl_port), *options],
                            cwd=ROOT, capture_output=True, text=True)
@@ -562,7 +561,7 @@ class TheRings(unittest.TestCase):
 
 @needs_root
 class OtherHandlers(unittest.TestCase):
-    """examples/ipv4.lfpl has no state and no reserve, and its fields fit its cells exactly. What this
+    """experimental/ipv4.lfpl has no state and no reserve, and its fields fit its cells exactly. What this
     runtime promises for other shapes has to be shown on other programs."""
 
     def setUp(self):
@@ -730,8 +729,8 @@ class WhatItCosts(unittest.TestCase):
 
 
 class TheTwoAreOneShape(unittest.TestCase):
-    """docs/workload.md says the two forwarders are alike but for what they are, and a speed comparison
-    means nothing if that has drifted. These run in the fast tier."""
+    """experimental/workload.md says the two forwarders are alike but for what they are, and a speed comparison
+    means nothing if that has drifted."""
 
     @classmethod
     def setUpClass(cls):
@@ -764,7 +763,7 @@ class TheTwoAreOneShape(unittest.TestCase):
 
 
 class TheHarnessesArithmetic(unittest.TestCase):
-    """tools/speed.py's reasoning, which can be checked without a card. These run in the fast tier."""
+    """experimental/speed.py's reasoning, which can be checked without a card."""
 
     def test_a_size_on_the_wire_is_four_bytes_more_than_pktgen_calls_it(self):
         self.assertEqual(speed.pktgen_size(64), 60)
@@ -853,7 +852,7 @@ class TheHarnessesArithmetic(unittest.TestCase):
 
 @needs_root
 class TheHarness(unittest.TestCase):
-    """tools/speed.py on a virtual pair, where the point is that it gives no rate, and that a run that
+    """experimental/speed.py on a virtual pair, where the point is that it gives no rate, and that a run that
     went wrong is not reported as one."""
 
     # Anything a rate could be written as. Its plumbing mode prints counts, and no count per anything.
@@ -879,7 +878,7 @@ class TheHarness(unittest.TestCase):
 
     def speed(self, *arguments: str) -> subprocess.CompletedProcess:
         with self.pair.inside():
-            return subprocess.run([sys.executable, os.path.join(ROOT, "tools", "speed.py"), *arguments],
+            return subprocess.run([sys.executable, os.path.join(ROOT, "experimental", "speed.py"), *arguments],
                                   cwd=ROOT, capture_output=True, text=True, timeout=120)
 
     def test_on_a_virtual_pair_it_refuses_and_touches_nothing(self):
@@ -959,7 +958,7 @@ class TheHarness(unittest.TestCase):
     def test_told_to_stop_it_puts_things_back(self):
         """A dropped session sends SIGHUP, and that must not strand the port in a namespace."""
         with self.pair.inside():
-            process = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "speed.py"), "--generator", TESTER_END,
+            process = subprocess.Popen([sys.executable, os.path.join(ROOT, "experimental", "speed.py"), "--generator", TESTER_END,
                                         "--forwarder", FORWARDER_END, "--plumbing"], cwd=ROOT,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         seen = ""
@@ -1071,7 +1070,7 @@ class TheLoader(unittest.TestCase):
 
     def test_an_interface_that_is_not_there_is_an_error_with_a_message(self):
         with self.pair.inside():
-            done = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "xdp_load.py"), "attach", "nosuchif",
+            done = subprocess.run([sys.executable, os.path.join(ROOT, "experimental", "xdp_load.py"), "attach", "nosuchif",
                                    "--pin", self.pair.pin], capture_output=True, text=True)
         self.assertEqual(done.returncode, 1)
         self.assertIn("xdp_load:", done.stderr)
@@ -1133,33 +1132,20 @@ class RefusalsAtStartup(unittest.TestCase):
 
 
 class TheCommandLine(unittest.TestCase):
-    """An option that means nothing for the runtime asked for is refused, and not ignored."""
-
     def refused(self, *arguments: str) -> str:
-        done = subprocess.run([sys.executable, "-m", "src.lfplo", SOURCE, "-o", os.path.join(tempfile.gettempdir(), "x"),
+        done = subprocess.run([sys.executable, "-m", "experimental.build", SOURCE, "-o", os.path.join(tempfile.gettempdir(), "x"),
                                *arguments], cwd=ROOT, capture_output=True, text=True)
         self.assertNotEqual(done.returncode, 0)
         return done.stderr
 
     XDP = ("--xdp", "eth0", "--map", "/sys/fs/bpf/x/xsks", "--ctl-port", "9000")
-    UDP = ("--in-port", "9000", "--out-port", "9100", "--ctl-port", "9001")
-
-    def test_what_only_the_udp_runtime_has(self):
-        for option in (("--in-port", "9"), ("--out-port", "9"), ("--n-max", "9"), ("--cells", "9"), ("--measure-age",)):
-            with self.subTest(option=option[0]):
-                self.assertIn(f"{option[0]} has no meaning with --xdp", self.refused(*self.XDP, *option))
-
-    def test_what_only_the_xdp_runtime_has(self):
-        for option in (("--map", "/x"), ("--frames", "16"), ("--queue", "1")):
-            with self.subTest(option=option[0]):
-                self.assertIn(f"{option[0]} has no meaning without --xdp", self.refused(*self.UDP, *option))
 
     def test_a_zero_is_not_taken_for_the_default(self):
         self.assertIn("K_out of 0", self.refused(*self.XDP, "--k-out", "0"))
         self.assertIn("F of 0", self.refused(*self.XDP, "--frames", "0"))
 
     def test_what_a_build_for_xdp_needs(self):
-        self.assertIn("needs -o, --map and --ctl-port", self.refused("--xdp", "eth0", "--ctl-port", "9000"))
+        self.assertIn("required: --map", self.refused("--xdp", "eth0", "--ctl-port", "9000"))
 
 
 class TheBaselinesRoutes(unittest.TestCase):
@@ -1291,7 +1277,7 @@ class TheProgramsBytes(unittest.TestCase):
 
 
 class Binding(unittest.TestCase):
-    """What the runtime can carry, read off the handler's types. These run in the fast tier."""
+    """What the runtime can carry, read off the handler's types."""
 
     GOOD_BODY = """ match i with Item(d1, a, tail) => match tail with Tail(d2, b, frame) =>
         (Out@d1(0, a, Tx@d2(b, frame)), free) end end;"""

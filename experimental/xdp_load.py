@@ -1,7 +1,7 @@
 """Load the XDP program that hands frames to an AF_XDP socket, and pin its socket map.
 
-    sudo python3 tools/xdp_load.py attach IFNAME --pin DIR [--mode drv|skb] [--queues N]
-    sudo python3 tools/xdp_load.py detach IFNAME --pin DIR
+    sudo python3 experimental/xdp_load.py attach IFNAME --pin DIR [--mode drv|skb] [--queues N]
+    sudo python3 experimental/xdp_load.py detach IFNAME --pin DIR
 
 The program is five BPF instructions, written here as bytes, so no C compiler is on the path of the
 thing that ships. It looks up the frame's receive queue in a map of sockets and redirects the frame
@@ -92,7 +92,7 @@ def program_bytes(map_fd: int) -> bytes:
 
 
 def drop_program_bytes() -> bytes:
-    """r0 = XDP_DROP, and exit. tools/speed.py puts this on the port that frames return to, so that their
+    """r0 = XDP_DROP, and exit. experimental/speed.py puts this on the port that frames return to, so that their
     return costs the generator next to nothing, and the card has still counted them."""
     return _instruction(0xb7, dst=0, immediate=XDP_DROP) + _instruction(0x95)
 

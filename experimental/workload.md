@@ -4,8 +4,8 @@ This is the fixed workload of every measurement from now on. It is what a router
 down to where nothing in it is a matter of taste, so that a number measured today can be compared with
 a number measured a year from now, and one forwarder's with another's.
 
-`baseline/ipv4_forward.c` and `examples/ipv4.lfpl` both do this, and `tests/ipv4_model.py` is a third
-statement of it, in Python, that shares nothing with either. `tests/test_ipv4.py` holds all three to each
+`experimental/ipv4_forward.c` and `experimental/ipv4.lfpl` both do this, and `experimental/ipv4_model.py` is a third
+statement of it, in Python, that shares nothing with either. `experimental/test_ipv4.py` holds all three to each
 other, frame by frame.
 
 ## What happens to a frame
@@ -36,7 +36,7 @@ Then the frame is forwarded, without moving it:
 
 ## The table, and matching in its place
 
-The table is what the C baseline does with `--routes`. `examples/ipv4.lfpl` does not have one yet, and
+The table is what the C baseline does with `--routes`. `experimental/ipv4.lfpl` does not have one yet, and
 chooses by the top two bits of the destination's first octet: below 64 is hop 0, below 128 hop 1, below
 192 hop 2, and the rest hop 3. The baseline's `--match` swaps its table for exactly that, which is the
 only way the two can be compared on the same frames. Read-only arrays with `get` already work in LFPL-O,
@@ -46,19 +46,19 @@ LFPL-O and C is without the table, and the baseline's rate with the table says w
 ## The shape of the comparison
 
 Both forwarders run on one core, with 4096 frames of 2048 bytes, rings of 4096 entries, a transmit ring
-of 2048, batches of 64, and the same XDP program, loaded by `tools/xdp_load.py`.
+of 2048, batches of 64, and the same XDP program, loaded by `experimental/xdp_load.py`.
 
 Sizes are of the whole frame on the wire, with its 4-byte frame check sequence, so a 64-byte frame is the
 60 bytes a driver handles and pktgen is told about.
 
 ## Speed
 
-`tools/speed.py` is the only thing in this repository that reports a rate, and it refuses to on a virtual
+`experimental/speed.py` is the only thing in this repository that reports a rate, and it refuses to on a virtual
 pair. No such rate exists yet, because the card has not arrived. When it does, with two ports cabled to
 each other and a driver with native XDP:
 
 ```
-sudo python3 tools/speed.py --generator PORT_A --forwarder PORT_B
+sudo python3 experimental/speed.py --generator PORT_A --forwarder PORT_B
 ```
 
 This moves the first port into a namespace and runs pktgen from it, and runs each forwarder on the second
