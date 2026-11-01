@@ -74,6 +74,8 @@ class GeneratedHandlers(unittest.TestCase):
         except subprocess.CalledProcessError as failure:
             self.assertTrue(any(reason in failure.stderr for reason in DECLARED),
                             f"seed {seed}: {failure.stderr}\n{handler.text()}")
+            # These do not recurse, so a bound always exists, whatever section 8.2 allows elsewhere.
+            self.assertNotIn("no linear bound", failure.stderr, f"seed {seed}\n{handler.text()}")
             return False
         try:
             interpreter = handler.interp()

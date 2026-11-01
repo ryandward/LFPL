@@ -86,8 +86,7 @@ fn first(l: Bytes) : (Int8, Bytes) = match l with
   end;
 fn choose(l: Bytes) : Bytes =
   let (k, m) = first(l) in
-  let (x, y) = split(m, Last, Last) in
-  let j = if ==(&(k, 1), 0) then rev(x, y) else rev(y, x) in
+  let j = if ==(&(k, 1), 0) then m else rev(m, Last) in
   rev(j, Last);
 fn touch(l: Bytes) : Bytes = match l with
   | Last => Last
@@ -176,13 +175,7 @@ def model_dear(cells: list) -> list:
 
 
 def model_choose(cells: list) -> list:
-    k = cells[0][1] if cells else 0
-    x: list = []
-    y: list = []
-    for cell in cells:
-        x, y = y, [cell] + x
-    joined = x[::-1] + y if k % 2 == 0 else y[::-1] + x
-    return joined[::-1]
+    return list(cells) if cells and cells[0][1] & 1 else cells[::-1]
 
 
 def model_touch(cells: list) -> list:
@@ -292,9 +285,9 @@ class TheModels(unittest.TestCase):
         self.assertEqual(model_incr([a, b]), [(1, 3, *bytes(6)), (1, 4, *bytes(6))])
         # b1 and b2 are zero, so both ifs take their first arm: 2 + 6 = 8, and mix(8) = 15 ^ 85.
         self.assertEqual(model_dear([a]), [(1, 15 ^ 85, *bytes(6))])
-        # split makes x = [a], y = [b]. a's first byte is even, so x goes onto y to make [a, b],
-        # and the last reversal gives b, a.
+        # a's first byte is even, so it is reversed once. b's is odd, so it is reversed twice.
         self.assertEqual(model_choose([a, b]), [b, a])
+        self.assertEqual(model_choose([b, a]), [b, a])
         self.assertEqual(model_marks([a, b]), [a, (1, 4, *bytes(6))])
 
     def test_weave_alternates_and_finishes_the_longer_side_reversed(self):
@@ -306,6 +299,17 @@ class TheModels(unittest.TestCase):
         # split makes x = [b], y = [c, a]. weave moves b and then c, and x is empty, so what is
         # left of y goes on the accumulator: that is a, in front.
         self.assertEqual(model_weave([a, b, c]), [a, c, b])
+
+
+def payload_of(length: int, fill: str, rng: random.Random) -> bytes:
+    """Random bytes take every `if` both ways, so the cheap arms' slack pays for the dear arms' in
+    the total, and a bound that only covers the average passes. Zeros and ones take one way all the
+    way along, which is what shows it."""
+    if fill == "zeros":
+        return bytes(length)
+    if fill == "ones":
+        return b"\xff" * length
+    return bytes(rng.randrange(256) for _ in range(length))
 
 
 class RandomWalks(unittest.TestCase):
@@ -326,7 +330,11 @@ class RandomWalks(unittest.TestCase):
             before = router.stats()
             share = 0.0
             for number in range(1, DATAGRAMS + 1):
-                payload = bytes(rng.randrange(256) for _ in range(rng.choice((0, 1, 7, 8, 30, longest))))
+                if number <= 3:
+                    payload = payload_of(longest, ("zeros", "ones", "random")[number - 1], rng)
+                else:
+                    payload = payload_of(rng.choice((0, 1, 7, 8, 30, longest)),
+                                         rng.choice(("zeros", "ones", "random", "random")), rng)
                 cells = cells_of(payload)
                 n = 1 + len(cells)
                 for name in names:
@@ -351,8 +359,9 @@ class RandomWalks(unittest.TestCase):
             router.close()
 
     def test_every_pipeline_is_accepted_correct_and_inside_its_bound(self):
-        """And the bound is worth having: a pipeline that drops no cells on the way spends nearly
-        all of W(n) on a long item. One that does was charged for cells it let go of."""
+        """And the bound is worth having: a pipeline that keeps its cells and has one way through
+        for some long item spends nearly all of W(n) on it. One that lets go of cells on the way was
+        charged for them anyway."""
         loosest_exact = loosest = 1.0
         for seed in range(1000 * SEED, 1000 * SEED + COUNT):
             rng = random.Random(seed)
@@ -360,7 +369,7 @@ class RandomWalks(unittest.TestCase):
             with tempfile.TemporaryDirectory() as workdir:
                 share = self._serve(names, workdir, rng, seed)
             loosest = min(loosest, share)
-            if not {"thin", "bump", "marks", "dear"} & set(names):
+            if not {"thin", "marks", "choose"} & set(names):
                 loosest_exact = min(loosest_exact, share)
         print(f"walking handlers: {COUNT} ran; the loosest W(n) was {loosest:.0%} used, "
               f"and {loosest_exact:.0%} among those with one path", file=sys.stderr)
@@ -368,26 +377,41 @@ class RandomWalks(unittest.TestCase):
         self.assertGreater(loosest, 0.25, "the bound is true and useless")
 
 
-class WhatAFieldCarries(unittest.TestCase):
-    """A value carries one amount per cell, all the way down. So a cell rebuilt in front of a chain
-    it leaves where it is can only claim what that chain already has."""
+class TheDearestWayThrough(unittest.TestCase):
+    """Pipelines chosen so that one mistaken rule is what the bound comes down to, each timed on the
+    payload that takes its dearest path along the whole of a long item."""
 
-    def test_a_walk_past_a_rebuilt_cell_is_paid_for_by_the_cells_behind_it(self):
+    def assert_covered(self, names: list, payload: bytes) -> None:
         with tempfile.TemporaryDirectory() as workdir:
             path = os.path.join(workdir, "walk.lfpl")
             with open(path, "w") as handle:
-                handle.write(pipeline_text(["touch", "rev"]))
+                handle.write(pipeline_text(names))
             router = Forwarder(bytes(1024), workdir, build_options=("--count-steps",), source=path)
             try:
                 _, (c, d) = bounds_in(router.report)
                 before = router.stats()
-                router.raw(bytes((PORT,)) + b"x" * 700)
-                self.assertEqual(len(router.outputs[PORT].recv(4096)), 700)
+                router.raw(bytes((PORT,)) + payload)
+                cells = cells_of(payload)
+                for name in names:
+                    cells = STEPS[name][1](cells)
+                self.assertEqual(router.outputs[PORT].recv(4096), wire_of(cells))
                 ran = router.settle(1)["steps"] - before["steps"]
             finally:
                 router.close()
-        self.assertGreater(c, 0, "nothing was charged for the walk")
-        self.assertLessEqual(ran, c * 101 + d)
+        self.assertLessEqual(ran, c * (1 + len(cells_of(payload))) + d, f"{names}, {router.report}")
+
+    def test_a_rebuilt_cell_can_only_claim_what_the_chain_it_leaves_in_place_has(self):
+        self.assert_covered(["touch", "rev"], b"x" * 700)
+
+    def test_a_join_leaves_what_its_dearest_edge_left(self):
+        self.assert_covered(["dear"], bytes(700))
+
+    def test_a_value_out_of_a_join_carries_what_every_edge_vouches_for(self):
+        """An odd first byte is the arm whose value came from a walk, with a walk still to come."""
+        self.assert_covered(["choose"], b"\xff" * 700)
+
+    def test_the_arm_with_the_mixes_in_it(self):
+        self.assert_covered(["bump"], b"\xff" * 700)
 
 
 class OneFunctionAtSeveralAmounts(unittest.TestCase):

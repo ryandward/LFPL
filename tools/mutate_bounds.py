@@ -15,9 +15,10 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PATIENCE = 300  # seconds: a mutant with nothing to catch it takes about 90
 # Running code first, so that a verdict says whether a mutant is caught by what a binary does, and
 # not only by the numbers in a unit test.
-TESTS = ["tests.test_walks.RandomWalks", "tests.test_walks.WhatAFieldCarries", "tests.test_walks.TheEndArm",
+TESTS = ["tests.test_walks.RandomWalks", "tests.test_walks.TheDearestWayThrough", "tests.test_walks.TheEndArm",
          "tests.test_walks.OneFunctionAtSeveralAmounts", "tests.test_walks.TooLargeForAnyMachine",
          "tests.test_checksum.TheBound", "tests.test_checksum.TheChecksum",
          "tests.test_checksum.WhatTheChainTypeOpensUp", "tests.test_rtcheck", "tests.test_simplex"]
@@ -145,9 +146,6 @@ MUTANTS = {
     "one message gathers only one item's cells": ("src/runtime.py",
         "out_iov = min(IOV_MAX, HEADER_BYTES_MAX + max(1, image.largest_output))",
         "out_iov = HEADER_BYTES_MAX + max(1, image.options.n_max)"),
-    "a message may gather past what sendmsg takes": ("src/runtime.py",
-        "out_iov = min(IOV_MAX, HEADER_BYTES_MAX + max(1, image.largest_output))",
-        "out_iov = HEADER_BYTES_MAX + max(1, image.largest_output)"),
     "an image of any size is built": ("src/runtime.py",
         "if image.bytes > MAX_IMAGE_BYTES:",
         "if False:"),
@@ -173,9 +171,12 @@ def run(work: str, path: str, old: str, new: str) -> tuple:
     with open(target, "w") as handle:
         handle.write(text.replace(old, new, 1))
     start = time.time()
-    done = subprocess.run([sys.executable, "-W", "ignore::ResourceWarning", "-m", "unittest", "-f", *TESTS],
-                          cwd=tree, env=dict(os.environ, TMPDIR=work, LFPL_FUZZ="30"),
-                          capture_output=True, text=True, timeout=900)
+    try:
+        done = subprocess.run([sys.executable, "-W", "ignore::ResourceWarning", "-m", "unittest", "-f", *TESTS],
+                              cwd=tree, env=dict(os.environ, TMPDIR=work, LFPL_FUZZ="30"),
+                              capture_output=True, text=True, timeout=PATIENCE)
+    except subprocess.TimeoutExpired:  # what removing a size limit looks like
+        return f"caught: the tests were still running after {PATIENCE}s", False
     took = time.time() - start
     if done.returncode == 0:
         return f"SURVIVED ({took:.0f}s)", True

@@ -271,7 +271,7 @@ exactly one. `tests/test_walks.py` pins each of those, and this rule does not re
 
 The certificate is the solver's numbers. `src/simplex.py` shares nothing with this pass, and
 `Checker.verify` evaluates each row with what it proposes, in exact fractions, so a wrong solver
-can only cost a refusal. An `--count-steps` build adds one to a counter at each working instruction,
+can only cost a refusal. A `--count-steps` build adds one to a counter at each working instruction,
 the same list this pass charges for, so that tests can hold running code to the W(n) it was given.
 
 ## Phantom construction

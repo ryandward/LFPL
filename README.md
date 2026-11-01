@@ -188,18 +188,16 @@ Declaring `Bytes` with the layout the runtime builds, where the forwarder left i
 lets the program read it. A linear program cannot read a chain and also keep it, so `add` takes
 the chain apart as it goes, moving each cell onto an accumulator, and `reverse` moves them all back.
 Nothing is copied and nothing is drawn from the reserve: only the link in each cell changes, and
-the sum replaces the old one in the same header cell. Now the report has the item's size in it,
-where `n` is the number of cells the item takes:
+the sum replaces the old one in the same header cell. A datagram is `[port][any two bytes][payload]`,
+and it leaves for port `9100 + port` as `[checksum][payload]`. Now the report has the item's size in
+it, where `n` is the number of cells the item takes:
 
 ```
-python3 -m src.lfplo examples/checksum.lfpl -o checksum --in-port 9000 --out-port 9100 --ctl-port 9001
+$ python3 -m src.lfplo examples/checksum.lfpl -o checksum --in-port 9000 --out-port 9100 --ctl-port 9001
 handler checksum: R(n) = 0 cells, W(n) = 28 n + 4 steps, stack 24 bytes, 14256 cells, image 232192 bytes
 ```
 
-A datagram is `[port][any two bytes][payload]`, and it leaves for port `9100 + port` as
-`[checksum][payload]`.
-
-That is the potential method of Hofmann and Jost. Imagine every cell of a value carrying some
+That bound comes from the potential method of Hofmann and Jost. Imagine every cell of a value carrying some
 amount of credit, the same unknown amount for each cell. Opening a cell releases its credit. Each
 instruction spends some, and building a value has to set aside the new cell's share out of what is
 in hand. So a walk has to pay for each iteration out of the one cell that iteration opened, and
@@ -432,8 +430,8 @@ still, on loopback where sends never block, none of the rest could be shown.
 Two limits come from the bound's own arithmetic. A handler's linear program stops at 1,024
 inequalities, and because each call gets its own copy of what it calls, those multiply with the depth
 of the call graph, so a deep program can be refused for that even though a bound exists. And a
-`Free` cannot be walked: rule R3 does not count one, which is what makes the arm for running out
-unreachable, and that means a program cannot hold two.
+program cannot keep a free list of its own: rule R3 does not count a `Free`, so nothing could ever
+get rid of a second one, which is why the arm for running out cannot be reached.
 
 Two parts deserve less trust than the rest. The runtime in `src/runtime.py` is assembly that no
 check reads, which section 11.3 of the specification accepts on the grounds that it is small and
