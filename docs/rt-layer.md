@@ -195,7 +195,11 @@ partial result is ever special. All the failures Phase 1 reports about registers
                            be read from the wrong home after the join.
     call                   one parallel move covering the arguments and the evacuation of
                            every live value in the callee's clobber set; call; result in rax
-    tail, tailmod          parallel move to the parameter registers; jmp
+    tail                   parallel move to the parameter registers; jmp
+    tailmod                one parallel move covering the fields and the parameter registers;
+                           jmp. The rule's order is about tokens, not emission: an operand in
+                           the cell must be read before any store lands, and the cell's pointer
+                           must last until the last store through it
     ret                    mov rax, s; ret. In an `@k` function, the entry word saved at the
                            prologue goes in rax instead.
 
