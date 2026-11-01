@@ -1009,10 +1009,10 @@ class FunctionCheck:
     def _below(self, cond: int, leaf: int, bound: int) -> bool:
         """On every path through cond, is leaf known to be below bound?"""
         T = self.T
+        if cond == T.ZERO:  # this path never reaches the shift, whatever the count is
+            return True
         if T.is_const(leaf):
             return T.value(leaf) < bound
-        if cond == T.ZERO:
-            return True
         atom = T.top(cond)
         if atom == NO_ATOM:
             return False

@@ -1548,6 +1548,13 @@ class TotalShifts(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(check_translation(source, compile_text(source)), [])
 
+    def test_a_constant_count_the_guard_sends_around_the_shift_is_no_problem(self):
+        """Found by the fuzzer, as a false alarm: on the path where the count is that
+        constant, the comparison has already jumped, so the shift is never reached."""
+        source = (b"fn f(a: Int64, b: Int64) : Int64 = "
+                  b">>(a, if ==(a, b) then 9223372036854775807 else b);\n")
+        self.assertEqual(check_translation(source, compile_text(source)), [])
+
     def test_the_symbolic_check_sees_the_hardware_mask(self):
         """`shl rax, 70` assembles without a warning and shifts by 6."""
         source = b"fn f(a: Int64) : Int64 = <<(a, 70);\n"

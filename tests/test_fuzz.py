@@ -126,8 +126,12 @@ class Scalars:
                 right_text = str(count)
             else:
                 right_text, count = self.value(depth - 1, env)
-            shifted = left << count if op == "<<" else left >> count
-            result = shifted & self.mask if count < self.bits else 0
+            if count >= self.bits:
+                result = 0
+            elif op == "<<":
+                result = (left << count) & self.mask
+            else:
+                result = left >> count
             return f"{op}({left_text}, {right_text})", result
         right_text, right = self.value(depth - 1, env)
         table = {"+": left + right, "-": left - right, "*": left * right,
