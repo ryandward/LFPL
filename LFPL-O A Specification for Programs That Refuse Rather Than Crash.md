@@ -734,9 +734,9 @@ The compiler and the LP solver are deliberately not on this list. A wrong output
 
 ## 12. Status against the repository
 
-The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and serves UDP sockets on the loopback address, through the whole of the pipeline below except the parts this table marks as missing. This is `ryandward/LFPL` main at commit `f827822`, where all 297 tests pass with Python 3.14.8.
+The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and serves UDP sockets on the loopback address, and `examples/checksum.lfpl` walks its item under a certified bound, through the whole of the pipeline below except the parts this table marks as missing. This is `ryandward/LFPL` main at commit `60562d5`, where all 369 tests pass with Python 3.14.8.
 
-| Requirement | Status at `f827822` | Needed |
+| Requirement | Status at `60562d5` | Needed |
 | --- | --- | --- |
 | exactly-once linear typing | present in Check, and repeated one level down by `src/rtcheck.py` | nothing |
 | exhaustive matching | present | nothing |
@@ -750,7 +750,7 @@ The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and 
 | stack in the image | present: S_max comes from the call graph, the stack is in the image with a guard page below it, and the depth is recomputed from the assembly | nothing |
 | startup: lock, prefault, signals | present. Each step that can fail exits with its own number, before any input. | nothing |
 | register-transfer layer | present: `src/rtlower.py`, `src/rtcheck.py` and `src/x86.py`, and every Phase 1 generator passes through it | move `tests/test_invariants.py` over, so that `src/lower.py` can go |
-| two-pass compilation | **absent**. A scalar read after its cell was rebuilt or handed over is refused, and it stops about one generated program in six. | section 8.1 |
+| two-pass compilation | **absent**. A scalar read after its cell was rebuilt or handed over is refused, and it stops 12 of the 60 generated programs the test suite runs. | section 8.1 |
 | translation validation | present on every build: a failure in `src/symcheck.py` leaves no binary. It covers the handler and its helpers, and it does not read the runtime. | admission |
 | identity-morphism validator | present, but **only in the test suite**: `src/lfplo.py` does not run it, so a build does not yet make the fourth check of section 8.4 | run it on every build |
 | heap-flatness test | present, on both compilers, and it holds when run on its own | nothing |
