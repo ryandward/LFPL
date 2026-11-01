@@ -5,7 +5,11 @@ mutant that survives is a claim in the README that nothing is testing, so this e
 if any does. It takes a long time, so it is not part of the test suite: run it after changing
 src/rtcheck.py, src/simplex.py or the admission code in src/runtime.py.
 
+The forwarder's mutants are caught by tests that put an XDP program on a virtual pair, so they need root,
+and without it they are reported as not run, and not as caught:
+
     python3 tools/mutate_bounds.py [name of a mutant...]
+    sudo env PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 python3 tools/mutate_bounds.py --forwarder
 """
 import os
 import shutil
@@ -21,6 +25,10 @@ RUNTIME_TESTS = ["tests.test_forward.WhatTheRuntimeDoesWithIt", "tests.test_forw
 VERILOG_TESTS = ["tests.test_rtverilog.TheEmittersOwnArithmetic", "tests.test_rtverilog.TheChecksum",
                  "tests.test_rtverilog.RandomWalks", "tests.test_rtverilog.OtherHandlers",
                  "tests.test_rtverilog.Synthesis"]
+FORWARDER_TESTS = ["tests.test_ipv4.TheTwoAgree", "tests.test_ipv4.TheRings", "tests.test_ipv4.OtherHandlers",
+                   "tests.test_ipv4.WhatItCosts", "tests.test_ipv4.RefusalsAtStartup", "tests.test_ipv4.TheLoader",
+                   "tests.test_ipv4.TheTable", "tests.test_ipv4.WithoutRoot", "tests.test_ipv4.Binding",
+                   "tests.test_ipv4.TheProgramsBytes"]
 # Running code first, so that a verdict says whether a mutant is caught by what a binary does, and
 # not only by the numbers in a unit test.
 TESTS = ["tests.test_walks.RandomWalks", "tests.test_walks.TheDearestWayThrough", "tests.test_walks.TheEndArm",
@@ -256,6 +264,155 @@ MUTANTS = {
     "a linear program of any size is solved": ("src/rtcheck.py",
         "if len(fn.obligations) > MAX_OBLIGATIONS:",
         "if False:"),
+    # --- the AF_XDP runtime
+    "xdp: a frame too short to read is admitted": ("src/runtime_xdp.py",
+        'add(f"    cmp ecx, {item.header_bytes}")\n    add("    jb .malformed")', 'pass', FORWARDER_TESTS),
+    "xdp: a full ring is not a refusal": ("src/runtime_xdp.py",
+        'add("    jae .full")', 'pass', FORWARDER_TESTS),
+    "xdp: a refusal loses its frame": ("src/runtime_xdp.py",
+        'add("    mov [rsi+rcx*8], rax")\n    add("    inc edx")', 'pass', FORWARDER_TESTS),
+    "xdp: what was sent does not go back on fill": ("src/runtime_xdp.py",
+        'add("    mov [r9+rdi*8], rsi")\n    add("    inc ecx")\n    add("    inc r10d")',
+        'add("    inc ecx")', FORWARDER_TESTS),
+    "xdp: the kernel is not told it has rx entries back": ("src/runtime_xdp.py",
+        'add("    mov rax, [rx_cons_at]")\n    add("    mov edx, [rx_cons]")\n    add("    mov [rax], edx")',
+        'pass', FORWARDER_TESTS),
+    "xdp: fill is not published after a batch": ("src/runtime_xdp.py",
+        'add("    mov rax, [fill_prod_at]")\n    add("    mov edx, [fill_prod]")\n    add("    mov [rax], edx")\n    add("    call flush_tx")',
+        'add("    call flush_tx")', FORWARDER_TESTS),
+    "xdp: tx is not published": ("src/runtime_xdp.py",
+        'add("    mov rax, [tx_prod_at]")\n    add("    mov edx, [tx_prod]")\n    add("    mov [rax], edx")\n    add("    mov rax, [tx_flags_at]")',
+        'add("    mov edx, [tx_prod]")\n    add("    mov rax, [tx_flags_at]")', FORWARDER_TESTS),
+    "xdp: the kernel is never woken": ("src/runtime_xdp.py",
+        f'add(f"    test dword [rax], {{XDP_RING_NEED_WAKEUP}}")\n    add("    jz .done")', 'add("    jmp .done")', FORWARDER_TESTS),
+    "xdp: egress leaves its cells out of the pool": ("src/runtime_xdp.py",
+        'add(f"    add qword [pool_count], {output.cells}")', 'pass', FORWARDER_TESTS),
+    "xdp: egress loses a cell": ("src/runtime_xdp.py",
+        'add("    mov [pool], rax")\n    add(f"    add qword [pool_count]',
+        'add("    mov rax, [rax]")\n    add("    mov [pool], rax")\n    add(f"    add qword [pool_count]', FORWARDER_TESTS),
+    "xdp: the output's fields are not written back": ("src/runtime_xdp.py",
+        "_free_cells(add, ctor, True)", "_free_cells(add, ctor, False)", FORWARDER_TESTS),
+    "xdp: a field goes back one byte along": ("src/runtime_xdp.py",
+        "writes.append(Scalar(name, cell, off, size, source.wire))",
+        "writes.append(Scalar(name, cell, off, size, source.wire + 1))", FORWARDER_TESTS),
+    "xdp: a frame leaves with the wrong length": ("src/runtime_xdp.py",
+        'add("    shr rbx, 32")', 'add("    shr rbx, 33")', FORWARDER_TESTS),
+    "xdp: the frame's length is not given to the program": ("src/runtime_xdp.py",
+        'add(f"    mov [rax+{item.length[1]}], cx")', 'pass', FORWARDER_TESTS),
+    "xdp: a gap in the cell is copied across": ("src/runtime_xdp.py",
+        'if runs and runs[-1][0] + runs[-1][2] == scalar.wire and runs[-1][1] + runs[-1][2] == scalar.offset:',
+        'if runs and runs[-1][0] + runs[-1][2] == scalar.wire:', FORWARDER_TESTS),
+    "xdp: length counts as a wire field": ("src/runtime_xdp.py",
+        'length = (cell, off)\n            continue', 'length = (cell, off)', FORWARDER_TESTS),
+    "xdp: P does not pause": ("src/runtime_xdp.py",
+        'add("    mov qword [egress_paused], 1")', 'pass', FORWARDER_TESTS),
+    "xdp: R does not resume": ("src/runtime_xdp.py",
+        'add("    cmp al, 82")\n    add("    jne .answer")\n    add("    mov qword [egress_paused], 0")',
+        'pass', FORWARDER_TESTS),
+    "xdp: Q leaves what is queued": ("src/runtime_xdp.py",
+        'add("    mov qword [egress_paused], 0")\n    add(f"    mov qword [patience], {QUIT_PATIENCE}")',
+        'add("    jmp .leave")\n    add(f"    mov qword [patience], {QUIT_PATIENCE}")', FORWARDER_TESTS),
+    "xdp: a bad port is sent anyway": ("src/runtime_xdp.py",
+        'add(f"    jne .bad_port_{position}")', 'pass', FORWARDER_TESTS),
+    "xdp: the pool is not counted when asked": ("src/runtime_xdp.py",
+        'add("    mov [cnt_pool], rcx")', 'pass', FORWARDER_TESTS),
+    "xdp: what the kernel dropped is not asked for": ("src/runtime_xdp.py",
+        'add("    mov [cnt_kernel_dropped], rax")', 'pass', FORWARDER_TESTS),
+    "xdp: the reserve is not handed to the program": ("src/runtime_xdp.py",
+        'add(f"    mov {PARAMS[k + 1]}, r13")', 'add(f"    xor {PARAMS[k + 1]}, {PARAMS[k + 1]}")', FORWARDER_TESTS),
+    "xdp: the image is sized without the reserve": ("src/runtime_xdp.py",
+        "return self.item.cells + self.reserve\n", "return self.item.cells\n", FORWARDER_TESTS),
+    "xdp: what is left of the reserve does not come back": ("src/runtime_xdp.py",
+        'add("    test r13, r13")\n    add("    jz .given_back")', 'add("    jmp .given_back")', FORWARDER_TESTS),
+    "xdp: state does not come back": ("src/runtime_xdp.py",
+        'add(f"    mov [state_{position}], {RESULTS[position]}")', 'pass', FORWARDER_TESTS),
+    "xdp: a constructor without a frame is bound": ("src/runtime_xdp.py",
+        'if frame is None:\n        raise BindingError', 'if False:\n        raise BindingError', FORWARDER_TESTS),
+    "xdp: an output may write what the item lacks": ("src/runtime_xdp.py",
+        'if source is None:', 'if source is None:\n            continue\n        if False:', FORWARDER_TESTS),
+    "xdp: a missing map is not a refusal": ("src/runtime_xdp.py",
+        'syscall(321, "js .refuse_map", str(BPF_OBJ_GET), "obj_attr", "24")',
+        'syscall(321, "", str(BPF_OBJ_GET), "obj_attr", "24")', FORWARDER_TESTS),
+    "xdp: the socket is not put in the map": ("src/runtime_xdp.py",
+        'syscall(321, "jnz .refuse_map", str(BPF_MAP_UPDATE_ELEM), "update_attr", "32")', 'pass', FORWARDER_TESTS),
+    "xdp: the packet memory is outside what startup touches": ("src/runtime_xdp.py",
+        'add(f"umem: resb {frames * CHUNK}")\n    add(f"bss_end_page: resb {PAGE}")\n    add("bss_end:")',
+        'add(f"bss_end_page: resb {PAGE}")\n    add("bss_end:")\n    add(f"umem: resb {frames * CHUNK}")', FORWARDER_TESTS),
+    # --- the loader
+    "xdp: what no socket wants is dropped": ("tools/xdp_load.py",
+        "XDP_PASS = 2", "XDP_PASS = 1", FORWARDER_TESTS),
+    "xdp: the program reads the wrong field for the queue": ("tools/xdp_load.py",
+        "RX_QUEUE_INDEX = 16", "RX_QUEUE_INDEX = 12", FORWARDER_TESTS),
+    # --- the handler
+    "ipv4: a TTL of 1 is forwarded": ("examples/ipv4.lfpl", "if <=(ttl, 1) then", "if <(ttl, 1) then", FORWARDER_TESTS),
+    "ipv4: a TTL of 2 is refused": ("examples/ipv4.lfpl", "if <=(ttl, 1) then", "if <=(ttl, 2) then", FORWARDER_TESTS),
+    "ipv4: the ethertype is not checked": ("examples/ipv4.lfpl",
+        "if !=(ethertype, 8) then false            # 08 00 on the wire\n  else if", "if", FORWARDER_TESTS),
+    "ipv4: the ethertype is read the other way round": ("examples/ipv4.lfpl",
+        "if !=(ethertype, 8) then", "if !=(ethertype, 2048) then", FORWARDER_TESTS),
+    "ipv4: only the version is checked": ("examples/ipv4.lfpl",
+        "else if !=(version, 69) then false", "else if !=(&(version, 240), 64) then false", FORWARDER_TESTS),
+    "ipv4: only the header length is checked": ("examples/ipv4.lfpl",
+        "else if !=(version, 69) then false", "else if !=(&(version, 15), 5) then false", FORWARDER_TESTS),
+    "ipv4: a total of 19 passes": ("examples/ipv4.lfpl", "else if <(total, 20) then false", "else if <(total, 19) then false", FORWARDER_TESTS),
+    "ipv4: a total of 20 is refused": ("examples/ipv4.lfpl", "else if <(total, 20) then false", "else if <=(total, 20) then false", FORWARDER_TESTS),
+    "ipv4: a total past the frame passes": ("examples/ipv4.lfpl",
+        "else if >(+(total, 14), pack<16>(length)) then false", "else if >(+(total, 13), pack<16>(length)) then false", FORWARDER_TESTS),
+    "ipv4: a total of exactly the frame is refused": ("examples/ipv4.lfpl",
+        "else if >(+(total, 14), pack<16>(length)) then false", "else if >=(+(total, 14), pack<16>(length)) then false", FORWARDER_TESTS),
+    "ipv4: the total is read with its bytes swapped": ("examples/ipv4.lfpl",
+        "pack<8,8>(low8(total), low8(>>(total, 8)))", "pack<8,8>(low8(>>(total, 8)), low8(total))", FORWARDER_TESTS),
+    "ipv4: the checksum is not checked": ("examples/ipv4.lfpl",
+        "else ==(fold(fold(sum)), 65535);", "else true;", FORWARDER_TESTS),
+    "ipv4: the check folds once": ("examples/ipv4.lfpl",
+        "else ==(fold(fold(sum)), 65535);", "else ==(fold(sum), 65535);", FORWARDER_TESTS),
+    "ipv4: a word is left out of the sum": ("examples/ipv4.lfpl",
+        "+(pack<16>(total), +(pack<16>(id),", "+(pack<16>(total), +(0,", FORWARDER_TESTS),
+    "ipv4: the TTL goes down by 2": ("examples/ipv4.lfpl", "-(ttl, 1), 2,", "-(ttl, 2), 2,", FORWARDER_TESTS),
+    "ipv4: the checksum is not patched": ("examples/ipv4.lfpl",
+        "Tx2@d3(fresh_sum, frame)", "Tx2@d3(sum, frame)", FORWARDER_TESTS),
+    "ipv4: the update leaves out the new word": ("examples/ipv4.lfpl",
+        "+(^(m, 65535), -(m, 1))", "+(^(m, 65535), m)", FORWARDER_TESTS),
+    "ipv4: the update does not fold": ("examples/ipv4.lfpl",
+        "low16(^(fold(+(^(pack<16>(sum), 65535), +(^(m, 65535), -(m, 1)))), 65535))",
+        "low16(^(+(^(pack<16>(sum), 65535), +(^(m, 65535), -(m, 1))), 65535))", FORWARDER_TESTS),
+    "ipv4: the update is RFC 1141's": ("examples/ipv4.lfpl",
+        "low16(^(fold(+(^(pack<16>(sum), 65535), +(^(m, 65535), -(m, 1)))), 65535))",
+        "low16(fold(+(pack<16>(sum), 1)))", FORWARDER_TESTS),
+    "ipv4: the boundary at 64 is off by one": ("examples/ipv4.lfpl", "if <(first, 64) then 0", "if <=(first, 64) then 0", FORWARDER_TESTS),
+    "ipv4: the boundary at 128 is off by one": ("examples/ipv4.lfpl", "if <(first, 128) then 1", "if <=(first, 128) then 1", FORWARDER_TESTS),
+    "ipv4: the boundary at 192 is off by one": ("examples/ipv4.lfpl", "if <(first, 192) then 2", "if <=(first, 192) then 2", FORWARDER_TESTS),
+    "ipv4: the hop comes from the wrong byte": ("examples/ipv4.lfpl",
+        "next_hop(low8(dst_hi))", "next_hop(low8(>>(dst_hi, 8)))", FORWARDER_TESTS),
+    "ipv4: the destination MAC is one off": ("examples/ipv4.lfpl", "low16(<<(mac_end, 8))", "low16(<<(+(mac_end, 1), 8))", FORWARDER_TESTS),
+    "ipv4: the source MAC loses its 1": ("examples/ipv4.lfpl", "+(<<(mac_end, 24), 65536)", "<<(mac_end, 24)", FORWARDER_TESTS),
+    "ipv4: an expired frame is called malformed": ("examples/ipv4.lfpl",
+        "(Expired@d1(frame), More@d2", "(Malformed@d1(frame), More@d2", FORWARDER_TESTS),
+    # --- the baseline, which is an oracle only if it is right
+    "c: a TTL of 1 is forwarded": ("baseline/ipv4_forward.c", "if (ttl <= 1)", "if (ttl < 1)", FORWARDER_TESTS),
+    "c: a frame too short to read is read": ("baseline/ipv4_forward.c",
+        "    if (length < HEADER_BYTES)\n        return MALFORMED;\n", "", FORWARDER_TESTS),
+    "c: the ethertype is not checked": ("baseline/ipv4_forward.c",
+        "    if (read16(frame + 12) != ETHERTYPE_IPV4_LE)\n        return MALFORMED;\n", "", FORWARDER_TESTS),
+    "c: the version byte is not checked": ("baseline/ipv4_forward.c",
+        "    if (ip[0] != VERSION_AND_LENGTH)\n        return MALFORMED;\n", "", FORWARDER_TESTS),
+    "c: a total past the frame passes": ("baseline/ipv4_forward.c", "total > length - 14", "total > length - 13", FORWARDER_TESTS),
+    "c: the checksum is not checked": ("baseline/ipv4_forward.c",
+        "    if (fold(fold(sum)) != 0xFFFF)\n        return MALFORMED;\n", "", FORWARDER_TESTS),
+    "c: the checksum is not patched": ("baseline/ipv4_forward.c", "    memcpy(frame + 24, &checksum, 2);\n", "", FORWARDER_TESTS),
+    "c: the MACs are not rewritten": ("baseline/ipv4_forward.c", "    memcpy(frame, hop_macs[hop], 12);\n", "", FORWARDER_TESTS),
+    "c: routes are not sorted": ("baseline/ipv4_forward.c",
+        "    qsort(routes, used, sizeof routes[0], compare_length);\n", "", FORWARDER_TESTS),
+    "c: a new second level starts empty": ("baseline/ipv4_forward.c",
+        "        for (uint32_t i = 0; i < TBL8_GROUP; i++)\n            tbl8[group * TBL8_GROUP + i] = tbl24[top];\n", "", FORWARDER_TESTS),
+    "c: the second level is not looked at": ("baseline/ipv4_forward.c",
+        "    if (entry & TBL8_FLAG)\n        entry = tbl8[(entry & ~TBL8_FLAG) * TBL8_GROUP + destination[3]];\n",
+        "    if (entry & TBL8_FLAG)\n        entry = 0;\n", FORWARDER_TESTS),
+    "c: a /24 spills over": ("baseline/ipv4_forward.c",
+        "uint32_t cells = 1u << (24 - length);", "uint32_t cells = (1u << (24 - length)) + 1;", FORWARDER_TESTS),
+    "c: no route is not refused": ("baseline/ipv4_forward.c",
+        "    if (hop == NO_ROUTE)\n        return MALFORMED;\n", "    if (hop == NO_ROUTE)\n        hop = 0;\n", FORWARDER_TESTS),
+    "c: match is off at 128": ("baseline/ipv4_forward.c", "first < 128 ? 1", "first <= 128 ? 1", FORWARDER_TESTS),
 }
 
 
@@ -290,15 +447,29 @@ def run(work: str, path: str, old: str, new: str, tests: Optional[list] = None) 
     return f"caught ({took:.0f}s) by {first.split('(')[0].strip()}: {why[:90]}", False
 
 
+def needs_root(name: str) -> bool:
+    return len(MUTANTS[name]) > 3 and MUTANTS[name][3] is FORWARDER_TESTS
+
+
 def main() -> int:
     survivors = 0
-    wanted = sys.argv[1:] or list(MUTANTS)
+    arguments = sys.argv[1:]
+    if arguments == ["--forwarder"]:
+        wanted = [name for name in MUTANTS if needs_root(name)]
+    else:
+        wanted = arguments or list(MUTANTS)
+    not_run = []
+    if os.geteuid() != 0:
+        not_run = [name for name in wanted if needs_root(name)]
+        wanted = [name for name in wanted if name not in not_run]
     with tempfile.TemporaryDirectory() as work:
         for name in wanted:
             verdict, survived = run(work, *MUTANTS[name])
             survivors += survived
             print(f"{name}: {verdict}", flush=True)
     print(f"{len(wanted) - survivors} of {len(wanted)} caught")
+    if not_run:
+        print(f"{len(not_run)} not run: they need root")
     return 1 if survivors else 0
 
 

@@ -19,7 +19,11 @@ TIER = ("tests.test_simplex",
         "tests.test_rtverilog.TargetIndependence",
         "tests.test_rtverilog.TheEmittersOwnArithmetic",
         "tests.test_walks.ReportedBounds",
-        "tests.test_walks.TheModels")
+        "tests.test_walks.TheModels",
+        "tests.test_ipv4_model",
+        "tests.test_ipv4.Binding",
+        "tests.test_ipv4.TheProgramsBytes",
+        "tests.test_ipv4.TheHarnessesArithmetic")
 SIMULATORS = frozenset(("iverilog", "vvp", "yosys", "verilator"))
 
 

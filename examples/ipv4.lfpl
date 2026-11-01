@@ -1,0 +1,67 @@
+# The fixed workload of docs/workload.md, without the table: arrays can do that later.
+#
+# An item is the frame's first 34 bytes, read as little-endian fields in wire order, so a word of the
+# IP header here is that word with its bytes swapped. An Internet checksum does not mind that, so
+# only the total length has to be put the right way round. One cell has 8 bytes of scalars beside its
+# link, so the item is five records, each owning the next. The frame itself is `frame`, which a
+# program can only hand on or give back, and `length` is how long the runtime found it to be.
+data Frame;
+record Tail { dst_lo: Int16, length: Int16, frame: Frame };
+record Ip2 { sum: Int16, src_hi: Int16, src_lo: Int16, dst_hi: Int16, rest: Tail };
+record Ip1 { total: Int16, id: Int16, frag: Int16, ttl: Int8, proto: Int8, rest: Ip2 };
+record Eth2 { smac_lo: Int32, ethertype: Int16, version: Int8, tos: Int8, rest: Ip1 };
+record Eth1 { dmac_hi: Int32, dmac_lo: Int16, smac_hi: Int16, rest: Eth2 };
+
+# What leaves. The fields of Send are written back to the frame, where the same names came from, and
+# the frame is queued to be sent. The other two give the frame back to the ring that feeds ingress.
+record Tx2 { sum: Int16, frame: Frame };
+record Tx1 { dmac_lo: Int16, smac_hi: Int16, smac_lo: Int32, rest: Tx2 };
+data Out = Malformed(frame: Frame)
+         | Expired(frame: Frame)
+         | Send(port: Int8, ttl: Int8, dmac_hi: Int32, rest: Tx1);
+
+# End-around carry. Two folds bring a sum of ten 16-bit words down to 16 bits.
+fn fold(s: Int64) : Int64 = +(&(s, 65535), >>(s, 16));
+
+fn well_formed(ethertype: Int16, version: Int8, total: Int64, length: Int16, sum: Int64) : Bool =
+  if !=(ethertype, 8) then false            # 08 00 on the wire
+  else if !=(version, 69) then false        # version 4, 5 words of header
+  else if <(total, 20) then false
+  else if >(+(total, 14), pack<16>(length)) then false
+  else ==(fold(fold(sum)), 65535);
+
+# RFC 1624, equation 3, on the word holding the TTL and the protocol: HC' = ~(~HC + ~m + m').
+# The TTL is that word's low byte here, so m' = m - 1, and ~m + m' is 0xFFFE whatever m is. Added to
+# ~HC that is at most 0x1FFFD, so one fold is enough.
+fn patched(sum: Int16, ttl: Int8, proto: Int8) : Int16 =
+  let m = pack<8,8>(proto, ttl) in
+  low16(^(fold(+(^(pack<16>(sum), 65535), +(^(m, 65535), -(m, 1)))), 65535));
+
+# The next hop, by the top bits of the destination's first octet.
+fn next_hop(first: Int8) : Int8 =
+  if <(first, 64) then 0 else if <(first, 128) then 1 else if <(first, 192) then 2 else 3;
+
+handler ipv4(h: Eth1, free: Free) : (Out, Free) =
+  match h with Eth1(d1, dmac_hi, dmac_lo, smac_hi, e2) =>
+  match e2 with Eth2(d2, smac_lo, ethertype, version, tos, i1) =>
+  match i1 with Ip1(d3, total, id, frag, ttl, proto, i2) =>
+  match i2 with Ip2(d4, sum, src_hi, src_lo, dst_hi, tail) =>
+  match tail with Tail(d5, dst_lo, length, frame) =>
+    let host_total = pack<8,8>(low8(total), low8(>>(total, 8))) in
+    let words = +(pack<8,8>(tos, version), +(pack<8,8>(proto, ttl),
+                +(pack<16>(total), +(pack<16>(id), +(pack<16>(frag), +(pack<16>(sum),
+                +(pack<16>(src_hi), +(pack<16>(src_lo), +(pack<16>(dst_hi), pack<16>(dst_lo)))))))))) in
+    if well_formed(ethertype, version, host_total, length, words) then
+      if <=(ttl, 1) then
+        (Expired@d1(frame), More@d2(More@d3(More@d4(More@d5(free)))))
+      else
+        let hop = next_hop(low8(dst_hi)) in
+        let fresh_sum = patched(sum, ttl, proto) in
+        let mac_end = pack<8>(+(hop, 16)) in
+        (Send@d1(0, -(ttl, 1), 2,
+                 Tx1@d2(low16(<<(mac_end, 8)), 2, low32(+(<<(mac_end, 24), 65536)),
+                        Tx2@d3(fresh_sum, frame))),
+         More@d4(More@d5(free)))
+    else
+      (Malformed@d1(frame), More@d2(More@d3(More@d4(More@d5(free)))))
+  end end end end end;

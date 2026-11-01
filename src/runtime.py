@@ -31,7 +31,7 @@ counters too, so whoever sent it knows it has happened. `Q` drains and shuts dow
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from .rtcheck import SIZES, Bound, Checker, Ctor
 
@@ -165,14 +165,13 @@ class Image:
                 + sum(s.length * s.element_size for s in self.states))
 
 
-def bind(checker: Checker, handler_name: str, depth: int, options: Options,
-         initial: dict[str, str]) -> Image:
-    """Read the handler's types from the checked stream, and refuse what cannot be served."""
+def handler_slots(checker: Checker, initial: dict[str, str]) -> tuple:
+    """The handler, the type of its item and of its output, and its state slots, which are the same
+    whichever device the items come from."""
     fn = next(f for f in checker.functions.values() if f.handler)
     item_type = checker.norm(fn.params[-2])
     results = checker.tuples[checker._resolve(fn.ret)]
     out_type = checker.norm(results[-2])
-    _check_reserve(checker, fn.params[-1])
     states = []
     for name, ty in checker.states:
         norm = checker.norm(ty)
@@ -184,6 +183,14 @@ def bind(checker: Checker, handler_name: str, depth: int, options: Options,
         raise BindingError(f"section 3.1: {fn.name} takes {len(fn.params) - 2} state slots, and the "
                            f"program declares {len(states)}: a slot declared after the handler is "
                            f"one it never receives")
+    return fn, item_type, out_type, tuple(states)
+
+
+def bind(checker: Checker, handler_name: str, depth: int, options: Options,
+         initial: dict[str, str]) -> Image:
+    """Read the handler's types from the checked stream, and refuse what cannot be served."""
+    fn, item_type, out_type, states = handler_slots(checker, initial)
+    _check_reserve(checker, fn.params[-1])
     decl = checker._decl(item_type)
     if decl is None or decl.kind != "record":
         raise BindingError(f"section 3.1: this runtime receives an item as a record, and "
@@ -202,7 +209,7 @@ def bind(checker: Checker, handler_name: str, depth: int, options: Options,
     if out_decl is None or out_decl.kind not in ("tagged", "tagless", "record"):
         raise BindingError(f"section 3.1: the output {out_type} is not a data type")
     out = tuple(_out_ctor(checker, ctor) for ctor in out_decl.ctors)
-    return Image(handler_name, tuple(states), tuple(scalars), chain, out_decl.kind == "tagged",
+    return Image(handler_name, states, tuple(scalars), chain, out_decl.kind == "tagged",
                  out, checker.bounds(handler_name), depth, options)
 
 
@@ -300,53 +307,7 @@ def assembly(image: Image) -> str:
     add("section .text")
     add("global _start")
     add(f"handler_entry equ fn_{image.handler}")
-    add("_start:")
-    add("    ; Section 7.2. Each step that can fail exits with its own number, before any input.")
-    add("    ; 1: block every asynchronous signal, and ignore SIGPIPE")
-    add("    mov eax, 14")
-    add("    xor edi, edi")
-    add("    mov esi, all_signals")
-    add("    xor edx, edx")
-    add("    mov r10d, 8")
-    add("    syscall")
-    add("    test rax, rax")
-    add("    jnz .refuse_signals")
-    add("    mov eax, 13")
-    add("    mov edi, 13")
-    add("    mov esi, ignore_action")
-    add("    xor edx, edx")
-    add("    mov r10d, 8")
-    add("    syscall")
-    add("    test rax, rax")
-    add("    jnz .refuse_signals")
-    add("    ; 2: lock the image into memory")
-    add("    mov eax, 151")
-    add("    mov edi, 3")
-    add("    syscall")
-    add("    test rax, rax")
-    add("    jnz .refuse_lock")
-    add("    ; 3: touch every page, so no page fault can happen during service")
-    add("    mov edi, data_start")
-    add(".touch_data:")
-    add("    or byte [rdi], 0")
-    add(f"    add rdi, {PAGE}")
-    add("    cmp rdi, data_end")
-    add("    jb .touch_data")
-    add("    mov edi, bss_start")
-    add(".touch_bss:")
-    add("    or byte [rdi], 0")
-    add(f"    add rdi, {PAGE}")
-    add("    cmp rdi, bss_end")
-    add("    jb .touch_bss")
-    add("    ; 4: the guard page, and the stack inside the image")
-    add("    mov eax, 10")
-    add("    mov edi, stack_guard")
-    add(f"    mov esi, {PAGE}")
-    add("    xor edx, edx")
-    add("    syscall")
-    add("    test rax, rax")
-    add("    jnz .refuse_guard")
-    add("    mov esp, stack_top")
+    fixed_image_startup(add)
     add("    ; 5: ingress takes the first N_max cells, and the rest are the pool")
     add("    mov edi, cells")
     add("    mov [slot_head], rdi")
@@ -826,30 +787,7 @@ def assembly(image: Image) -> str:
         add(f"    mov [in_iov+{16 * position}], rsi")
     add("    ret")
     add("")
-    add("; The free list. Admission has already shown a cell is there. pop_cell returns one in")
-    add("; rax and uses r9. push_cell takes one in rdi and uses rax. free_chain takes a chain in")
-    add("; rdi and also uses rbx.")
-    add("pop_cell:")
-    add("    mov rax, [pool]")
-    add("    mov r9, [rax]")
-    add("    mov [pool], r9")
-    add("    dec qword [pool_count]")
-    add("    ret")
-    add("push_cell:")
-    add("    mov rax, [pool]")
-    add("    mov [rdi], rax")
-    add("    mov [pool], rdi")
-    add("    inc qword [pool_count]")
-    add("    ret")
-    add("free_chain:")
-    add("    test rdi, rdi")
-    add("    jz .done")
-    add("    mov rbx, [rdi+8]")
-    add("    call push_cell")
-    add("    mov rdi, rbx")
-    add("    jmp free_chain")
-    add(".done:")
-    add("    ret")
+    pool_routines(add)
     add("")
     add("section .data align=4096")
     add("data_start:")
@@ -910,14 +848,97 @@ def assembly(image: Image) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _dispatch(add: Callable[[str], None], image: Image, register: str, stem: str) -> None:
-    """Jump to the arm for the constructor this register holds. The last needs no test."""
-    ctors = image.out
-    for position, ctor in enumerate(ctors[:-1]):
-        if image.out_tagged:
-            add(f"    cmp byte [{register}], {ctor.tag}")
+def fixed_image_startup(add: Callable[[str], None]) -> None:
+    """Section 7.2's first four steps, which do not depend on the device. Exits with 1, 2 or 4."""
+    add("_start:")
+    add("    ; Section 7.2. Each step that can fail exits with its own number, before any input.")
+    add("    ; 1: block every asynchronous signal, and ignore SIGPIPE")
+    add("    mov eax, 14")
+    add("    xor edi, edi")
+    add("    mov esi, all_signals")
+    add("    xor edx, edx")
+    add("    mov r10d, 8")
+    add("    syscall")
+    add("    test rax, rax")
+    add("    jnz .refuse_signals")
+    add("    mov eax, 13")
+    add("    mov edi, 13")
+    add("    mov esi, ignore_action")
+    add("    xor edx, edx")
+    add("    mov r10d, 8")
+    add("    syscall")
+    add("    test rax, rax")
+    add("    jnz .refuse_signals")
+    add("    ; 2: lock the image into memory")
+    add("    mov eax, 151")
+    add("    mov edi, 3")
+    add("    syscall")
+    add("    test rax, rax")
+    add("    jnz .refuse_lock")
+    add("    ; 3: touch every page, so no page fault can happen during service")
+    add("    mov edi, data_start")
+    add(".touch_data:")
+    add("    or byte [rdi], 0")
+    add(f"    add rdi, {PAGE}")
+    add("    cmp rdi, data_end")
+    add("    jb .touch_data")
+    add("    mov edi, bss_start")
+    add(".touch_bss:")
+    add("    or byte [rdi], 0")
+    add(f"    add rdi, {PAGE}")
+    add("    cmp rdi, bss_end")
+    add("    jb .touch_bss")
+    add("    ; 4: the guard page, and the stack inside the image")
+    add("    mov eax, 10")
+    add("    mov edi, stack_guard")
+    add(f"    mov esi, {PAGE}")
+    add("    xor edx, edx")
+    add("    syscall")
+    add("    test rax, rax")
+    add("    jnz .refuse_guard")
+    add("    mov esp, stack_top")
+
+
+def pool_routines(add: Callable[[str], None]) -> None:
+    add("; The free list. Admission has already shown a cell is there. pop_cell returns one in")
+    add("; rax and uses r9. push_cell takes one in rdi and uses rax. free_chain takes a chain in")
+    add("; rdi and also uses rbx.")
+    add("pop_cell:")
+    add("    mov rax, [pool]")
+    add("    mov r9, [rax]")
+    add("    mov [pool], r9")
+    add("    dec qword [pool_count]")
+    add("    ret")
+    add("push_cell:")
+    add("    mov rax, [pool]")
+    add("    mov [rdi], rax")
+    add("    mov [pool], rdi")
+    add("    inc qword [pool_count]")
+    add("    ret")
+    add("free_chain:")
+    add("    test rdi, rdi")
+    add("    jz .done")
+    add("    mov rbx, [rdi+8]")
+    add("    call push_cell")
+    add("    mov rdi, rbx")
+    add("    jmp free_chain")
+    add(".done:")
+    add("    ret")
+
+
+def dispatch_on(add: Callable[[str], None], tags: Sequence[Optional[int]], tagged: bool, register: str,
+                stem: str) -> None:
+    """Jump to the arm for the constructor this register holds, given each one's tag, or None for the
+    null constructor of a tagless type. The last needs no test."""
+    for position, tag in enumerate(tags[:-1]):
+        if tagged:
+            add(f"    cmp byte [{register}], {tag}")
             add(f"    je {stem}_{position}")
         else:
             add(f"    test {register}, {register}")
-            add(f"    {'jz' if _is_null(ctor, False) else 'jnz'} {stem}_{position}")
-    add(f"    jmp {stem}_{len(ctors) - 1}")
+            add(f"    {'jz' if tag is None else 'jnz'} {stem}_{position}")
+    add(f"    jmp {stem}_{len(tags) - 1}")
+
+
+def _dispatch(add: Callable[[str], None], image: Image, register: str, stem: str) -> None:
+    dispatch_on(add, [ctor.tag for ctor in image.out], image.out_tagged, register, stem)
