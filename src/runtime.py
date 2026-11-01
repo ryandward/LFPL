@@ -46,6 +46,7 @@ RUNTIME_DEPTH = 48   # the deepest the loop's own calls go: control, drain, free
 IDLE_MICROSECONDS = 1000
 MAX_IMAGE_BYTES = 1 << 30  # the code reaches the image with 32-bit displacements, which stop at 2 GiB
 WORD_LIMIT = 1 << 63       # the admission table and the arithmetic on it are 64-bit, signed in imul
+IOV_MAX = 1024             # what one sendmsg takes: a longer chain counts as a send error
 # admitted_cells adds up n, as admission worked it out from each datagram's length. budget_steps
 # adds up W(n) for those. steps is what ran, in a build that counts them, and is otherwise 0.
 COUNTERS = ("capacity", "pool", "served", "forwarded", "dropped", "too_large", "short", "full",
@@ -112,12 +113,19 @@ class Image:
     options: Options
 
     @property
+    def largest_output(self) -> int:
+        """N_out: an output can hold every cell of its item and of its reserve."""
+        return self.options.n_max + self.reserve_at_most
+
+    @property
     def cell_count(self) -> int:
-        """Section 3.4: C = K_in N_max + (R(N_max) + N_max) + K_out O_max N_out + S_cap."""
+        """Section 3.4: C = K_in N_max + (R(N_max) + N_max) + K_out O_max N_out + S_cap. At this
+        size Short cannot happen: a queue with room always leaves a maximal transaction's cells."""
         n_max = self.options.n_max
         if self.options.cells is not None:
             return self.options.cells
-        return K_IN * n_max + self.reserve_at_most + n_max + self.options.k_out * O_MAX * n_max
+        return (K_IN * n_max + self.reserve_at_most + n_max
+                + self.options.k_out * O_MAX * self.largest_output)
 
     @property
     def reserve_at_most(self) -> int:
@@ -276,7 +284,7 @@ def assembly(image: Image) -> str:
     add = lines.append
     item_count = len(image.item_scalars)
     iov_in = item_count + image.body_cells
-    out_iov = HEADER_BYTES_MAX + max(1, image.options.n_max)
+    out_iov = min(IOV_MAX, HEADER_BYTES_MAX + max(1, image.largest_output))
     k = len(image.states)
 
     add("section .text")

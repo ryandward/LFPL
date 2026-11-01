@@ -325,6 +325,34 @@ fn main() : Int64 = pack<8>(f(5));"""), 0)
         self.assertEqual(self.answer(b"# caf\xe9\nfn main() : Int64 = 1;"), 1)
 
 
+class TheDecreasingSet(unittest.TestCase):
+    """`end` states what R3 found, because that is what carries the bound."""
+
+    def ends(self, source: str) -> list:
+        return [line for line in rt_lines(io.BytesIO((PRELUDE + source).encode()))
+                if line.startswith("end")]
+
+    def test_a_function_that_does_not_recurse_names_nothing(self):
+        self.assertEqual(self.ends("fn f(x: Int64) : Int64 = +(x, 1);\n"), ["end"])
+
+    def test_a_walk_names_the_parameter_it_walks(self):
+        self.assertEqual(self.ends("""fn f(acc: List, l: List) : List = match l with
+  | Nil => acc
+  | Cons(d, h, t) => f(Cons@d(h, acc), t)
+  end;
+"""), ["end decreasing 1"])
+
+    def test_a_walk_that_trades_between_two_names_them_both(self):
+        self.assertEqual(self.ends("""fn f(x: List, y: List, acc: List) : List = match x with
+  | Nil => match y with
+      | Nil => acc
+      | Cons(d, h, t) => f(Nil, t, Cons@d(h, acc))
+      end
+  | Cons(d, h, t) => f(y, t, Cons@d(h, acc))
+  end;
+"""), ["end decreasing 0,1"])
+
+
 class RefusedWithAReason(unittest.TestCase):
     def refuse(self, why: str, source: bytes) -> None:
         with self.assertRaisesRegex((Reject, Limit, RTError), why):

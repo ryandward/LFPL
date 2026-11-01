@@ -73,6 +73,45 @@ fn weave(x: Bytes, y: Bytes, acc: Bytes) : Bytes = match x with
   | Last => rev(y, acc)
   | Chunk(d, {FIELDS}, next) => weave(y, next, Chunk@d({FIELDS}, acc))
   end;
+fn dear(l: Bytes, acc: Bytes) : Bytes = match l with
+  | Last => acc
+  | Chunk(d, {FIELDS}, next) =>
+      let m = if <(b1, 128) then +(+(+(b0, 1), 2), 3) else b0 in
+      let k = if <(b2, 128) then mix(m) else m in
+      dear(next, Chunk@d(used, k, b1, b2, b3, b4, b5, b6, acc))
+  end;
+fn first(l: Bytes) : (Int8, Bytes) = match l with
+  | Last => (0, Last)
+  | Chunk(d, {FIELDS}, next) => (b0, Chunk@d({FIELDS}, next))
+  end;
+fn choose(l: Bytes) : Bytes =
+  let (k, m) = first(l) in
+  let (x, y) = split(m, Last, Last) in
+  let j = if ==(&(k, 1), 0) then rev(x, y) else rev(y, x) in
+  rev(j, Last);
+fn touch(l: Bytes) : Bytes = match l with
+  | Last => Last
+  | Chunk(d, {FIELDS}, next) => Chunk@d(used, ^(b0, 255), b1, b2, b3, b4, b5, b6, next)
+  end;
+fn incr(l: Bytes) : Bytes @l = match l with
+  | Last => Last
+  | Chunk(d, {FIELDS}, next) => Chunk@d(used, +(b0, 1), b1, b2, b3, b4, b5, b6, incr(next))
+  end;
+data Marks = Stop(x: Int8) | Odd(x: Int8, y: Int8, rest: Marks) | Even(x: Int8, y: Int8, rest: Marks);
+fn mark(l: Bytes, acc: Marks) : Marks = match l with
+  | Last => acc
+  | Chunk(d, {FIELDS}, next) =>
+      if ==(&(b0, 1), 0) then mark(next, Even@d(used, b0, acc)) else mark(next, Odd@d(used, b0, acc))
+  end;
+fn unmark(t: Marks, acc: Bytes, free: Free) : (Bytes, Free) = match t with
+  | Stop(d, x) => (acc, More@d(free))
+  | Odd(d, x, y, rest) => unmark(rest, Chunk@d(x, +(y, 1), 0, 0, 0, 0, 0, 0, acc), free)
+  | Even(d, x, y, rest) => unmark(rest, Chunk@d(x, y, 0, 0, 0, 0, 0, 0, acc), free)
+  end;
+fn marks(x: Bytes, free: Free) : (Bytes, Free) = match free with
+  | End => (x, End)
+  | More(c, rest) => unmark(mark(x, Stop@c(0)), Last, rest)
+  end;
 """
 
 
@@ -127,8 +166,50 @@ def model_weave(cells: list) -> list:
     return b[::-1] + out
 
 
+def model_dear(cells: list) -> list:
+    out: list = []
+    for used, b0, b1, b2, *others in cells:
+        m = (b0 + 6) & 255 if b1 < 128 else b0
+        k = _mix(m) if b2 < 128 else m
+        out.insert(0, (used, k, b1, b2, *others))
+    return out
+
+
+def model_choose(cells: list) -> list:
+    k = cells[0][1] if cells else 0
+    x: list = []
+    y: list = []
+    for cell in cells:
+        x, y = y, [cell] + x
+    joined = x[::-1] + y if k % 2 == 0 else y[::-1] + x
+    return joined[::-1]
+
+
+def model_touch(cells: list) -> list:
+    if not cells:
+        return cells
+    (used, b0, *others), *rest = cells
+    return [(used, b0 ^ 255, *others), *rest]
+
+
+def model_incr(cells: list) -> list:
+    return [(used, (b0 + 1) & 255, *others) for used, b0, *others in cells]
+
+
+def model_marks(cells: list) -> list:
+    out = []
+    for used, b0, *_others in cells:
+        out.append((used, (b0 + (b0 & 1)) & 255, *bytes(WIDTH - 1)))
+    return out
+
+
 STEPS = {
     "rev": ("let {out} = rev({x}, Last) in\n", model_rev, 1),
+    "dear": ("let {out} = dear({x}, Last) in\n", model_dear, 1),
+    "choose": ("let {out} = choose({x}) in\n", model_choose, 1),
+    "touch": ("let {out} = touch({x}) in\n", model_touch, 1),
+    "incr": ("let {out} = incr({x}) in\n", model_incr, 1),
+    "marks": ("let ({out}, {free_out}) = marks({x}, {free}) in\n", model_marks, 1),
     "dup": ("let ({out}, {free_out}) = dup({x}, Last, {free}) in\n", model_dup, 2),
     "thin": ("let ({out}, {free_out}) = thin({x}, Last, {free}) in\n", model_thin, 1),
     "bump": ("let {out} = bump({x}, Last, 0) in\n", model_bump, 1),
@@ -207,6 +288,14 @@ class TheModels(unittest.TestCase):
         self.assertEqual(model_dup([a, b]), [b, b, a, a])
         self.assertEqual(model_thin([a, b, c]), [c, a])
         self.assertEqual(model_pairs([a, b, c]), [c, a, b])
+        self.assertEqual(model_touch([a, b]), [(1, 2 ^ 255, *bytes(6)), b])
+        self.assertEqual(model_incr([a, b]), [(1, 3, *bytes(6)), (1, 4, *bytes(6))])
+        # b1 and b2 are zero, so both ifs take their first arm: 2 + 6 = 8, and mix(8) = 15 ^ 85.
+        self.assertEqual(model_dear([a]), [(1, 15 ^ 85, *bytes(6))])
+        # split makes x = [a], y = [b]. a's first byte is even, so x goes onto y to make [a, b],
+        # and the last reversal gives b, a.
+        self.assertEqual(model_choose([a, b]), [b, a])
+        self.assertEqual(model_marks([a, b]), [a, (1, 4, *bytes(6))])
 
     def test_weave_alternates_and_finishes_the_longer_side_reversed(self):
         a, b, c = self.A, self.B, self.C
@@ -255,7 +344,8 @@ class RandomWalks(unittest.TestCase):
                 before = now
             self.assertEqual(before["pool"], before["capacity"], said)
             self.assertEqual(a > 0, "dup" in names, said)
-            self.assertEqual(b, 0, said)
+            if "dup" not in names:  # otherwise a header cell's share of a can pay for a draw
+                self.assertEqual(b > 0, "marks" in names, said)
             return share
         finally:
             router.close()
@@ -270,11 +360,34 @@ class RandomWalks(unittest.TestCase):
             with tempfile.TemporaryDirectory() as workdir:
                 share = self._serve(names, workdir, rng, seed)
             loosest = min(loosest, share)
-            if "thin" not in names and "bump" not in names:
+            if not {"thin", "bump", "marks", "dear"} & set(names):
                 loosest_exact = min(loosest_exact, share)
         print(f"walking handlers: {COUNT} ran; the loosest W(n) was {loosest:.0%} used, "
               f"and {loosest_exact:.0%} among those with one path", file=sys.stderr)
         self.assertGreater(loosest_exact, 0.75, "the bound is true and useless")
+        self.assertGreater(loosest, 0.25, "the bound is true and useless")
+
+
+class WhatAFieldCarries(unittest.TestCase):
+    """A value carries one amount per cell, all the way down. So a cell rebuilt in front of a chain
+    it leaves where it is can only claim what that chain already has."""
+
+    def test_a_walk_past_a_rebuilt_cell_is_paid_for_by_the_cells_behind_it(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = os.path.join(workdir, "walk.lfpl")
+            with open(path, "w") as handle:
+                handle.write(pipeline_text(["touch", "rev"]))
+            router = Forwarder(bytes(1024), workdir, build_options=("--count-steps",), source=path)
+            try:
+                _, (c, d) = bounds_in(router.report)
+                before = router.stats()
+                router.raw(bytes((PORT,)) + b"x" * 700)
+                self.assertEqual(len(router.outputs[PORT].recv(4096)), 700)
+                ran = router.settle(1)["steps"] - before["steps"]
+            finally:
+                router.close()
+        self.assertGreater(c, 0, "nothing was charged for the walk")
+        self.assertLessEqual(ran, c * 101 + d)
 
 
 class OneFunctionAtSeveralAmounts(unittest.TestCase):
@@ -304,8 +417,16 @@ class OneFunctionAtSeveralAmounts(unittest.TestCase):
 
 
 class TooLargeForAnyMachine(unittest.TestCase):
-    """Every program here has a linear bound, and the numbers in it are too large to be served. A
-    bound is a promise that the memory exists and that the arithmetic works, so that is a refusal."""
+    """Every program here has a linear bound, and something about it is too large to certify or to
+    serve. A bound is a promise that the memory exists and the arithmetic works, so that is a refusal."""
+
+    def test_a_linear_program_past_the_declared_size(self):
+        """Each call gets its own copy of what it calls, so layers of calls multiply the rows."""
+        layers = "fn t0(x: Bytes) : Bytes = rev(rev(x, Last), Last);\n" + "".join(
+            f"fn t{k}(x: Bytes) : Bytes = t{k - 1}(t{k - 1}(x));\n" for k in range(1, 9))
+        text = (PRELUDE + layers + "handler h(p: P, free: Free) : (P, Free) = match p with "
+                "P(d, port, body) => (P@d(port, t8(body)), free) end;\n")
+        self.assertRegex(refusal(text), r"section 8\.2: .*inequalities")
 
     def test_a_reserve_past_what_an_image_can_hold(self):
         """Each copy doubles the cells behind it, so twenty copies want a million per item cell."""
@@ -322,9 +443,9 @@ class TooLargeForAnyMachine(unittest.TestCase):
 
 class TheEndArm(unittest.TestCase):
     """Section 5.3's DRAW leaves the End arm out of the bound, because a reserve of R(n) cells does
-    not reach it. That rests on every Free in a program being the reserve, which is what the second
-    half of this class pins: if any of these were ever accepted, a program's own End would be
-    reachable, and its cost would be missing from the bound."""
+    not reach it. That rests on every Free in a program being the reserve. rtcheck refuses to bound a
+    handler that makes one, and the second half of this class shows the language gets there first:
+    a program that made one could not finish."""
 
     def serve(self, text: str) -> Forwarder:
         workdir = tempfile.TemporaryDirectory()
@@ -408,7 +529,7 @@ fn merge(a: Free, b: Free, l: Bytes) : (Free, Bytes) = match l with
         self.assertRegex(refusal("""record Q { port: Int8 };
 data Out = Nothing | Both(port: Int8, extra: Free);
 handler h(q: Q, free: Free) : (Out, Free) = match q with Q(d, port) => (Both@d(port, End), free) end;
-"""), "carries scalars and one chain")
+"""), "makes a Free")
 
     def test_a_second_free_cannot_leave_as_a_second_result(self):
         self.assertRegex(refusal(PRELUDE + """handler h(p: P, free: Free) : (P, Free, Free) =

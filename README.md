@@ -192,8 +192,12 @@ the sum replaces the old one in the same header cell. Now the report has the ite
 where `n` is the number of cells the item takes:
 
 ```
+python3 -m src.lfplo examples/checksum.lfpl -o checksum --in-port 9000 --out-port 9100 --ctl-port 9001
 handler checksum: R(n) = 0 cells, W(n) = 28 n + 4 steps, stack 24 bytes, 14256 cells, image 232192 bytes
 ```
+
+A datagram is `[port][any two bytes][payload]`, and it leaves for port `9100 + port` as
+`[checksum][payload]`.
 
 That is the potential method of Hofmann and Jost. Imagine every cell of a value carrying some
 amount of credit, the same unknown amount for each cell. Opening a cell releases its credit. Each
@@ -220,7 +224,11 @@ build adds a counter at each step the checker charged for, and `tests/test_check
 that against `W(n)` on a live socket, along with the checksum itself against one written
 independently in Python, for every short length and the longest item there is. `tests/test_walks.py`
 then does the same to handlers nobody chose: random pipelines of reversals, copies, filters and
-merges, each with a model in Python, each datagram judged on its bytes and its steps.
+merges, each with a model in Python, each datagram judged on its bytes and its steps. Those tests
+have to be able to fail, so `tools/mutate_bounds.py` breaks the rules that derive a bound and the
+code that uses one, a line at a time, and reports any break that no test notices. Its first run found
+that the image was too small for a handler that grows its item, and that nothing was timing a walk
+with a join in it.
 
 ## How the compiler holds itself to the same rules
 

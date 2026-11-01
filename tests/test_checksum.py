@@ -330,7 +330,7 @@ handler h(p: P, free: Free) : (P, Free) =
         self.assertEqual(router.settle(2)["pool"], router.stats()["capacity"])
 
     def test_a_chain_grown_past_what_a_message_can_gather_is_dropped_and_returned(self):
-        router = self.start("--n-max", "3", source=self.program("""
+        router = self.start(source=self.program("""
 fn more(free: Free, acc: Bytes) : (Free, Bytes) = match free with
   | End => (End, acc)
   | More(c, rest) => (rest, Chunk@c(1, 65, 0, 0, 0, 0, 0, 0, acc))
@@ -349,7 +349,7 @@ handler h(p: P, free: Free) : (P, Free) =
   match p with P(d, port, body) => let (a, f) = grow(body, Last, free) in (P@d(port, a), f) end;
 """))
         self.assertIn("R(n) = 12 n", router.report)
-        router.raw(bytes((PORT,)) + b"x" * 8)  # two body cells: 26 cells, past 18 entries
+        router.raw(bytes((PORT,)) + b"x" * 700)  # 100 body cells become 1300, past what sendmsg takes
         now = router.settle(1)
         self.assertEqual((now["served"], now["send_errors"]), (1, 1))
         self.assertEqual(now["pool"], now["capacity"])
@@ -358,10 +358,7 @@ handler h(p: P, free: Free) : (P, Free) =
         self.assertEqual(answer, b"A" * 12 + b"y")
         self.assertEqual(router.settle(2)["pool"], now["capacity"])
 
-    def test_a_reserve_proportional_to_the_item_is_given_and_never_runs_out(self):
-        """R(n) = n: each body cell is copied into a drawn cell, so if admission worked out n wrong,
-        or handed over fewer cells, the End arm would leave a copy out."""
-        router = self.start(source=self.program("""
+    TWICE = """
 fn twice(l: Bytes, acc: Bytes, free: Free) : (Bytes, Free) = match l with
   | Last => (acc, free)
   | Chunk(d, used, b0, b1, b2, b3, b4, b5, b6, next) => match free with
@@ -373,7 +370,34 @@ fn twice(l: Bytes, acc: Bytes, free: Free) : (Bytes, Free) = match l with
   end;
 handler h(p: P, free: Free) : (P, Free) =
   match p with P(d, port, body) => let (a, f) = twice(body, Last, free) in (P@d(port, a), f) end;
-"""))
+"""
+
+    def test_at_the_size_section_3_4_gives_the_pool_is_never_short(self):
+        """With a queue full of the largest outputs this handler can make, the next item is refused
+        for the queue. If it were refused for the pool, the image is smaller than the formula means:
+        an output can hold every cell of its item and of its reserve, not just N_max of them."""
+        router = self.start("--k-out", "2", source=self.program(self.TWICE))
+        router.stats(b"P")
+        largest = b"z" * LARGEST
+        for _ in range(6):
+            router.raw(bytes((PORT,)) + largest)
+        now = router.settle(6)
+        self.assertEqual((now["served"], now["full"], now["short"]), (2, 4, 0))
+        router.stats(b"R")
+        for _ in range(2):
+            self.assertEqual(len(router.outputs[PORT].recv(8192)), 2 * LARGEST)
+
+    def test_the_largest_output_of_a_handler_that_grows_its_item_goes_out_whole(self):
+        router = self.start(source=self.program(self.TWICE))
+        router.raw(bytes((PORT,)) + b"z" * LARGEST)
+        self.assertEqual(len(router.outputs[PORT].recv(8192)), 2 * LARGEST)
+        now = router.settle(1)
+        self.assertEqual((now["send_errors"], now["pool"]), (0, now["capacity"]))
+
+    def test_a_reserve_proportional_to_the_item_is_given_and_never_runs_out(self):
+        """R(n) = n: each body cell is copied into a drawn cell, so if admission worked out n wrong,
+        or handed over fewer cells, the End arm would leave a copy out."""
+        router = self.start(source=self.program(self.TWICE))
         self.assertIn("R(n) = 1 n cells", router.report)
         for length in (0, 1, 7, 8, 21, 70):
             body = bytes(range(length))

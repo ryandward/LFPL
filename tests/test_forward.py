@@ -476,6 +476,19 @@ handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Verdict, Free) =
     def test_an_output_this_runtime_cannot_send(self):
         self.assert_refused("carries scalars", """
 record Hdr { ttl: Int8 };
+record Box { a: Int8 };
+data Out = Nothing | X(port: Int8, b: Box);
+handler h(m: Hdr, free: Free) : (Out, Free) =
+  match m with Hdr(d, ttl) => match free with
+    | End => (Nothing, More@d(End))
+    | More(c, rest) => (X@d(1, Box@c(ttl)), rest)
+    end
+  end;
+""")
+
+    def test_a_reserve_sent_away_needs_a_free_it_cannot_have(self):
+        self.assert_refused("makes a Free", """
+record Hdr { ttl: Int8 };
 data Out = X(port: Int8, rest: Free);
 handler h(m: Hdr, free: Free) : (Out, Free) =
   match m with Hdr(d, ttl) => (X@d(1, free), End) end;

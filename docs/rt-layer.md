@@ -262,11 +262,12 @@ shared and not copied, because nothing connects its calls. Rows therefore multip
 the call graph, and a handler's are capped: past 1,024 it is refused, as section 8.2's limit.
 
 Leaving the End arm out is section 5.3's DRAW, and it is sound only because every Free on a path
-that has not taken an End arm is the handler's reserve. A second one could never be got rid of. A
-More arm leaves as many Frees as it found, R3 will not walk a Free, an output cannot hold one, and a
-handler returns exactly one, so any program that makes a second Free has an arm it cannot finish,
-and is refused. `tests/test_walks.py` pins each of those refusals, because relaxing any of them would
-make this rule wrong: a program's own End would be reachable with its cost left out of the bound.
+that has not taken an End arm is the handler's reserve. This pass enforces that itself: linearity
+keeps there from being two of one, so all that remains is making one, which only a literal can do,
+and a handler that does so on a path that can run, or calls something that does, gets no bound. No
+compiled program should reach that refusal. A second Free could never be got rid of: a More arm
+leaves as many as it found, R3 will not walk a Free, an output cannot hold one, and a handler returns
+exactly one. `tests/test_walks.py` pins each of those, and this rule does not rest on them.
 
 The certificate is the solver's numbers. `src/simplex.py` shares nothing with this pass, and
 `Checker.verify` evaluates each row with what it proposes, in exact fractions, so a wrong solver

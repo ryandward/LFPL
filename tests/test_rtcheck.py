@@ -379,7 +379,10 @@ end
         broken = template.format(end_arm="    drop r77\n")
         self.refuse("r77", FORWARD, broken)
 
-    def test_a_walk_over_the_reserve_has_no_bound_because_the_reserve_carries_nothing(self):
+    def test_a_handler_that_makes_a_free_has_no_bound(self):
+        """Its End arm is reachable, and DRAW leaves End arms out. Here that would be a walk of the
+        reserve whose accumulator starts from a literal. Check would not let it get this far, and
+        this does not rest on that."""
         stream = """
 fn f0 walk(r0 : t30, r1 : t30) : t30
     br.null r0, L1, L2
@@ -396,8 +399,66 @@ handler f1 h(r0 : t32768, r1 : t17, r2 : t30) : t32770
     ret r0, r1, r4
 end
 """
-        with self.assertRaises(Unbounded):
+        with self.assertRaisesRegex(Unbounded, "makes a Free"):
             certify(check(FORWARD, stream), "h", 216)
+
+    FREE_HELPERS = """
+fn f0 walk(r0 : t30, r1 : t30) : t30
+    br.null r0, L1, L2
+L1: ret r1
+L2: take r2, r0[0:8]
+    build r0, c32, none, r1
+    tail f0, r2, r0
+end decreasing 0
+fn f1 none(r0 : i8) : t30
+    const r1, #0 : t30
+    ret r1
+end
+fn f2 wrap(r0 : cap) : t30
+    build r0, c32, none, #0
+    ret r0
+end
+"""
+
+    @staticmethod
+    def _serving(body: str) -> str:
+        return f"""
+handler f3 h(r0 : t32768, r1 : t17, r2 : t30) : t32770
+{body}
+    open r1, c18
+    build r1, c23, write, =
+    ret r0, r1, r9
+end
+"""
+
+    def test_every_way_of_making_a_free_where_it_can_run_is_refused(self):
+        """walk merges two Frees, which R3 would not let a compiled program do, so each of these
+        types, and each of them reaches an End arm the bound would leave out."""
+        for name, body in (
+                ("a literal in a register", "    const r3, #0 : t30\n    call r9, f0, r2, r3"),
+                ("a literal as an argument", "    call r9, f0, r2, #0"),
+                ("a call that makes one", "    call r3, f1, #0\n    call r9, f0, r2, r3"),
+                ("a literal as a field", """    br.null r2, L1, L2
+L1: const r9, #0 : t30
+    jump L3
+L2: take r3, r2[0:8]
+    call r4, f2, r2
+    call r9, f0, r3, r4
+    jump L3
+L3:""")):
+            with self.subTest(name), self.assertRaisesRegex(Unbounded, "makes a Free"):
+                certify(check(FORWARD, self.FREE_HELPERS, self._serving(body)), "h", 216)
+
+    def test_a_free_made_past_an_end_arm_is_not_a_second_one(self):
+        """The reserve has gone there, and that path is out of the bound anyway."""
+        kept = """L2: build r2, c32, none, =
+    move r9, r2
+    jump L3
+L3:"""
+        for name, end_arm in (("a literal", "const r9, #0 : t30"), ("a call", "call r9, f1, #0")):
+            body = f"    br.null r2, L1, L2\nL1: {end_arm}\n    jump L3\n{kept}"
+            with self.subTest(name):
+                self.assertEqual(certify(check(FORWARD, self.FREE_HELPERS, self._serving(body)), "h", 216).b, 1)
 
     def test_a_draw_from_the_reserve_is_counted(self):
         stream = """
@@ -532,9 +593,10 @@ end decreasing 1
             check(LIST, walk)
 
     def test_the_decreasing_set_shares_one_amount(self):
-        """R3 only says the set's total falls, so a cell that leaves may be any member's."""
-        weave = """
-fn f0 weave(r0 : t16, r1 : t16, r2 : t16) : t16
+        """R3 only says the set's total falls, so a cell that leaves may be any member's. Neither
+        parameter is ever passed as the other here, so nothing but `end` connects their amounts."""
+        walk = """
+fn f0 walk(r0 : t16, r1 : t16, r2 : t16) : t16
     br.null r0, L1, L2
 L1: br.null r1, L3, L4
 L3: ret r2
@@ -544,10 +606,10 @@ L4: take r4, r1[8:8]
     tail f0, r3, r4, r1
 L2: take r5, r0[8:8]
     build r0, c18, none, =, r2
-    tail f0, r1, r5, r0
+    tail f0, r5, r1, r0
 end decreasing 0,1
 """
-        checker = check(LIST, weave)
+        checker = check(LIST, walk)
         signature = checker.functions["f0"]
         first, second = signature.param_pots[:2]
         self.assertIn(Budget().plus(first).plus(second, -1), signature.obligations)

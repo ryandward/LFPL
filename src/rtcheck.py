@@ -5,9 +5,10 @@ the imports. Every rule moves tokens and creates none, so a value used twice, a 
 skipped when it was needed, or a read of a cell that has been rebuilt is a local type error
 here, found without running anything.
 
-It keeps the first specification's memory bound: the only state is the tokens of the function
-being read, and one merged token state for each label still open. Control flow is structured,
-so that is at most one state per enclosing construct.
+It keeps the first specification's memory bound for typing: the only state is the tokens of the
+function being read, and one merged token state for each label still open. Control flow is
+structured, so that is at most one state per enclosing construct. The bounds below add each finished
+function's inequalities, because its callers copy them. Those are capped per function.
 
 The same pass derives a handler's bounds, by the potential method of LFPL-O section 5. Every cell
 of a value carries an unknown amount of each resource, which is released when the cell is opened
@@ -184,6 +185,7 @@ class Signature:
     obligations: dict = field(default_factory=dict)  # inequalities, its callees' included: a set in order
     recursive: bool = False
     too_large: bool = False
+    makes_a_free: bool = False      # on a path that can run: see _made
 
 
 def _args(text: str) -> list[str]:
@@ -247,6 +249,10 @@ class Checker:
         if handler.too_large:
             raise Unbounded(f"section 8.2: {handler.name} and what it calls come to more than "
                             f"{MAX_OBLIGATIONS} inequalities, past what one linear program may hold")
+        if handler.makes_a_free:
+            raise Unbounded(f"section 5.3: {handler.name} or what it calls makes a Free of its own on "
+                            f"a path that can run, so an End arm can be reached, and DRAW leaves "
+                            f"those out of the bound")
         rows = dict(handler.obligations)
         reserve = handler.param_pots[-1]
         if reserve is not None:
@@ -316,6 +322,15 @@ class Checker:
         if len(fn.obligations) > MAX_OBLIGATIONS:
             fn.too_large = True
             fn.obligations = {}
+
+    def _made(self, ty: Type) -> None:
+        """DRAW leaves the End arm out because a reserve of R(n) cells does not reach it, and that
+        needs every Free to be the reserve. Linearity keeps there from being two of one, so all
+        that is left to rule out is making one, which only a literal can do. Past an End arm that
+        is fine, because the reserve has gone, and so has everything the bound says."""
+        assert self.S is not None and self.fn is not None
+        if self.is_reserve(ty) and not self.S.unreachable:
+            self.fn.makes_a_free = True
 
     def at_least(self, have: Optional[int], need: Optional[int]) -> None:
         """A value carrying `have` per cell, used where `need` per cell is wanted. None on the
@@ -757,6 +772,7 @@ class Checker:
             if decl is None or decl.kind != "tagless" or value != 0:
                 raise self.fail(f"only a tagless type has a literal, and only 0: {a[1]}")
             word = ("null",)
+            self._made(norm)
         self.set(a[0], Tok(norm, word))
 
     def i_move(self, a: list[str]) -> None:
@@ -955,6 +971,7 @@ class Checker:
         decl = self._decl(ty)
         if decl is None or decl.kind != "tagless" or int(match.group(1)) != 0:
             raise self.fail(f"{where}: {source} cannot be a {ty}")
+        self._made(ty)
 
     def _computed(self, source: str, cell: Cell, ty: Type, where: str, own: tuple[int, int]) -> None:
         match = _FUNC.match(source)
@@ -1031,9 +1048,7 @@ class Checker:
         null_edge.nulls = null_edge.nulls | {token.word}
         reserve = self.is_reserve(token.ty)
         # Section 5.3's DRAW: the arm with a cell costs a cell. The End arm has to type, and it is
-        # not charged, because a reserve that holds R(n) cells does not reach it. Every Free a
-        # program holds is that reserve: a second one could never be got rid of, since R3 will not
-        # walk a Free, an output cannot hold one, and a handler returns exactly one.
+        # not charged, because a reserve that holds R(n) cells does not reach it: see _made.
         null_edge.unreachable = base.unreachable or reserve
         self.S = null_edge
         self.edge(a[1])
@@ -1113,7 +1128,10 @@ class Checker:
         if is_scalar(want):
             return is_int(want)
         decl = self._decl(want)
-        return decl is not None and decl.kind == "tagless" and value == 0
+        if decl is None or decl.kind != "tagless" or value != 0:
+            return False
+        self._made(want)
+        return True
 
     def _hand_over_cell(self, word: Word, operand: str) -> None:
         assert self.S is not None
@@ -1168,6 +1186,8 @@ class Checker:
             return None if unknown is None else copy(unknown)
 
         fn.too_large = fn.too_large or callee.too_large
+        if self.S is not None and not self.S.unreachable:
+            fn.makes_a_free = fn.makes_a_free or callee.makes_a_free
         for row in callee.obligations:
             self.obligate(Budget(tuple(sorted((copy(u), c) for u, c in row.terms)), row.cells, row.steps))
         return replace(callee, entry=copy(callee.entry),

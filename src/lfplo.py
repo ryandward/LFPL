@@ -1,9 +1,10 @@
 """The LFPL-O compiler: source to a running binary, or a refusal and no binary.
 
-    Lex -> Parse -> Check -> Lower (RT) -> rtcheck -> x86 -> symcheck -> nasm, ld
+    Lex -> Parse -> Check -> Lower (RT) -> rtcheck -> x86 -> certificate -> symcheck, stack -> nasm, ld
 
-LFPL-O section 8.4 is the shape of this file. Every check runs on every build, and a failure
-in any of them leaves nothing behind, so a program that compiled is one that passed.
+LFPL-O section 8.4 is the shape of this file. Those checks run on every build, and a failure in any
+of them leaves nothing behind, so a program that compiled is one that passed. The fourth check of
+that section, redundant moves, runs only in the test suite so far.
 """
 from __future__ import annotations
 

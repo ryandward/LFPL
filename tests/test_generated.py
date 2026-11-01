@@ -5,7 +5,8 @@ test_fuzz.py works out each answer alongside the text it writes, which limits it
 author thought of. These generators came from an independent review, aimed at what those miss:
 tuples through joins, nested matches, spills across calls, handlers with helpers. Every program that
 compiles must pass the symbolic check and print what the interpreter says. A handler must also
-answer every datagram correctly on a live socket, and give every cell back.
+answer every datagram correctly on a live socket, give every cell back, and stay inside the W(n)
+it was certified for, counted by a build that adds a counter at each step the checker charges for.
 
 A program may stop at a limit the language declares: anything else is a bug.
 """
@@ -68,21 +69,27 @@ class GeneratedHandlers(unittest.TestCase):
                 handle.write(data)
             options += ["--state", f"{name}={table}"]
         try:
-            router = Forwarder(bytes(1024), workdir, build_options=tuple(options), source=path)
+            router = Forwarder(bytes(1024), workdir, build_options=("--count-steps", *options),
+                               source=path)
         except subprocess.CalledProcessError as failure:
             self.assertTrue(any(reason in failure.stderr for reason in DECLARED),
                             f"seed {seed}: {failure.stderr}\n{handler.text()}")
             return False
         try:
             interpreter = handler.interp()
-            for _ in range(DATAGRAMS):
+            before = router.stats()
+            for number in range(1, DATAGRAMS + 1):
                 datagram, values, body = handler.datagram()
                 port, want = handler.expect(interpreter, values, body)
                 router.raw(datagram)
                 if port is not None and port < len(router.outputs):
                     self.assertEqual(router.outputs[port].recv(4096), want,
                                      f"seed {seed}, datagram {datagram!r}\n{handler.text()}")
-            now = router.settle(DATAGRAMS)
+                now = router.settle(number)
+                self.assertLessEqual(now["steps"] - before["steps"],
+                                     now["budget_steps"] - before["budget_steps"],
+                                     f"seed {seed}, datagram {datagram!r}\n{handler.text()}")
+                before = now
             self.assertEqual(now["pool"], now["capacity"], f"seed {seed}\n{handler.text()}")
             self.assertIsNone(router.process.poll())
         finally:
