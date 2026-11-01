@@ -155,7 +155,7 @@ class Backend:
         self.clean: dict[int, int] = {}  # a value in a register that still has a copy in this slot
         self.peak = 0
         self.linear: set[int] = set()
-        self.edges: dict[str, dict[int, Home]] = {}
+        self.edges: dict[str, tuple[dict[int, Home], set[int]]] = {}
         self.hold: Optional[tuple] = None
         self.live = False
         self.clobbered: set[str] = set()
@@ -230,6 +230,7 @@ class Backend:
             del self.owner[home]
         else:
             self.slots.discard(home)
+        self.linear.discard(r)
         copy = self.clean.pop(r, None)
         if copy is not None:
             self.slots.discard(copy)
@@ -346,6 +347,12 @@ class Backend:
             if ready is not None:
                 pending.remove(ready)
                 self._emit_move(ready)
+                if isinstance(ready.dest, Reg) and isinstance(ready.src, (Slot, Mem)):
+                    # The same value is wanted again, and it is now in a register that nothing
+                    # in this move will change: h(x, x) reads x's slot once.
+                    for other in pending:
+                        if other.src == ready.src:
+                            other.src = ready.dest
                 continue
             self._break_cycle(pending)
 
@@ -560,27 +567,30 @@ class Backend:
 
     def _label(self, label: str) -> None:
         if self.live:
-            self._arrive(label, dict(self.home))
-        target = self.edges.pop(label, None)
-        assert target is not None, f"{label} has no incoming edge"
-        self._table(target)
+            self._arrive(label, dict(self.home), set(self.linear))
+        edge = self.edges.pop(label, None)
+        assert edge is not None, f"{label} has no incoming edge"
+        self._table(edge[0])
+        self.linear = set(edge[1])
         self.place(self.asm_label(label))
         self.live = True
 
     def _needs_moves(self, label: str, table: dict[int, Home]) -> bool:
-        target = self.edges.get(label)
-        if target is None:
+        edge = self.edges.get(label)
+        if edge is None:
             return False
-        return any(r in target and target[r] != home for r, home in table.items())
+        return any(r in edge[0] and edge[0][r] != home for r, home in table.items())
 
-    def _arrive(self, label: str, table: dict[int, Home]) -> None:
+    def _arrive(self, label: str, table: dict[int, Home], linear: set[int]) -> None:
         """An edge reaches a label. The first sets its homes, and later ones move to them.
         A value not live on every edge is not live after the label, by the merge rule."""
         self._table(table)
-        target = self.edges.get(label)
-        if target is None:
-            self.edges[label] = dict(self.home)
+        self.linear = {r for r in linear if r in table}
+        edge = self.edges.get(label)
+        if edge is None:
+            self.edges[label] = (dict(self.home), set(self.linear))
             return
+        target = edge[0]
         for r in [r for r in target if r not in self.home]:
             del target[r]
         for r in [r for r in self.home if r not in target]:
@@ -591,23 +601,24 @@ class Backend:
         self._table(target)
 
     def i_jump(self, a: list[str]) -> None:
-        self._arrive(a[0], dict(self.home))
+        self._arrive(a[0], dict(self.home), set(self.linear))
         self.hold = ("jump", a[0])
         self.live = False
 
     def _branch(self, cc: str, then: str, other: str, then_table: dict[int, Home],
                 other_table: dict[int, Home]) -> None:
+        linear = set(self.linear)
         if self._needs_moves(then, then_table) or self._needs_moves(other, other_table):
             bridge = self.fresh_label()
             self.ins(f"j{cc}", bridge)
-            self._arrive(other, other_table)
+            self._arrive(other, other_table, linear)
             self.ins("jmp", self.asm_label(other))
             self.place(bridge)
-            self._arrive(then, then_table)
+            self._arrive(then, then_table, linear)
             self.ins("jmp", self.asm_label(then))
         else:
-            self._arrive(then, then_table)
-            self._arrive(other, other_table)
+            self._arrive(then, then_table, linear)
+            self._arrive(other, other_table, linear)
             self.hold = ("br", cc, then, other)
         self.live = False
 
@@ -672,8 +683,12 @@ class Backend:
         source = self.reg(a[1])
         home = self.home[source]
         linear = source in self.linear
+        copy = self.clean.pop(source, None)
         self._free(source)
         r = self.reg(a[0])
+        if copy is not None:  # its slot still holds this value, under its new name
+            self.slots.add(copy)
+            self.clean[r] = copy
         self._bind(r, home)
         if linear:
             self.linear.add(r)

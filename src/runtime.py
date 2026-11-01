@@ -29,7 +29,9 @@ counters too, so whoever sent it knows it has happened. `Q` drains and shuts dow
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
+
+from .rtcheck import SIZES, Checker, Ctor
 
 PAGE = 4096
 CELL = 16
@@ -118,44 +120,52 @@ class Image:
         return self.options.n_max - 1 if self.item_chain is not None else 0
 
 
-def bind(checker: object, handler_name: str, depth: int, options: Options,
+def bind(checker: Checker, handler_name: str, depth: int, options: Options,
          initial: dict[str, str]) -> Image:
     """Read the handler's types from the checked stream, and refuse what cannot be served."""
-    fn = next((f for f in checker.functions.values() if f.handler), None)  # type: ignore[attr-defined]
-    assert fn is not None and fn.name == handler_name
-    checker_types = checker  # the declarations are the checker's, read once from the stream
-    item_type = checker_types.norm(fn.params[-2])  # type: ignore[attr-defined]
-    results = checker_types.tuples[checker_types._resolve(fn.ret)]  # type: ignore[attr-defined]
-    out_type = checker_types.norm(results[-2])  # type: ignore[attr-defined]
+    fn = next(f for f in checker.functions.values() if f.handler)
+    item_type = checker.norm(fn.params[-2])
+    results = checker.tuples[checker._resolve(fn.ret)]
+    out_type = checker.norm(results[-2])
+    _check_reserve(checker, fn.params[-1])
     states = []
-    for name, ty in checker_types.states:  # type: ignore[attr-defined]
-        _kind, length, element = checker_types.norm(ty)  # type: ignore[attr-defined]
-        states.append(StateSlot(name, length, {"i8": 1, "bool": 1, "i16": 2, "i32": 4, "i64": 8}[element],
-                                initial.pop(name, None)))
+    for name, ty in checker.states:
+        norm = checker.norm(ty)
+        assert isinstance(norm, tuple) and norm[0] == "array"
+        states.append(StateSlot(name, norm[1], SIZES[norm[2]], initial.pop(name, None)))
     if initial:
         raise BindingError(f"no state slot named {sorted(initial)[0]}")
-    decl = checker_types._decl(item_type)  # type: ignore[attr-defined]
+    decl = checker._decl(item_type)
     if decl is None or decl.kind != "record":
         raise BindingError(f"section 3.1: this runtime receives an item as a record, and "
                            f"{item_type} is not one")
-    scalars, chain = _split_fields(checker_types, decl.name, decl.ctors[0].fields)
+    scalars, chain = _split_fields(checker, decl.name, decl.ctors[0].fields)
     if sum(size for _o, size in scalars) > HEADER_BYTES_MAX:
         raise BindingError(f"section 3.1: {decl.name}'s header does not fit one cell's fields")
-    out_decl = checker_types._decl(out_type)  # type: ignore[attr-defined]
+    out_decl = checker._decl(out_type)
     if out_decl is None or out_decl.kind not in ("tagged", "tagless", "record"):
         raise BindingError(f"section 3.1: the output {out_type} is not a data type")
-    out = tuple(_out_ctor(checker_types, ctor) for ctor in out_decl.ctors)
-    draws, steps = checker_types.bounds(handler_name)  # type: ignore[attr-defined]
+    out = tuple(_out_ctor(checker, ctor) for ctor in out_decl.ctors)
+    draws, steps = checker.bounds(handler_name)
     return Image(handler_name, tuple(states), tuple(scalars), chain, out_decl.kind == "tagged",
                  out, draws, steps, depth, options)
 
 
-def _split_fields(checker: object, owner: str, fields: list) -> tuple[list, Optional[int]]:
+def _check_reserve(checker: Checker, reserve: str) -> None:
+    """The pool and every reserve are threaded through offset 0, as the built-in Free is. A
+    program may still declare its own Free, and then it has to have that shape."""
+    decl = checker._decl(checker.norm(reserve))
+    assert decl is not None
+    full = [c for c in decl.ctors if c.tag != "null"]
+    if decl.kind != "tagless" or len(full) != 1 or full[0].fields[0][:2] != (0, 8):
+        raise BindingError("section 3.1: Free must be End | More(next: Free)")
+
+
+def _split_fields(checker: Checker, owner: str, fields: list) -> tuple[list, Optional[int]]:
     scalars = []
     chain = None
     for off, size, ty, name in fields:
-        norm = checker.norm(ty)  # type: ignore[attr-defined]
-        decl = checker._decl(norm)  # type: ignore[attr-defined]
+        decl = checker._decl(checker.norm(ty))
         if decl is None:
             scalars.append((off, size))
         elif decl.kind == "abstract" and chain is None:
@@ -166,21 +176,19 @@ def _split_fields(checker: object, owner: str, fields: list) -> tuple[list, Opti
     return scalars, chain
 
 
-def _out_ctor(checker: object, ctor: object) -> OutCtor:
+def _out_ctor(checker: Checker, ctor: Ctor) -> OutCtor:
     port = None
     rest = []
-    for entry in ctor.fields:  # type: ignore[attr-defined]
+    for entry in ctor.fields:
         if entry[3] == "port":
-            norm = checker.norm(entry[2])  # type: ignore[attr-defined]
-            if norm not in ("i8", "i16"):
-                raise BindingError(f"section 3.1: {ctor.name}.port must be Int8 or Int16")  # type: ignore[attr-defined]
+            if checker.norm(entry[2]) not in ("i8", "i16"):
+                raise BindingError(f"section 3.1: {ctor.name}.port must be Int8 or Int16")
             port = (entry[0], entry[1])
         else:
             rest.append(entry)
-    scalars, chain = _split_fields(checker, ctor.name, rest)  # type: ignore[attr-defined]
-    tag_text = ctor.tag  # type: ignore[attr-defined]
-    tag = int(tag_text) if tag_text.isdigit() else (None if tag_text == "null" else 0)
-    return OutCtor(ctor.name, tag, port, tuple(scalars), chain)  # type: ignore[attr-defined]
+    scalars, chain = _split_fields(checker, ctor.name, rest)
+    tag = int(ctor.tag) if ctor.tag.isdigit() else (None if ctor.tag == "null" else 0)
+    return OutCtor(ctor.name, tag, port, tuple(scalars), chain)
 
 
 def _be16(port: int) -> str:
@@ -202,6 +210,8 @@ def assembly(image: Image) -> str:
     if image.cell_count < smallest:
         raise BindingError(f"section 3.4: {image.cell_count} cells cannot hold ingress and one "
                            f"maximal transaction, which take {smallest}")
+    if o.out_base + (1 << 8 * max((c.port[1] for c in image.out if c.port), default=0)) - 1 > 65535:
+        raise BindingError(f"section 7.3: egress at {o.out_base} plus a port number can pass 65535")
     lines: list[str] = []
     add = lines.append
     item_count = len(image.item_scalars)
@@ -211,6 +221,7 @@ def assembly(image: Image) -> str:
 
     add("section .text")
     add("global _start")
+    add(f"handler_entry equ fn_{image.handler}")
     add("_start:")
     add("    ; Section 7.2. Each step that can fail exits with its own number, before any input.")
     add("    ; 1: block every asynchronous signal, and ignore SIGPIPE")
@@ -443,7 +454,7 @@ def assembly(image: Image) -> str:
     add(f"    mov {PARAMS[k]}, r14")
     for position in range(k):
         add(f"    mov {PARAMS[position]}, [state_{position}]")
-    add(f"    call fn_{image.handler}")
+    add(f"    call handler_entry")
     add("    ; DONE: the state, the output and what is left of the reserve come back")
     for position in range(k):
         add(f"    mov [state_{position}], {RESULTS[position]}")
@@ -697,7 +708,7 @@ def assembly(image: Image) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _dispatch(add, image: Image, register: str, stem: str) -> None:
+def _dispatch(add: Callable[[str], None], image: Image, register: str, stem: str) -> None:
     """Jump to the arm for the constructor this register holds. The last needs no test."""
     ctors = image.out
     for position, ctor in enumerate(ctors[:-1]):

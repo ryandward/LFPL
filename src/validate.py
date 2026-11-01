@@ -183,7 +183,7 @@ def recompute_stack(asm: str) -> int:
     current = None
     calls: list[str] = []
     tails: list[str] = []
-    handler = re.search(r"call fn_(\w+)\n\s+; DONE", asm)
+    handler = re.search(r"^handler_entry equ fn_(\w+)$", asm, re.M)
     for raw in asm.splitlines():
         line = raw.strip()
         if line.endswith("_body:") and line.startswith("fn_"):

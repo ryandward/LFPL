@@ -22,11 +22,13 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.lfplo import compile_program  # noqa: E402
 from src.lower import FailFast, build_and_run, compile_source, occupancy_bound  # noqa: E402
+from src import rtlower  # noqa: E402
+from src.rtlower import Limit  # noqa: E402
 from src.symcheck import check_translation  # noqa: E402
 from src.validate import validate  # noqa: E402
 
-PIPELINE = os.environ.get("LFPL_PIPELINE", "lower")
 COUNT = int(os.environ.get("LFPL_FUZZ", "60"))
 SEED = int(os.environ.get("LFPL_FUZZ_SEED", "0"))
 WIDTHS = {8: "Int8", 16: "Int16", 32: "Int32", 64: "Int64"}
@@ -49,18 +51,21 @@ def compile_checked(source: bytes) -> str:
     return "\n".join(lines) + "\n"
 
 
-if PIPELINE == "rt":  # the same programs, through the register-transfer path
-    from src.lfplo import compile_program as compile_checked  # noqa: E402,F811
-    from src.rtlower import Limit  # noqa: E402
+def compile_rt(source: bytes) -> str:
+    """The same programs through the register-transfer path, with its own Theorem 7.2 bound."""
 
-    def _limit_of(failure: Exception) -> str:
-        return str(failure).split(":")[0]
-else:
-    class Limit(Exception):  # type: ignore[no-redef]
-        pass
+    def on_step(ring) -> None:
+        check = ring.stages[2]
+        in_use = ring.store.C - len(ring.F)
+        depth = max(stage.depth() for stage in ring.stages)
+        g_cells = len(check.G.cells) + len(check.TA.cells) + len(check.TF.cells) + len(check.TT.cells)
+        limit = rtlower.occupancy_bound(depth, g_cells)
+        if in_use > limit:
+            raise AssertionError(f"Theorem 7.2: {in_use} cells at depth {depth}, bound {limit}")
+        if ring.counts["egress"] % 97 == 0:
+            ring.check_conservation()
 
-    def _limit_of(failure: Exception) -> str:
-        return str(failure)
+    return compile_program(source, on_step=on_step)
 
 
 class Scalars:
@@ -717,6 +722,8 @@ def tagged_if_program(rng: random.Random) -> tuple[bytes, int]:
 
 
 class Differential(unittest.TestCase):
+    compiler = staticmethod(compile_checked)
+
     def _campaign(self, generator, seed: int, *, min_compiled: float = 0.7) -> None:
         rng = random.Random(seed + 1000 * SEED)
         compiled = 0
@@ -725,14 +732,14 @@ class Differential(unittest.TestCase):
             for index in range(COUNT):
                 source, expected = generator(rng)
                 try:
-                    asm = compile_checked(source)
+                    asm = self.compiler(source)
                 except FailFast as failure:
                     self.assertIsNotNone(failure.limit, f"not a declared limit: {failure}\n"
                                                          f"{source.decode()}")
                     limits[failure.limit] += 1
                     continue
                 except Limit as failure:
-                    limits[_limit_of(failure)] += 1
+                    limits[str(failure).split(":")[0]] += 1
                     continue
                 self.assertEqual(validate(asm), [], source.decode())
                 self.assertEqual([str(p) for p in check_translation(source, asm)], [],
@@ -777,6 +784,11 @@ class Differential(unittest.TestCase):
 
     def test_tagged_constructors_in_both_arms(self):
         self._campaign(tagged_if_program, 11)
+
+
+class DifferentialRT(Differential):
+    """Every generator again, through Lower's replacement."""
+    compiler = staticmethod(compile_rt)
 
 
 if __name__ == "__main__":

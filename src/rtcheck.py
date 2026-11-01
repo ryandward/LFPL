@@ -148,7 +148,6 @@ class Checker:
         self.fn: Optional[Signature] = None
         self.S: Optional[State] = None
         self.pending: dict[str, list[State]] = {}
-        self.placed: set[str] = set()
         self.next_word = 0
         self.line_number = 0
         self.steps = 0
@@ -337,8 +336,8 @@ class Checker:
         return Cell(tag, locs)
 
     def edge(self, label: str) -> None:
-        if label in self.placed:
-            raise self.fail(f"a jump back to {label}: a loop is a tail call at this level")
+        """A jump. One back to a label already placed stays pending, so `end` refuses it: a loop
+        is a tail call at this level, and nothing here remembers every label ever placed."""
         assert self.S is not None
         self.pending.setdefault(label, []).append(self.S.copy())
 
@@ -443,7 +442,6 @@ class Checker:
             if token.ty == "cap":
                 self.S.cells[token.word] = Cell()
         self.pending = {}
-        self.placed = set()
         self.steps = self.draws = 0
         self.callee_steps = self.callee_draws = 0
         self.recursive = False
@@ -472,7 +470,8 @@ class Checker:
         if self.S is not None:
             raise self.fail("control runs off the end of the function")
         if self.pending:
-            raise self.fail(f"labels never placed: {sorted(self.pending)}")
+            raise self.fail(f"labels never placed after a jump to them, or jumped back to: "
+                            f"{sorted(self.pending)}")
         fn = self.fn
         assert fn is not None
         if self.recursive or self.callee_steps is None or self.callee_draws is None:
@@ -490,9 +489,6 @@ class Checker:
     def _label(self, label: str) -> None:
         if self.fn is None:
             raise self.fail("a label outside a function")
-        if label in self.placed:
-            raise self.fail(f"label {label} placed twice")
-        self.placed.add(label)
         edges = self.pending.pop(label, [])
         if self.S is not None:
             edges.append(self.S)

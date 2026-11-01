@@ -43,7 +43,7 @@ from .dyck import (CLOSE, ELEMENT_CODES, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL
                    K_RECORD, K_RESWORD, K_RTDECL, K_RTDECLMORE, K_STATE, K_TARRAY, K_TFIN,
                    K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_WITH, LEAF, OPEN, SEP,
                    ev_class, ev_kind, ev_tag)
-from .ring import Reject, Ring, Stage
+from .ring import FrameStack, Reject, Ring, Stage
 from .tokens import PAYLOAD_BYTES
 
 CELL_FIELDS_MAX = 16
@@ -255,14 +255,14 @@ class CheckStage(Stage):
 
     # --- array, Fin and tuple types: interned, so one type always has one id
 
-    def _intern(self, table: object, first: int, data: bytes) -> tuple[int, bool]:
-        for index in range(len(table)):  # type: ignore[arg-type]
-            if table.at(index)[1].rstrip(b"\0") == data.rstrip(b"\0"):  # type: ignore[attr-defined]
+    def _intern(self, table: FrameStack, first: int, data: bytes) -> tuple[int, bool]:
+        for index in range(len(table)):
+            if table.at(index)[1].rstrip(b"\0") == data.rstrip(b"\0"):
                 return first + index, False
-        if len(table) >= self.g_max:  # type: ignore[arg-type]
+        if len(table) >= self.g_max:
             raise self._reject(f"more than {self.g_max} distinct types")
-        table.push(0, data)  # type: ignore[attr-defined]
-        return first + len(table) - 1, True  # type: ignore[arg-type]
+        table.push(0, data)
+        return first + len(table) - 1, True
 
     def _array_type(self, length: int, element: int) -> int:
         if length == 0 or length & length - 1:

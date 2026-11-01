@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Iterator, NamedTuple, Optional
+from typing import BinaryIO, Callable, Generic, Iterable, Iterator, NamedTuple, Optional, Protocol, TypeVar
 
 from .check import (P_ARM_RT, P_BINDER, P_CALL_RT, P_DIAMOND_RT, P_FIELD, P_GET_RT, P_IDX_RT,
                     P_LET_RT, P_PARAM_RT, P_TYPE_RT, P_VAR, P_WITH_RT, CheckStage)
@@ -27,14 +27,15 @@ from .dyck import (CC_NAMES, CLOSE, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_C
                    K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
                    K_RTDECLMORE, K_TUPLE, K_TYPE, K_VAR, K_WITH, LEAF, OP_NAMES, OPEN, SEP, Lexer,
                    Parser, ev_class, ev_kind)
-from .ring import Reject, Ring, Stage
+from .ring import FrameStack, Ring, Stage
 from .tokens import PAYLOAD_BYTES
 
 LINE_MORE, LINE_END = 0, 1
 _RT_OPS = {"imul": "mul"}
 _RMW = frozenset(("add", "sub", "and", "or", "xor"))
 UNKNOWN_TAG = 255
-E_MAX = 256  # the most cells of text one event may write
+MAX_BINDERS = 128  # LFPL-O section 8.2: names in scope in one function
+E_MAX = 4096       # the most cells of text one event may write: a settle of a whole value stack
 
 
 class Limit(Exception):
@@ -128,39 +129,49 @@ class Frame:
         return Dest(self.dest, self.d, self.count, self.t, self.f)
 
 
-class Records:
+class Packed(Protocol):
+    def pack(self) -> bytes: ...
+
+    @staticmethod
+    def unpack(data: bytes) -> "Packed": ...
+
+
+R = TypeVar("R", bound=Packed)
+
+
+class Records(Generic[R]):
     """A stack of fixed-format records, in cells."""
 
-    def __init__(self, frames: object, cls: type):
+    def __init__(self, frames: FrameStack, cls: type[R]):
         self.frames = frames
         self.cls = cls
 
     def __len__(self) -> int:
-        return len(self.frames)  # type: ignore[arg-type]
+        return len(self.frames)
 
-    def push(self, record: object) -> None:
-        self.frames.push(0, record.pack())  # type: ignore[attr-defined]
+    def push(self, record: R) -> None:
+        self.frames.push(0, record.pack())
 
-    def at(self, index: int):
-        return self.cls.unpack(self.frames.at(index)[1])  # type: ignore[attr-defined]
+    def at(self, index: int) -> R:
+        return self.cls.unpack(self.frames.at(index)[1])
 
-    def top(self):
+    def top(self) -> R:
         return self.at(len(self) - 1)
 
-    def set(self, index: int, record: object) -> None:
-        self.frames.rewrite(index, 0, record.pack())  # type: ignore[attr-defined]
+    def set(self, index: int, record: R) -> None:
+        self.frames.rewrite(index, 0, record.pack())
 
-    def set_top(self, record: object) -> None:
+    def set_top(self, record: R) -> None:
         self.set(len(self) - 1, record)
 
-    def pop(self):
+    def pop(self) -> R:
         record = self.top()
-        self.frames.pop()  # type: ignore[attr-defined]
+        self.frames.pop()
         return record
 
     def truncate(self, length: int) -> None:
         while len(self) > length:
-            self.frames.pop()  # type: ignore[attr-defined]
+            self.frames.pop()
 
 
 @dataclass(frozen=True)
@@ -485,11 +496,11 @@ class RTLower(Stage):
             dest, push = self._resolve(dest)
             self.F.push(Frame(K_IF, dest=dest.kind, d=dest.d, count=dest.count, t=dest.t, f=dest.f,
                               push=push, l1=self.new_label(), l2=self.new_label(), l3=self.new_label(),
-                              gmark=len(self.G), umark=len(self.U)))
+                              bmark=len(self.B), gmark=len(self.G), umark=len(self.U)))
         elif kind == K_MATCH:
             dest, push = self._resolve(dest)
             self.F.push(Frame(K_MATCH, dest=dest.kind, d=dest.d, count=dest.count, t=dest.t, f=dest.f,
-                              push=push, l3=self.new_label(), vmark=len(self.V),
+                              push=push, l3=self.new_label(), vmark=len(self.V), bmark=len(self.B),
                               gmark=len(self.G), umark=len(self.U)))
         elif kind in (K_AND, K_OR, K_NOT):
             self._open_logical(kind, dest)
@@ -572,8 +583,20 @@ class RTLower(Stage):
         return self._use(src, bool(linear))
 
     def _set_binder(self, index: int, binder: Binder) -> None:
-        self.U.push(Undo(index, self.B.at(index)))
+        """A change a later arm must not see goes in the undo log. Only a name older than the
+        innermost open branch can be seen by one, and such a name is consumed at most once and
+        moved at most once along any path, so the log is bounded by the names on this path, not
+        by the length of the function."""
+        if index < self._branch_floor():
+            self.U.push(Undo(index, self.B.at(index)))
         self.B.set(index, binder)
+
+    def _branch_floor(self) -> int:
+        for position in range(len(self.F) - 1, -1, -1):
+            frame = self.F.at(position)
+            if frame.kind in (K_IF, K_MATCH) and frame.state != 0:
+                return frame.bmark
+        return 0
 
     def _use(self, index: int, linear: bool) -> Value:
         binder = self.B.at(index)
@@ -609,19 +632,19 @@ class RTLower(Stage):
         self.F.set_top(top)
         if top.state == 1:  # a known constructor: the names are its field values
             if kind == 0:
-                self.B.push(Binder(Value(V_CAP, top.reg, off=UNKNOWN_TAG, word=top.word, cell=top.cell,
-                                         flags=LINEAR)))
+                self._push_binder(Binder(Value(V_CAP, top.reg, off=UNKNOWN_TAG, word=top.word,
+                                               cell=top.cell, flags=LINEAR)))
                 return
             match = self.F.at(len(self.F) - 2)
             value = self.V.at(match.vmark + position - 1)
-            self.B.push(Binder(value, self.fresh() if linear else 0))
+            self._push_binder(Binder(value, self.fresh() if linear else 0))
             return
         if kind == 0:
-            self.B.push(Binder(Value(V_CAP, top.reg, off=top.l1, word=top.word, cell=top.cell,
-                                     flags=LINEAR)))
+            self._push_binder(Binder(Value(V_CAP, top.reg, off=top.l1, word=top.word, cell=top.cell,
+                                           flags=LINEAR)))
             return
-        self.B.push(Binder(Value(V_LOC, top.reg, off, size, self.new_word(), top.cell,
-                                 LINEAR if linear else 0), self.fresh() if linear else 0))
+        self._push_binder(Binder(Value(V_LOC, top.reg, off, size, self.new_word(), top.cell,
+                                       LINEAR if linear else 0), self.fresh() if linear else 0))
 
     def _sep_let(self, top: Frame, payload: bytes) -> None:
         _one, _linear, _size, count = P_LET_RT.unpack_from(payload)
@@ -638,7 +661,13 @@ class RTLower(Stage):
         self.F.set_top(top)
 
     def _bind_value(self, value: Value) -> None:
-        self.B.push(Binder(value, self.fresh() if value.kind == V_LOC and value.flags & LINEAR else 0))
+        self._push_binder(Binder(value, self.fresh() if value.kind == V_LOC and value.flags & LINEAR else 0))
+
+    def _push_binder(self, binder: Binder) -> None:
+        if len(self.B) >= MAX_BINDERS:
+            raise Limit(f"section 8.2: fn {self.fn_name.decode()} has more than {MAX_BINDERS} names "
+                        f"in scope at once")
+        self.B.push(binder)
 
     def _pop_binders(self, mark: int, values_from: int = 0) -> None:
         """Names go out of scope. A scalar's register goes with its owner, unless the value the
@@ -653,11 +682,8 @@ class RTLower(Stage):
                 if held.kind == V_REG and held.reg == value.reg:
                     self.V.set(index, replace(held, flags=held.flags | OWNED))
                     kept = True
-            if not kept and self.live and not self.last_into_is(value.reg):
+            if not kept and self.live:
                 self.i(f"drop r{value.reg}")
-
-    def last_into_is(self, _register: int) -> bool:
-        return False
 
     # --- if and match
 
@@ -752,9 +778,19 @@ class RTLower(Stage):
         self.F.push(Frame(K_ARM, dest=match.dest, d=match.d, count=match.count, t=match.t, f=match.f,
                           reg=match.reg, word=match.word, cell=cell, bmark=len(self.B), l1=known))
 
+    def _forget_cells_from(self, first: int) -> None:
+        """The cells opened since this number are out of scope, and nothing can name them. What
+        is left is one cell per enclosing arm, so this list is bounded by depth too."""
+        kept = [self.G.at(i) for i in range(len(self.G)) if self.G.at(i).number < first]
+        self.G.truncate(0)
+        for cell in kept:
+            self.G.push(cell)
+
     def _close_arm(self) -> None:
         top = self.F.pop()
         self._pop_binders(top.bmark)
+        if top.state != 1:
+            self._forget_cells_from(top.cell)
         match = self.F.top()
         self._note_arm(match)
         self.F.set_top(match)
@@ -1023,7 +1059,6 @@ class RTLower(Stage):
             self.live = False
             return
         self.i(f"build r{top.reg}, c{info.ctor}, {tag}{separator}{joined}")
-        self._mark_gone(top.cell)
         for value, _operand in entries:
             self._release(value)
         for value, extra in entries:
@@ -1145,12 +1180,8 @@ class RTLower(Stage):
         source = self._field_sources(top, [field], [(value, None)])[0]
         sources = ["="] * top.l2
         sources[top.aux] = source
-        if source == "=":
-            named = frozenset(((off, size),))
-        else:
-            named = frozenset()
         self._pop_binders(top.bmark)
-        self._close_cell_for_with(top, named)
+        self._close_cell(top.cell, frozenset(), len(self.V))
         self.i(f"build r{top.reg}, c{top.l1}, none, {', '.join(sources)}")
         self._release(value)
         result = Value(V_REG, top.reg, word=top.word, flags=OWNED | LINEAR)
@@ -1158,9 +1189,6 @@ class RTLower(Stage):
             self._into(result, top.d)
         else:
             self._deliver(result, top.as_dest())
-
-    def _close_cell_for_with(self, top: Frame, _named: frozenset) -> None:
-        self._close_cell(top.cell, frozenset(), len(self.V))
 
     # --- sep and close, dispatched
 
@@ -1251,23 +1279,38 @@ def _type_text(ty: int) -> str:
 
 # ------------------------------------------------------------------ occupancy and the driver
 
+_CELL_FIELDS = 16
+_ARGUMENTS = 6
 _FRAME_CELLS = (_FRAME.size + PAYLOAD_BYTES - 1) // PAYLOAD_BYTES
-S_LOWER = _FRAME_CELLS + 2 * 2 + 17 + 17 * 2 + 17 * 2 + 2  # frame; undo; values, binders; layouts
-S_CHECK = 3 + 1 + 2 * 17 + 6 + 4
+# Cells per open construct: its frame; the values waiting on it, a field or an argument each, with
+# a computed source's operand under it; the names an arm binds, and the undo records one path can
+# hold for them, consumed once and moved once; the layouts, the constructor and the one cell.
+S_LOWER = (_FRAME_CELLS + (2 * _CELL_FIELDS + _ARGUMENTS) + 2 * (_CELL_FIELDS + 1)
+           + 2 * 2 * (_CELL_FIELDS + 1) + _CELL_FIELDS + 2)
 S_PARSE = 1
-G_CELLS = 2 * 2048 + 3 * 64
-CELLS = 8 + E_MAX + 2 * PAYLOAD_BYTES + (S_PARSE + S_CHECK + S_LOWER) * 64 + G_CELLS + 1
+S_CHECK = 3 + 1 + 2 * (_CELL_FIELDS + 1) + 6 + 2 * _ARGUMENTS
+G_CELLS_PER_ENTRY = 2
+DEFAULT_G_MAX = 2048
 
 
-def file_bytes(handle: object, chunk: int = 4096) -> Iterator[int]:
+def occupancy_bound(depth: int, g_cells: int, l_max: int = PAYLOAD_BYTES, w: int = 1) -> int:
+    """Theorem 7.2, for this ring: W + 4 + (E - 1) + L_max + (per-stage cells) * D + s * G."""
+    return w + 4 + (E_MAX - 1) + l_max + (S_PARSE + S_CHECK + S_LOWER) * depth + g_cells
+
+
+def required_cells(d_max: int, g_max: int = DEFAULT_G_MAX) -> int:
+    return occupancy_bound(d_max, 2 * G_CELLS_PER_ENTRY * g_max) + 1
+
+
+def file_bytes(handle: BinaryIO, chunk: int = 4096) -> Iterator[int]:
     while True:
-        block = handle.read(chunk)  # type: ignore[attr-defined]
+        block = handle.read(chunk)
         if not block:
             return
         yield from block
 
 
-def rt_lines(handle: object) -> Iterator[str]:
+def rt_lines(handle: BinaryIO, on_step: Optional[Callable[[Ring], None]] = None) -> Iterator[str]:
     """The stream, one line at a time, as the ring writes it. Nothing is held in between: the
     ring runs only as far as it takes to produce the next line."""
     pending: list[str] = []
@@ -1280,7 +1323,7 @@ def rt_lines(handle: object) -> Iterator[str]:
             text.clear()
 
     stages = [Lexer(), Parser(), CheckStage(lfplo=True), RTLower()]
-    ring = Ring(CELLS, file_bytes(handle), stages, sink)
+    ring = Ring(required_cells(64), file_bytes(handle), stages, sink, on_step)
     for _ in _steps(ring):
         while pending:
             yield pending.pop(0)

@@ -37,7 +37,7 @@ def egress_block() -> tuple[int, list]:
                 out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 held.append(out)
                 out.bind(("127.0.0.1", base + number))
-                out.settimeout(0.5)
+                out.settimeout(10)  # a test that waits for nothing sets its own, shorter one
             return base, held
         except OSError:
             for out in held:

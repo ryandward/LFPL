@@ -15,8 +15,9 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
+from .ring import Reject, Ring
 from .rtcheck import Checker, RTError
 from .rtlower import Limit, rt_lines
 from .runtime import BindingError, Image, Options, assembly, bind
@@ -69,7 +70,8 @@ def _generate(lines: Iterable[str], asm_path: str, options: Options,
     return image, compiled.instructions
 
 
-def compile_program(source: bytes, *, target_cells: int = 1024) -> str:
+def compile_program(source: bytes, *, target_cells: int = 1024,
+                    on_step: Optional[Callable[[Ring], None]] = None) -> str:
     """A Phase 1 program, with `fn main` and no handler: the assembly, to run once and exit. The
     runtime is not involved, so this is what shows the compiler does what the old one did."""
     from .lower import _trailer
@@ -77,7 +79,7 @@ def compile_program(source: bytes, *, target_cells: int = 1024) -> str:
     out: list[str] = []
     checker = Checker()
     backend = Backend(out.append)
-    for line in rt_lines(io.BytesIO(source)):
+    for line in rt_lines(io.BytesIO(source), on_step):
         checker.feed(line)
         backend.feed(line)
     checker.finish()
@@ -165,12 +167,9 @@ def main(argv: list[str]) -> int:
         name, _, path = entry.partition("=")
         initial[name] = path
     options = Options(args.in_port, args.out_port, args.ctl_port, args.n_max, args.k_out, args.cells)
-    from .ring import Reject
-
-    errors: tuple = (Refused, Reject)
     try:
         report = build(args.source, args.output, options, initial, keep_asm=args.asm)
-    except errors as failure:
+    except (Refused, Reject) as failure:
         print(f"{args.source}: refused: {failure}", file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as failure:
