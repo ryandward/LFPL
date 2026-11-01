@@ -5,12 +5,17 @@ Scalars are erasable, and reading one does not consume it. Lower enforces the
 one further rule a forward fold requires: overwriting a location erases the
 scalar homed there.
 
-Rule R3 makes every function terminate. In every recursive call, one fixed argument
-position must receive a variable bound by a chain of matches starting at that same
-parameter, so that position's cell count strictly falls. A binder therefore remembers
-which parameter it came from and whether a match lies in between, and `let` keeps that
-because it is only a renaming. The set of positions still decreasing in every call seen
-so far fits in a byte, so this costs no extra frames.
+Rule R3 makes every function terminate. For some fixed set of linear argument positions,
+not counting Free, the total number of cells must strictly fall at every recursive call.
+That number is mu(C@e(args)) = 1 + the sum of mu over its linear args, and a match
+replaces mu(x) with 1 + the sum of mu over the fields, or with 0 in a null arm. So each
+value's count is a linear form, and comparing two is arithmetic. A count that cannot be
+known, such as a call's result or the join of two arms, is opaque and never passes.
+
+Exactly-once linearity keeps this small: an unknown can appear at most once in a form, so
+a form is a constant plus a 64-bit mask, and it fits in the binder's own attribute cell.
+Every subset of the positions starts as a candidate, and each call strikes out the ones
+it does not shrink. With at most 6 parameters, those candidates fit in a 64-bit mask.
 
 Usage state is a 64-bit mask, so a branch frame holds its snapshots in constant
 space. That caps live linear binders per function at 64, a language limit that
@@ -21,7 +26,7 @@ so it never compares a name and its frames stay small.
 from __future__ import annotations
 
 import struct
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from .dyck import (CLOSE, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP,
                    K_CTOR, K_CTORDECL, K_DATA, K_DIAMOND, K_EOF, K_FIELD, K_FN, K_IF,
@@ -45,11 +50,8 @@ _SIZES = {T_I8: 1, T_I16: 2, T_I32: 4, T_I64: 8, T_BOOL: 1, T_LIT: 8}
 E_TYPE, E_CTOR, E_FIELD, E_FUNC, E_PARAM = range(5)
 _ATTR = struct.Struct("<BBBBHHH")  # a, b, c, d, x, y, z
 _FRAME = struct.Struct("<BBHHHHQQQ")  # a, b, t1, t2, c1, c2, m1, m2, m3
-_BINDER = struct.Struct("<HBB")  # type, linear index or 255, origin
-# A binder's origin is the parameter position it came from, with _BELOW set once a match
-# lies between them. Only a value with _BELOW set has fewer cells than the parameter.
-_NO_ORIGIN = 255
-_BELOW = 8
+_BINDER = struct.Struct("<HBHQB")  # type, linear index or 255, then its cell count
+_ARGUMENT = struct.Struct("<HQB")  # the cell count of one argument to a recursive call
 _FORWARD, _RESOLVED = 254, 253  # the `a` attribute of a forward-declared type
 
 # Payloads for Lower.
@@ -62,6 +64,22 @@ P_BINDER = struct.Struct("<BBBB")  # 0 for diamond or 1 for a field, off, size, 
 P_LET = struct.Struct("<BBB")     # separator 1, linear, size
 P_PARAM = struct.Struct("<HBB")   # src index, size, linear
 P_WITH = struct.Struct("<BBB")    # off, size, linear
+
+
+class Cells(NamedTuple):
+    """mu of a value, as a linear form: a constant plus some unknowns, each at least 0.
+    Opaque means nothing is known about it. A form can be stored in one binder's cell."""
+    constant: int = 0
+    unknowns: int = 0
+    opaque: bool = False
+
+    def plus(self, other: "Cells") -> "Cells":
+        return Cells(self.constant + other.constant, self.unknowns | other.unknowns,
+                     self.opaque or other.opaque)
+
+
+OPAQUE = Cells(opaque=True)
+RESERVE_TYPE = b"Free"  # the reserve is never a measure: an item's work is paid by the item
 
 
 def is_linear(ty: int) -> bool:
@@ -90,8 +108,10 @@ class CheckStage(Stage):
         self.decl_field_count = 0
         self.decl_ctor = -1
         self.decl_forward = -1
-        self.origin = _NO_ORIGIN  # of the expression just finished, if it is a variable
-        self.decreasing = 0       # R3: positions that fell in every recursive call so far
+        self.form = Cells()       # mu of the expression just finished
+        self.closing = OPAQUE     # what a construct's close leaves in self.form
+        self.entry: list[Cells] = []  # R3: mu of each parameter, as far as matches have shown
+        self.viable = 0           # R3: subsets of positions that fell at every call so far
         self.pending_name = b""
         self.child_seen = False
 
@@ -101,6 +121,7 @@ class CheckStage(Stage):
         self.K = self.stack()
         self.B = self.stack()
         self.N = self.stack()  # the name of each let whose bound value is still open
+        self.A = self.stack()  # R3: the cell count of each argument to a recursive call
 
     def depth(self) -> int:
         return len(self.K)
@@ -144,7 +165,9 @@ class CheckStage(Stage):
             raise self._reject(f"unknown type {key.decode()}")
         return found + FIRST_NAMED
 
-    def _bind(self, name: bytes, ty: int, origin: int = _NO_ORIGIN) -> int:
+    def _bind(self, name: bytes, ty: int, form: Optional[Cells] = None) -> int:
+        """A new binder. By default its cell count is an unknown of its own, except that
+        a diamond is exactly one cell and a scalar owns none."""
         linear = 255
         if is_linear(ty):
             for bit in range(LINEAR_BINDERS_MAX):
@@ -155,13 +178,21 @@ class CheckStage(Stage):
             else:
                 raise self._reject(
                     f"more than {LINEAR_BINDERS_MAX} live linear binders in a function")
-        self.B.push(0, name.ljust(PAYLOAD_BYTES, b"\0") + _BINDER.pack(ty, linear, origin))
+        if form is None:
+            if ty == T_DIAMOND:
+                form = Cells(1)
+            elif linear != 255:
+                form = Cells(unknowns=1 << linear)
+            else:
+                form = Cells()
+        self.B.push(0, name.ljust(PAYLOAD_BYTES, b"\0")
+                    + _BINDER.pack(ty, linear, form.constant, form.unknowns, form.opaque))
         return len(self.B) - 1
 
     def _unbind_to(self, mark: int) -> None:
         while len(self.B) > mark:
             _, data = self.B.peek()
-            _ty, linear, _origin = _BINDER.unpack_from(data, PAYLOAD_BYTES)
+            _ty, linear, *_form = _BINDER.unpack_from(data, PAYLOAD_BYTES)
             if linear != 255:
                 if not self.used >> linear & 1:
                     name = data[:PAYLOAD_BYTES].rstrip(b"\0").decode()
@@ -174,12 +205,14 @@ class CheckStage(Stage):
         for index in range(len(self.B) - 1, -1, -1):
             _, data = self.B.at(index)
             if data[:PAYLOAD_BYTES] == name:
-                ty, linear, _origin = _BINDER.unpack_from(data, PAYLOAD_BYTES)
+                ty, linear, *_form = _BINDER.unpack_from(data, PAYLOAD_BYTES)
                 return index, ty, linear
         raise self._reject(f"unbound variable {name.rstrip(bytes(1)).decode()}")
 
-    def _origin_of(self, index: int) -> int:
-        return _BINDER.unpack_from(self.B.at(index)[1], PAYLOAD_BYTES)[2]
+    def _form_of(self, index: int) -> Cells:
+        _ty, _linear, constant, unknowns, opaque = _BINDER.unpack_from(
+            self.B.at(index)[1], PAYLOAD_BYTES)
+        return Cells(constant, unknowns, bool(opaque))
 
     def _use(self, name: bytes) -> tuple[int, int, int]:
         index, ty, linear = self._lookup(name)
@@ -238,7 +271,7 @@ class CheckStage(Stage):
         result = (self._on_open, self._on_sep, self._on_leaf, self._on_close)[cls](
             kind, payload)
         if cls == CLOSE:
-            self.origin = _NO_ORIGIN  # a finished construct is not a plain variable
+            self.form, self.closing = self.closing, OPAQUE
         if result is None:
             self.ring.drop(self, cell)
         else:
@@ -368,6 +401,7 @@ class CheckStage(Stage):
                 raise self._reject("duplicate function name")
             self.fn_self = self._g_push(E_FUNC, payload, x=self.fn_count)
             self.used = self.lin_held = 0
+            self.entry = []
             self._frame(K_FN, c1=len(self.G))
             return kind, payload
         if kind in (K_LET, K_WITH):
@@ -418,7 +452,19 @@ class CheckStage(Stage):
         self._store(frame)
         self.used = frame[6]  # every arm starts from the state at the match
         nctors = len(self._ctors(type_index))
-        self._frame(K_ARM, a=0 if is_null else count + 1, t1=frame[4], c1=len(self.B), c2=found)
+        # R3: on this path, the unknown matched here is 0, or a cell plus its fields. The
+        # fields are added as they are bound, and the arm's close undoes all of it.
+        position = saved = None
+        if frame[4]:
+            bit = 1 << frame[4] - 1
+            position = next((k for k, f in enumerate(self.entry) if f.unknowns & bit), None)
+            if position is not None:
+                saved = self.entry[position]
+                self.entry[position] = Cells(saved.constant + (not is_null), saved.unknowns & ~bit)
+        self._frame(K_ARM, a=0 if is_null else count + 1,
+                    t1=0 if position is None else position + 1,
+                    t2=0 if saved is None else saved.constant, c1=len(self.B), c2=found,
+                    m1=0 if saved is None else saved.unknowns)
         return K_ARM, P_ARM.pack(tag, tagged, is_null, arm_index, nctors)
 
     # --- sep
@@ -438,13 +484,14 @@ class CheckStage(Stage):
                 self._check_main(first, nparams)
             _, _a, b, c, d, ordinal, _y, _z = self._g(func)
             self._g_set(func, nparams, b, c, d, ordinal, self.ret_ty, first)
-            self.decreasing = (1 << nparams) - 1
+            self.viable = self._candidate_sets(first, nparams)
             return kind, payload
         if kind == K_LET:
             ty = self.ty
             name = self.N.peek()[1][:PAYLOAD_BYTES]
             self.N.pop()
-            self._bind(name, ty, self.origin)  # let is a renaming, so the chain survives
+            # let is a renaming, so the value's count carries over to the name
+            self._bind(name, ty, self.form if is_linear(ty) else Cells())
             return kind, P_LET.pack(1, is_linear(ty), size_of(ty))
         if kind == K_IF:
             if index == 1:
@@ -460,7 +507,11 @@ class CheckStage(Stage):
             if self.ty < FIRST_NAMED:
                 raise self._reject(f"cannot match on {self._show(self.ty)}")
             frame[2] = self.ty
-            frame[4] = self.origin  # a constructor's fields descend from nothing
+            # R3: only a value whose count is exactly one unknown can have it expanded
+            form = self.form
+            single = (form.constant == 0 and not form.opaque and form.unknowns
+                      and not form.unknowns & form.unknowns - 1)
+            frame[4] = form.unknowns.bit_length() if single else 0
             frame[6] = self.used
             self._store(frame)
         elif kind == K_ARM:
@@ -527,25 +578,63 @@ class CheckStage(Stage):
         else:
             wanted = self._g(frame[4] + position)[5]
         self._unify(wanted, self.ty, "an argument")
-        if self.K.peek()[0] == K_CALL and frame[1] and self.origin == position | _BELOW:
-            frame[6] |= 1 << position  # R3: this argument came from this parameter's cells
+        if self.K.peek()[0] == K_CTOR:
+            if is_linear(wanted):
+                frame[3] += self.form.constant
+                frame[6] |= self.form.unknowns
+                frame[1] = frame[1] or self.form.opaque
+        elif frame[1]:  # an argument to a recursive call: kept until the call closes
+            self.A.push(0, _ARGUMENT.pack(self.form.constant, self.form.unknowns, self.form.opaque))
         frame[5] = position + 1
         self._store(frame)
 
-    def _rule_r3(self, falling: int) -> None:
-        """Keep the positions that fell in this recursive call as well as all earlier
-        ones. Termination needs one position that falls every time."""
-        name = self.G.at(self.fn_self)[1][:PAYLOAD_BYTES].rstrip(b"\0").decode()
-        if not falling:
+    def _candidate_sets(self, first: int, nparams: int) -> int:
+        """Every nonempty set of linear positions, as a bit per subset. A set of positions
+        is a number below 64, because a function has at most 6 parameters."""
+        positions = 0
+        for position in range(nparams):
+            ty = self._g(first + position)[5]
+            if is_linear(ty) and not (
+                    ty >= FIRST_NAMED and self.G.at(ty - FIRST_NAMED)[1][:PAYLOAD_BYTES].rstrip(b"\0")
+                    == RESERVE_TYPE):
+                positions |= 1 << position
+        sets = 0
+        for subset in range(1, 1 << nparams):
+            if not subset & ~positions:
+                sets |= 1 << subset
+        return sets
+
+    def _rule_r3(self, count: int) -> None:
+        """Strike out every set of positions this recursive call fails to shrink. What is
+        left at the end is a natural number that falls at every call, so f terminates."""
+        args = []
+        for position in range(count):
+            data = self.A.at(len(self.A) - count + position)[1]
+            constant, unknowns, opaque = _ARGUMENT.unpack_from(data)
+            args.append(Cells(constant, unknowns, bool(opaque)))
+        for _ in range(count):
+            self.A.pop()
+        surviving = 0
+        for subset in range(1, 1 << count):
+            if self.viable >> subset & 1 and self._falls(subset, args):
+                surviving |= 1 << subset
+        self.viable = surviving
+        if not surviving:
+            name = self.G.at(self.fn_self)[1][:PAYLOAD_BYTES].rstrip(b"\0").decode()
             raise self._reject(
-                f"rule R3: in this recursive call of {name}, no argument is a variable bound "
-                f"by a chain of matches on the parameter in its own position, so nothing "
-                f"shows that the recursion ends")
-        self.decreasing &= falling
-        if not self.decreasing:
-            raise self._reject(
-                f"rule R3: the recursive calls of {name} each shrink some argument, but no "
-                f"one position shrinks in all of them, so nothing shows the recursion ends")
+                f"rule R3: no fixed set of linear arguments of {name} loses cells at every "
+                f"recursive call so far, not counting Free, so nothing shows the recursion ends")
+
+    def _falls(self, subset: int, args: list[Cells]) -> bool:
+        """before - after must be at least 1 whatever the unknowns are, and they can all be
+        0. So after may use only unknowns before has, and the constants must leave 1."""
+        before = after = Cells()
+        for position, arg in enumerate(args):
+            if subset >> position & 1:
+                before = before.plus(self.entry[position])
+                after = after.plus(arg)
+        return (not after.opaque and not after.unknowns & ~before.unknowns
+                and before.constant - after.constant >= 1)
 
     # --- leaf
 
@@ -564,7 +653,8 @@ class CheckStage(Stage):
                 return None
             if len(self.G) - frame[4] == 6:
                 raise self._reject("more than 6 parameters (the register budget)")
-            src = self._bind(self.pending_name, ty, origin=len(self.G) - frame[4])
+            src = self._bind(self.pending_name, ty)
+            self.entry.append(self._form_of(src))
             self._g_push(E_PARAM, self.pending_name, x=ty)
             return K_PARAM, P_PARAM.pack(src, size_of(ty), is_linear(ty))
         if kind == K_RESWORD:
@@ -589,11 +679,11 @@ class CheckStage(Stage):
             self.child_seen = False
             return kind, P_DIAMOND.pack(src, tag, tagged, count, off, size, linear)
         self.child_seen = True
-        self.origin = _NO_ORIGIN
+        self.form = Cells()  # literals, Bool and null constructors own no cells
         if kind == K_VAR:
             src, ty, linear = self._use(payload)
             self.ty = ty
-            self.origin = self._origin_of(src)
+            self.form = self._form_of(src)
             return kind, P_VAR.pack(src, linear != 255, size_of(ty))
         if kind == K_INT:
             self.ty = T_LIT
@@ -621,8 +711,9 @@ class CheckStage(Stage):
             self._bind(payload, T_DIAMOND)
             return K_BINDER, P_BINDER.pack(0, 0, 8, 1)
         field = self._g(frame[5] + position)
-        origin = _NO_ORIGIN if frame[2] == _NO_ORIGIN else frame[2] | _BELOW
-        self._bind(payload, field[7], origin)
+        index = self._bind(payload, field[7])
+        if frame[2]:  # the scrutinee was an unknown of this parameter: these fields replace it
+            self.entry[frame[2] - 1] = self.entry[frame[2] - 1].plus(self._form_of(index))
         return K_BINDER, P_BINDER.pack(1, field[1], field[2], is_linear(field[7]))
 
     def _with_field(self, payload: bytes):
@@ -649,6 +740,7 @@ class CheckStage(Stage):
             self.K.pop()
             return kind, payload
         if kind == K_LET:
+            self.closing = self.form  # the value of a let is the value of its body
             self._unbind_to(frame[4])
         elif kind == K_IF:
             self.ty = self._unify(frame[2], self.ty, "the arms of an if")
@@ -662,6 +754,8 @@ class CheckStage(Stage):
             self.used = frame[8]
         elif kind == K_ARM:
             self._unbind_to(frame[4])
+            if frame[2]:
+                self.entry[frame[2] - 1] = Cells(frame[3], frame[6])
             self.K.pop()
             parent = self._top()
             if parent[1]:
@@ -699,8 +793,10 @@ class CheckStage(Stage):
                 frame = self._top()
             if frame[5] != frame[0]:
                 raise self._reject(f"wrong argument count: expected {frame[0]}")
-            if kind == K_CALL and frame[1]:
-                self._rule_r3(frame[6])
+            if kind == K_CTOR:  # mu(C@e(args)) = 1 + the sum of mu over the linear args
+                self.closing = Cells(1 + frame[3], frame[6], bool(frame[1]))
+            elif frame[1]:
+                self._rule_r3(frame[0])
             self.ty = frame[2]
         elif kind == K_PACK:
             self._need_int(self.ty, "a pack field")

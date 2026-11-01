@@ -427,13 +427,16 @@ class CellConservation(unittest.TestCase):
             self.assertGreater(ring.counts[rule], 0, rule)
 
     def test_compiled_program_keeps_every_cell(self):
-        """Exactly-once linearity on silicon: walking the free list that comes back
-        counts the 1023 cells that are not the result, which holds the last one."""
-        source = PRE + (b"fn count(f: Free, n: Int64, out: Diamond, back: Free) : Res = "
-                        b"match f with End => Done@out(n, back) "
-                        b"| More(d, rest) => count(rest, +(n, 1), out, More@d(back)) end;\n"
-                        b"fn main(free: Free) : Res = match free with End => Fail | "
-                        b"More(out, rest) => count(rest, 0, out, End) end;")
+        """Exactly-once linearity on silicon: walking the list that comes back counts the
+        1023 cells that are not the result, which holds the last one. The list has a type
+        of its own because rule R3 does not let a function walk the reserve."""
+        source = (b"data Cells = None | Cell(next: Cells);\n"
+                  b"data Res = Fail | Done(value: Int64, rest: Cells);\n"
+                  b"fn count(f: Cells, n: Int64, out: Diamond, back: Cells) : Res = "
+                  b"match f with None => Done@out(n, back) "
+                  b"| Cell(d, rest) => count(rest, +(n, 1), out, Cell@d(back)) end;\n"
+                  b"fn main(free: Cells) : Res = match free with None => Fail | "
+                  b"Cell(out, rest) => count(rest, 0, out, None) end;")
         self.assertEqual(run(source), 1023)
 
     def test_register_partition_is_checked_each_step(self):
@@ -949,15 +952,15 @@ class TagWrites(unittest.TestCase):
     def test_a_tag_write_does_not_corrupt_a_field_still_owed_at_offset_zero(self):
         """Found by the symbolic check, in programs whose result never showed it: the
         tag landed on the free list's next pointer before that pointer was moved out."""
-        source = (b"data Free = End | More(next: Free);\n"
-                  b"data Res = Fail | Done(value: Int64, rest: Free);\n"
+        source = (b"data Cells = None | Cell(next: Cells);\n"
+                  b"data Res = Fail | Done(value: Int64, rest: Cells);\n"
                   b"data S = D | E(k: Int8) | G;\n"
-                  b"fn count(f: Free, n: Int64, s: S, back: Free) : Res = match f with "
-                  b"| More(d, rest) => count(rest, +(n, 1), s, More@d(back)) "
-                  b"| End => match s with D(c) => Done@c(n, back) "
+                  b"fn count(f: Cells, n: Int64, s: S, back: Cells) : Res = match f with "
+                  b"| Cell(d, rest) => count(rest, +(n, 1), s, Cell@d(back)) "
+                  b"| None => match s with D(c) => Done@c(n, back) "
                   b"| E(c, k) => Done@c(n, back) | G(c) => Done@c(n, back) end end;\n"
-                  b"fn main(free: Free) : Res = match free with End => Fail | "
-                  b"More(c, rest) => count(rest, 0, D@c(), End) end;")
+                  b"fn main(free: Cells) : Res = match free with None => Fail | "
+                  b"Cell(c, rest) => count(rest, 0, D@c(), None) end;")
         self.assertEqual(run(source), 1023)
 
 
@@ -1186,7 +1189,22 @@ class DeclaredLimits(unittest.TestCase):
 
 
 class StructuralRecursion(unittest.TestCase):
-    """Rule R3, section 4.6 of LFPL-O: every function terminates (termination)."""
+    """Rule R3 as a summed measure: for some fixed set of linear argument positions, not
+    counting Free, the total cell count strictly falls at every recursive call. So every
+    accepted function terminates (termination)."""
+
+    WALK = (b"data Free = End | More(next: Free);\n"
+            b"data Res = Fail | Done(value: Int64, rest: Free);\n"
+            b"data Pair;\ndata T = Leaf | Node(v: Int64, kids: Pair);\n"
+            b"record Pair { l: T, r: T };\ndata Stack = Empty | Push(t: T, s: Stack);\n"
+            b"fn finish(acc: Int64, free: Free) : Res = match free with "
+            b"| End => Fail | More(c, rest) => Done@c(acc, rest) end;\n"
+            b"fn walk(t: T, stack: Stack, acc: Int64, free: Free) : Res = match t with "
+            b"| Node(d, v, k) => match k with Pair(e, l, r) => "
+            b"walk(l, Push@e(r, stack), +(*(acc, 3), v), More@d(free)) end "
+            b"| Leaf => match stack with "
+            b"| Empty => finish(acc, free) "
+            b"| Push(d, next, rest) => walk(next, rest, acc, More@d(free)) end end;\n")
 
     def _refused(self, source: bytes) -> None:
         with self.assertRaisesRegex(Reject, "R3"):
@@ -1195,11 +1213,13 @@ class StructuralRecursion(unittest.TestCase):
     def _accepted(self, source: bytes) -> None:
         compile_text(source)
 
+    # --- what must be refused: most of these really do run forever
+
     def test_the_specs_spin_is_refused(self):
         self._refused(b"fn spin(x: Int64) : Int64 = spin(x);")
 
     def test_a_scalar_counter_is_refused(self):
-        """It would terminate, but only a structural measure is something R3 can see."""
+        """It would terminate, but no linear value shrinks, so nothing shows that it does."""
         self._refused(b"fn go(n: Int64) : Int64 = if ==(n, 0) then 0 else go(-(n, 1));")
 
     def test_recursion_with_no_arguments_is_refused(self):
@@ -1209,43 +1229,148 @@ class StructuralRecursion(unittest.TestCase):
         self._refused(PRE + b"fn f(l: List) : List = f(l);")
 
     def test_rebuilding_the_argument_is_refused(self):
-        """This never terminates: each call rebuilds the same list and passes it on."""
+        """Each call rebuilds the same list from its own parts and passes it on."""
         self._refused(PRE + b"fn f(l: List) : List = match l with "
                             b"| Cons(d, h, t) => f(Cons@d(h, t)) | Nil => Nil end;")
 
+    def test_swapping_a_rebuilt_list_between_positions_is_refused(self):
+        self._refused(PRE + b"fn f(a: List, b: List) : List = match a with "
+                            b"| Cons(d, h, t) => f(b, Cons@d(h, t)) | Nil => b end;")
+
+    def test_a_cell_moved_back_and_forth_is_refused(self):
+        """One call moves a cell from a to b and the other moves it back, so each set of
+        positions fails at one of the calls, and the program really runs forever."""
+        self._refused(PRE + b"fn f(a: List, b: List) : List = match a with "
+                            b"| Cons(d, h, t) => f(t, Cons@d(h, b)) "
+                            b"| Nil => match b with "
+                            b"| Cons(d, h, t) => f(Cons@d(h, Nil), t) | Nil => Nil end end;")
+
     def test_a_field_of_a_cell_built_here_does_not_decrease(self):
-        """t is l again, through a constructor matched at once, so this loops forever.
-        A phantom match must not count as a match on the parameter."""
+        """t is l again, through a constructor matched at once, so this loops forever."""
         self._refused(PRE + b"fn f(l: List, c: Diamond) : List = match Cons@c(1, l) with "
                             b"| Cons(e, h, t) => f(t, e) | Nil => Nil end;")
         self._refused(PRE + b"fn f(l: List, c: Diamond) : List = let x = Cons@c(1, l) in "
                             b"match x with | Cons(e, h, t) => f(t, e) | Nil => Nil end;")
 
-    def test_a_value_returned_by_a_call_does_not_decrease(self):
+    def test_a_value_returned_by_a_call_counts_for_nothing(self):
         self._refused(PRE + b"fn g(l: List) : List = l;\n"
                             b"fn f(l: List) : List = match l with "
                             b"| Cons(d, h, t) => f(Cons@d(h, g(t))) | Nil => Nil end;")
         self._refused(PRE + b"fn g(l: List) : List = l;\n"
                             b"fn f(l: List) : List = f(g(l));")
 
-    def test_a_field_must_come_from_the_parameter_in_its_own_position(self):
-        self._refused(PRE + b"fn f(a: List, b: List) : List = match a with "
-                            b"| Cons(d, h, t) => f(b, Cons@d(h, t)) | Nil => b end;")
-        self._refused(PRE + b"fn f(a: List, b: List) : List = match a with "
-                            b"| Cons(d, h, t) => f(b, t) | Nil => b end;")
+    def test_a_joined_value_counts_for_nothing(self):
+        """The check is conservative here: this one would terminate."""
+        self._refused(PRE + b"fn f(l: List, acc: List, c: Bool) : List = match l with "
+                            b"| Nil => acc | Cons(d, h, t) => "
+                            b"let x = if c then t else t in f(x, Cons@d(h, acc), c) end;")
 
-    def test_one_position_must_decrease_in_every_call(self):
-        """Each call decreases something, but no single position decreases in both."""
-        self._refused(PRE + b"fn f(a: List, b: List) : List = match a with "
-                            b"| Cons(d, h, t) => f(t, Cons@d(h, b)) "
-                            b"| Nil => match b with "
-                            b"| Cons(d, h, t) => f(Cons@d(h, Nil), t) | Nil => Nil end end;")
+    def test_a_grown_argument_is_refused(self):
+        self._refused(PRE + b"fn f(l: List, c: Diamond, free: Free) : List = match free with "
+                            b"| End => Cons@c(1, l) "
+                            b"| More(d, rest) => f(Cons@c(1, l), d, rest) end;")
+
+    def test_cells_drawn_from_free_do_not_pay_for_a_rebuild(self):
+        """The new cell comes from Free, so the measured list never gets any smaller."""
+        self._refused(PRE + b"fn f(l: List, free: Free) : Free = match l with "
+                            b"| Nil => free "
+                            b"| Cons(d, h, t) => match free with "
+                            b"| End => f(Cons@d(h, t), End) "
+                            b"| More(c, rest) => f(Cons@c(h, t), More@d(rest)) end end;")
+
+    def test_free_is_not_a_measure(self):
+        """Walking the reserve is refused: work has to be paid for by the item."""
+        self._refused(PRE + b"fn count(f: Free, n: Int64, back: Free) : Free = match f with "
+                            b"| End => back "
+                            b"| More(d, rest) => count(rest, +(n, 1), More@d(back)) end;")
+
+    # --- the claim itself, tried on every combination of a family of recursive arms
+
+    A_ARMS = (("f(t, b, More@d(free))", lambda a, b, r: (a - 1, b, r + 1)),
+              ("f(b, t, More@d(free))", lambda a, b, r: (b, a - 1, r + 1)),
+              ("f(t, Cons@d(h, b), free)", lambda a, b, r: (a - 1, b + 1, r)),
+              ("f(Cons@d(h, b), t, free)", lambda a, b, r: (b + 1, a - 1, r)),
+              ("f(Cons@d(h, t), b, free)", lambda a, b, r: (a, b, r)),
+              ("f(b, Cons@d(h, t), free)", lambda a, b, r: (b, a, r)),
+              ("match free with End => f(t, b, More@d(End)) "
+               "| More(c, q) => f(Cons@c(h, t), b, More@d(q)) end",
+               lambda a, b, r: (a, b, r) if r else (a - 1, b, 1)))
+    B_ARMS = (("f(t, Nil, More@d(free))", lambda a, b, r: (b - 1, 0, r + 1)),
+              ("f(Nil, t, More@d(free))", lambda a, b, r: (0, b - 1, r + 1)),
+              ("f(Cons@d(h, t), Nil, free)", lambda a, b, r: (b, 0, r)),
+              ("f(Nil, Cons@d(h, t), free)", lambda a, b, r: (0, b, r)))
+
+    @staticmethod
+    def _runs_forever(a_arm, b_arm) -> bool:
+        """Simulated on list lengths alone, with no part of the compiler involved."""
+        for a0 in range(4):
+            for b0 in range(4):
+                a, b, r = a0, b0, 2
+                for _ in range(400):
+                    if a:
+                        a, b, r = a_arm(a, b, r)
+                    elif b:
+                        a, b, r = b_arm(a, b, r)
+                    else:
+                        break
+                else:
+                    return True
+        return False
+
+    def test_nothing_it_accepts_runs_forever(self):
+        accepted = refused_but_ends = 0
+        for a_text, a_arm in self.A_ARMS:
+            for b_text, b_arm in self.B_ARMS:
+                source = PRE + (
+                    f"fn f(a: List, b: List, free: Free) : Free = match a with "
+                    f"| Cons(d, h, t) => {a_text} "
+                    f"| Nil => match b with | Nil => free | Cons(d, h, t) => {b_text} end end;\n"
+                    f"fn main(r0: Free) : Res = match r0 with End => Fail | More(x, r1) => "
+                    f"match r1 with End => Done@x(0, End) | More(y, r2) => "
+                    f"match r2 with End => Done@x(0, More@y(End)) | More(z, r3) => "
+                    f"match f(Cons@x(1, Cons@y(2, Nil)), Cons@z(3, Nil), r3) with "
+                    f"End => Fail | More(c, q) => Done@c(7, q) end end end end;\n").encode()
+                loops = self._runs_forever(a_arm, b_arm)
+                with self.subTest(a=a_text, b=b_text):
+                    try:
+                        asm = compile_text(source)
+                    except Reject as refusal:
+                        self.assertIn("R3", str(refusal))
+                        refused_but_ends += not loops
+                        continue
+                    self.assertFalse(loops, "accepted, and it runs forever")
+                    accepted += 1
+                    with tempfile.TemporaryDirectory() as workdir:
+                        self.assertEqual(build_and_run(asm, workdir), 7)
+        self.assertGreaterEqual(accepted, 3)
+        print(f"R3 family: {accepted} accepted, {refused_but_ends} refused though they end",
+              file=sys.stderr)
+
+    # --- what must be accepted
+
+    def test_walk_is_accepted(self):
+        """Neither position falls at every call, but their sum does: the first call moves
+        a cell out to Free, and the second pops one."""
+        self._accepted(self.WALK)
+
+    def test_walk_runs_and_reads_the_tree_in_order(self):
+        source = self.WALK + (
+            b"fn main(r0: Free) : Res = match r0 with End => Fail | More(a, r1) => "
+            b"match r1 with End => Done@a(0, End) | More(b, r2) => "
+            b"match r2 with End => Done@a(0, More@b(End)) | More(c, r3) => "
+            b"match r3 with End => Done@a(0, More@b(More@c(End))) | More(d, r4) => "
+            b"walk(Node@a(2, Pair@b(Node@c(5, Pair@d(Leaf, Leaf)), Leaf)), Empty, 0, r4) "
+            b"end end end end;")
+        self.assertEqual(run(source), 2 * 3 + 5)
+
+    def test_a_subset_is_enough_when_the_whole_total_holds_still(self):
+        """A cell moves from l to acc, so l + acc never falls, but l alone does."""
+        self._accepted(PRE + b"fn rev(l: List, acc: List) : List = match l with "
+                             b"| Nil => acc | Cons(d, h, t) => rev(t, Cons@d(h, acc)) end;")
 
     def test_a_direct_field_is_accepted(self):
         self._accepted(PRE + b"fn inc(l: List) : List @l = match l with "
                              b"| Cons(d, h, t) => Cons@d(+(h, 1), inc(t)) | Nil => Nil end;")
-        self._accepted(PRE + b"fn rev(l: List, acc: List) : List = match l with "
-                             b"| Nil => acc | Cons(d, h, t) => rev(t, Cons@d(h, acc)) end;")
 
     def test_a_chain_of_matches_is_accepted(self):
         self._accepted(PRE + b"fn f(l: List, acc: List) : List = match l with | Nil => acc "
@@ -1259,7 +1384,19 @@ class StructuralRecursion(unittest.TestCase):
                        b"| Node(d, v, k) => match k with Pair(e, l, r) => "
                        b"f(l, Go@e(r, Go@d(Leaf, s))) end end;\n")
 
-    def test_let_is_a_renaming_so_it_keeps_the_chain(self):
+    def test_a_rebuilt_value_counts_its_cell_and_its_arguments(self):
+        """Two cells come off the list and one goes back, so the total still falls."""
+        self._accepted(PRE + b"fn f(l: List, free: Free) : Free = match l with | Nil => free "
+                             b"| Cons(d, h, t) => match t with | Nil => More@d(free) "
+                             b"| Cons(e, x, y) => f(Cons@e(x, y), More@d(free)) end end;")
+
+    def test_arguments_may_swap_while_the_total_falls(self):
+        self._accepted(PRE + b"fn f(a: List, b: List, free: Free) : Free = match a with "
+                             b"| Cons(d, h, t) => f(b, t, More@d(free)) "
+                             b"| Nil => match b with | Nil => free "
+                             b"| Cons(d, h, t) => f(t, Nil, More@d(free)) end end;")
+
+    def test_let_is_a_renaming(self):
         self._accepted(PRE + b"fn f(l: List, acc: List) : List = match l with | Nil => acc "
                              b"| Cons(d, h, t) => let m = t in f(m, Cons@d(h, acc)) end;")
         self._accepted(PRE + b"fn f(l: List, acc: List) : List = let k = l in match k with "
@@ -1272,19 +1409,17 @@ class StructuralRecursion(unittest.TestCase):
     def test_a_tail_call_to_an_earlier_function_is_not_recursion(self):
         self._accepted(b"fn g(x: Int64) : Int64 = x;\nfn f(x: Int64) : Int64 = g(x);")
 
-    def test_each_function_gets_its_own_position(self):
+    def test_each_function_gets_its_own_set(self):
         self._accepted(PRE + b"fn p(a: List, b: List) : List = match a with | Nil => b "
                              b"| Cons(d, h, t) => p(t, Cons@d(h, b)) end;\n"
                              b"fn q(a: List, b: List) : List = match b with | Nil => a "
                              b"| Cons(d, h, t) => q(Cons@d(h, a), t) end;")
 
-    def test_a_decreasing_program_still_runs(self):
-        source = PRE + (b"fn count(f: Free, n: Int64, out: Diamond, back: Free) : Res = "
-                        b"match f with End => Done@out(n, back) "
-                        b"| More(d, rest) => count(rest, +(n, 1), out, More@d(back)) end;\n"
-                        b"fn main(free: Free) : Res = match free with End => Fail | "
-                        b"More(out, rest) => count(rest, 0, out, End) end;")
-        self.assertEqual(run(source), 1023)
+    def test_a_list_of_your_own_type_is_a_measure(self):
+        """Only the type named Free is excluded."""
+        self._accepted(b"data Cells = None | Cell(next: Cells);\n"
+                       b"fn f(c: Cells, back: Cells) : Cells = match c with | None => back "
+                       b"| Cell(d, rest) => f(rest, Cell@d(back)) end;")
 
 
 class TotalShifts(unittest.TestCase):

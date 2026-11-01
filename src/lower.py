@@ -2501,7 +2501,8 @@ Lower.CLOSERS = {K_FN: Lower._close_fn, K_LET: Lower._close_let, K_IF: Lower._cl
 # 16 per cell) and a spilled value never reloads (at most 15 homes move at a join).
 _MAX_FIELDS = 16
 S_PARSE = 1
-S_CHECK = 3 + 1 + 2 * (_MAX_FIELDS + 1)   # frame, let name, binder name and attributes
+# frame, let name, binder name and attributes, and rule R3's count for each argument
+S_CHECK = 3 + 1 + 2 * (_MAX_FIELDS + 1) + 6
 S_LOWER = ((_HDR.size + max(_SNAPSHOT_BYTES, _MAX_FIELDS * _ENTRY.size) + 14) // 15
            + 2 * (_MAX_FIELDS + 1))       # frame, then field binders and unbuilt fields
 E_MAX = 128        # the largest expansion one event may produce
