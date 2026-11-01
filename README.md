@@ -154,7 +154,10 @@ into memory. And admission refuses one item, counting why, when it is too large,
 short or the output queue is full; the item's cells never left ingress, so nothing else moves.
 Once a handler starts it finishes. All the memory is laid out at link time and touched once at
 startup, and the stack is inside that image with a guard page below it, so a flood changes the
-refusal count and nothing else. `tests/test_forward.py` checks each of these against a
+refusal count and nothing else. A flood too fast to read is dropped by the kernel, before any of
+this, and the socket says how many on the next datagram it delivers, so that `kernel_dropped`, `served` and
+the refusals add up to what was sent. It also says when each datagram arrived, and `max_age_ns` keeps
+the longest any admitted item waited, which nothing refuses on yet. `tests/test_forward.py` checks each of these against a
 running binary, from outside it, including pausing egress so that a queue really does fill.
 
 ## A program that walks its item

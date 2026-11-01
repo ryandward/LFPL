@@ -7,6 +7,7 @@ to a running binary, from outside it.
 import os
 import re
 import resource
+import signal
 import socket
 import struct
 import subprocess
@@ -18,7 +19,8 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE = "examples/forward.lfpl"
 COUNTERS = ("capacity", "pool", "served", "forwarded", "dropped", "too_large", "short", "full",
-            "malformed", "send_errors", "recv_errors", "admitted_cells", "budget_steps", "steps")
+            "malformed", "send_errors", "recv_errors", "admitted_cells", "budget_steps", "steps",
+            "kernel_dropped", "max_age_ns")
 
 
 def free_port() -> int:
@@ -118,6 +120,253 @@ class Forwarder:
         for sock in self.outputs + [self.tx, self.ctl]:
             sock.close()
         return self.process.returncode
+
+
+def drops_the_kernel_reports(port: int) -> int:
+    """From outside the process: the drops column of /proc/net/udp, for the socket on this port."""
+    with open("/proc/net/udp") as handle:
+        for line in handle.readlines()[1:]:
+            fields = line.split()
+            if int(fields[1].split(":")[1], 16) == port:
+                return int(fields[-1])
+    raise AssertionError(f"no UDP socket on port {port}")
+
+
+class WhatTheKernelSaid(unittest.TestCase):
+    """The ingress socket's control messages: how many datagrams it dropped, and when each arrived."""
+
+    REFUSALS = ("too_large", "short", "full", "malformed")
+    STOPPED = 0.3  # seconds
+
+    def setUp(self):
+        self.workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.workdir.cleanup)
+        self.router = Forwarder(bytes(1024), self.workdir.name)
+        self.addCleanup(self.router.close)
+
+    def accounted(self, now: dict) -> int:
+        return now["kernel_dropped"] + now["served"] + sum(now[reason] for reason in self.REFUSALS)
+
+    def test_every_datagram_sent_is_served_refused_or_counted_as_dropped(self):
+        """Pausing egress fills the queue, so most of what arrives is refused as Full. To go past the
+        socket's receive buffer the process has to stop reading, or it keeps up with this sender. The
+        last datagram is there because the kernel stamps a datagram with the count when it queues
+        it: while the buffer is full nothing is queued, so nothing in it can say what was dropped
+        after it. The next one that gets in does, and with room in the buffer, that one does."""
+        router = self.router
+        router.stats(b"P")
+        router.process.send_signal(signal.SIGSTOP)
+        sent = 0
+        for number in range(5000):
+            router.send(64, number, b"flood")
+            sent += 1
+        router.process.send_signal(signal.SIGCONT)
+        drained = router.settle(sent)
+        self.assertEqual(drained["kernel_dropped"], 0, "what was queued was queued before any drop")
+        router.send(64, 0, b"last")
+        sent += 1
+        now = router.settle(self.accounted(drained) + 1)
+        self.assertGreater(now["kernel_dropped"], 0, "this has to go past the receive buffer to mean anything")
+        self.assertEqual(self.accounted(now), sent, now)
+        self.assertEqual(now["kernel_dropped"], drops_the_kernel_reports(router.in_port))
+        self.assertEqual(now["served"], 64, "the queue holds 64, and egress is paused")
+
+    def test_the_count_only_grows_by_the_difference(self):
+        """A second flood adds what it dropped, and what the first dropped is not counted again."""
+        router = self.router
+        router.stats(b"P")
+        totals = []
+        sent = 0
+        for _round in range(2):
+            router.process.send_signal(signal.SIGSTOP)
+            for number in range(3000):
+                router.send(64, number, b"flood")
+                sent += 1
+            router.process.send_signal(signal.SIGCONT)
+            drained = router.settle(sent)
+            router.send(64, 0, b"last")
+            sent += 1
+            now = router.settle(self.accounted(drained) + 1)
+            self.assertEqual(self.accounted(now), sent)
+            totals.append(now["kernel_dropped"])
+        self.assertGreater(totals[0], 0)
+        self.assertGreater(totals[1], totals[0])
+        self.assertEqual(totals[1], drops_the_kernel_reports(router.in_port))
+
+    def test_the_largest_age_is_how_long_an_admitted_item_waited(self):
+        router = self.router
+        router.send(64, 1)
+        router.outputs[0].recv(64)
+        quick = router.settle(1)["max_age_ns"]
+        self.assertLess(quick, 1_000_000_000, "an idle process takes an item straight away")
+        router.process.send_signal(signal.SIGSTOP)
+        router.send(64, 2)
+        time.sleep(self.STOPPED)
+        router.process.send_signal(signal.SIGCONT)
+        router.outputs[0].recv(64)
+        waited = router.settle(2)["max_age_ns"]
+        self.assertGreaterEqual(waited, int(self.STOPPED * 1e9))
+        self.assertLess(waited, 60_000_000_000)
+        router.send(64, 3)
+        router.outputs[0].recv(64)
+        self.assertEqual(router.settle(3)["max_age_ns"], waited, "the largest seen, not the last")
+
+    def test_an_item_refused_is_not_aged(self):
+        router = self.router
+        router.process.send_signal(signal.SIGSTOP)
+        router.raw(b"\x01")  # too short for the header, so it is refused as malformed
+        time.sleep(0.1)
+        router.process.send_signal(signal.SIGCONT)
+        now = router.settle(1)
+        self.assertEqual((now["malformed"], now["max_age_ns"]), (1, 0))
+
+
+class WhatTheRuntimeDoesWithIt(unittest.TestCase):
+    """The two routines of src/runtime.py, assembled by themselves with what a socket cannot be made
+    to do on demand: a count that wraps, and an arrival time ahead of the clock. They are the routines a
+    build really emits, cut from its assembly."""
+
+    HARNESS = """default abs
+section .text
+global _start
+_start:
+{setup}
+    mov eax, 231
+    mov edi, 0
+{verdict}
+    syscall
+bad:
+    mov eax, 231
+    mov edi, 1
+    syscall
+{routine}
+section .bss
+in_control: resq 8
+arrival_sec: resq 1
+arrival_nsec: resq 1
+item_arrival_sec: resq 1
+item_arrival_nsec: resq 1
+clock_now: resq 2
+last_drops: resq 1
+cnt_kernel_dropped: resq 1
+cnt_max_age_ns: resq 1
+future: resq 2
+section .data
+in_msg: dq 0, 0, 0, 0, in_control, 0, 0
+"""
+
+    def routine(self, name: str) -> str:
+        with tempfile.TemporaryDirectory() as workdir:
+            asm = os.path.join(workdir, "program.asm")
+            table = os.path.join(workdir, "routes.bin")
+            with open(table, "wb") as handle:
+                handle.write(bytes(1024))
+            subprocess.run([sys.executable, "-m", "src.lfplo", os.path.join(ROOT, SOURCE), "-o",
+                            os.path.join(workdir, "out"), "--in-port", "41000", "--out-port", "41100",
+                            "--ctl-port", "41001", "--state", f"routes={table}", "--asm", asm],
+                           cwd=ROOT, check=True, capture_output=True)
+            with open(asm) as handle:
+                text = handle.read()
+        start = text.index(f"{name}:\n")
+        return text[start:text.index(f"; end {name}\n", start)]
+
+    def status(self, setup: str, verdict: str, routine: str) -> int:
+        with tempfile.TemporaryDirectory() as workdir:
+            asm, obj, exe = (os.path.join(workdir, name) for name in ("t.asm", "t.o", "t"))
+            with open(asm, "w") as handle:
+                handle.write(self.HARNESS.format(setup=setup, verdict=verdict, routine=routine))
+            subprocess.run(["nasm", "-f", "elf64", "-o", obj, asm], check=True)
+            subprocess.run(["ld", "-o", exe, obj], check=True)
+            return subprocess.run([exe]).returncode
+
+    MESSAGES = """
+    ; a timestamp, then a count, as the kernel lays them out
+    mov qword [in_control], 32
+    mov dword [in_control+8], 1
+    mov dword [in_control+12], 35
+    mov qword [in_control+16], 1234
+    mov qword [in_control+24], 5678
+    mov qword [in_control+32], 20
+    mov dword [in_control+40], 1
+    mov dword [in_control+44], 40
+    mov dword [in_control+48], {count}
+    mov qword [in_msg+40], 56
+    mov dword [last_drops], {last}
+    mov rax, 77
+    call read_control
+    cmp rax, 77
+    jne bad
+    cmp qword [arrival_sec], 1234
+    jne bad
+    cmp qword [arrival_nsec], 5678
+    jne bad
+    cmp dword [last_drops], {count}
+    jne bad
+"""
+
+    def test_the_count_is_the_unsigned_32_bit_difference_across_the_wrap(self):
+        routine = self.routine("read_control")
+        setup = self.MESSAGES.format(count="0x10", last="0xfffffff0")
+        self.assertEqual(self.status(setup, "    cmp qword [cnt_kernel_dropped], 0x20\n    jne bad", routine), 0)
+
+    def test_the_count_is_a_difference_and_not_the_total(self):
+        routine = self.routine("read_control")
+        setup = self.MESSAGES.format(count="100", last="60")
+        self.assertEqual(self.status(setup, "    cmp qword [cnt_kernel_dropped], 40\n    jne bad", routine), 0)
+        self.assertEqual(self.status(setup, "    cmp qword [cnt_kernel_dropped], 100\n    jne bad", routine), 1,
+                         "the control: this harness can fail")
+
+    def test_a_message_of_another_kind_is_stepped_over(self):
+        routine = self.routine("read_control")
+        setup = """
+    mov qword [in_control], 20
+    mov dword [in_control+8], 1
+    mov dword [in_control+12], 99
+    mov dword [in_control+16], 12345
+    mov qword [in_control+24], 20
+    mov dword [in_control+32], 1
+    mov dword [in_control+36], 40
+    mov dword [in_control+40], 7
+    mov qword [in_msg+40], 44
+    call read_control
+"""
+        self.assertEqual(self.status(setup, "    cmp qword [cnt_kernel_dropped], 7\n    jne bad", routine), 0)
+
+    def test_a_negative_age_counts_as_zero(self):
+        routine = self.routine("note_age")
+        ahead = """
+    mov eax, 228
+    xor edi, edi
+    mov esi, future
+    syscall
+    mov rax, [future]
+    add rax, {seconds}
+    mov [arrival_sec], rax
+    mov rax, [future+8]
+    mov [arrival_nsec], rax
+    mov qword [cnt_max_age_ns], {before}
+    call note_age
+    mov rax, [arrival_sec]
+    cmp rax, [item_arrival_sec]
+    jne bad
+"""
+        self.assertEqual(self.status(ahead.format(seconds=3600, before=0),
+                                     "    cmp qword [cnt_max_age_ns], 0\n    jne bad", routine), 0)
+        self.assertEqual(self.status(ahead.format(seconds=3600, before=5),
+                                     "    cmp qword [cnt_max_age_ns], 5\n    jne bad", routine), 0,
+                         "and a negative age is no reason to lower the largest")
+        self.assertEqual(self.status(ahead.format(seconds="-3600", before=0),
+                                     "    cmp qword [cnt_max_age_ns], 0\n    je bad", routine), 0,
+                         "the control: an hour ago is an age")
+
+    def test_with_no_timestamp_there_is_no_age(self):
+        routine = self.routine("note_age")
+        setup = """
+    mov qword [arrival_sec], 0
+    mov qword [cnt_max_age_ns], 0
+    call note_age
+"""
+        self.assertEqual(self.status(setup, "    cmp qword [cnt_max_age_ns], 0\n    jne bad", routine), 0)
 
 
 class ForwardingHandler(unittest.TestCase):

@@ -13,9 +13,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATIENCE = 300  # seconds: a mutant with nothing to catch it takes about 90
+RUNTIME_TESTS = ["tests.test_forward.WhatTheRuntimeDoesWithIt", "tests.test_forward.WhatTheKernelSaid"]
 VERILOG_TESTS = ["tests.test_rtverilog.TheEmittersOwnArithmetic", "tests.test_rtverilog.TheChecksum",
                  "tests.test_rtverilog.RandomWalks", "tests.test_rtverilog.OtherHandlers",
                  "tests.test_rtverilog.Synthesis"]
@@ -210,6 +212,31 @@ MUTANTS = {
     "port A's output does not hold": ("src/rtverilog.py",
         "        add(\"        if (a_en) a_dout <= cells[a_addr];\")\n",
         "        add(\"        a_dout <= cells[a_addr];\")\n"),
+    # --- what the kernel says about ingress
+    "the drop count is taken whole": ("src/runtime.py",
+        'add("    sub edx, [last_drops]")', 'pass', RUNTIME_TESTS),
+    "the last count is not kept": ("src/runtime.py",
+        'add("    mov [last_drops], r8d")', 'pass', RUNTIME_TESTS),
+    "the difference is taken in 64 bits": ("src/runtime.py",
+        'add("    sub edx, [last_drops]")', 'add("    mov r9d, [last_drops]"); add("    sub rdx, r9")', RUNTIME_TESTS),
+    "the socket is not asked for the count": ("src/runtime.py",
+        "for option in (SO_RXQ_OVFL, SO_TIMESTAMPNS):", "for option in (SO_TIMESTAMPNS,):", RUNTIME_TESTS),
+    "the socket is not asked for the time": ("src/runtime.py",
+        "for option in (SO_RXQ_OVFL, SO_TIMESTAMPNS):", "for option in (SO_RXQ_OVFL,):", RUNTIME_TESTS),
+    "the room for control messages is not reset": ("src/runtime.py",
+        'add(f"    mov qword [in_msg+40], {CONTROL_BYTES}")', 'pass', RUNTIME_TESTS),
+    "a message is not aligned to the next": ("src/runtime.py",
+        'add("    add rcx, 7")', 'pass', RUNTIME_TESTS),
+    "a negative age is not zero": ("src/runtime.py",
+        'add("    jns .known")', 'add("    jmp .known")', RUNTIME_TESTS),
+    "the age is the last and not the largest": ("src/runtime.py",
+        'add("    jbe .done")\n    add("    mov [cnt_max_age_ns], rax")', 'add("    mov [cnt_max_age_ns], rax")', RUNTIME_TESTS),
+    "an item with no timestamp has an age": ("src/runtime.py",
+        'add("    test rdx, rdx")\n    add("    jz .done")\n    add("    mov [item_arrival_sec], rdx")',
+        'add("    mov [item_arrival_sec], rdx")', RUNTIME_TESTS),
+    "a refused item is aged": ("src/runtime.py",
+        'add("    call read_control")', 'add("    call read_control"); add("    push rax"); add("    call note_age"); add("    pop rax")',
+        RUNTIME_TESTS),
     # --- back to the runtime
     "the image is sized without the reserve": ("src/runtime.py",
         "return (K_IN * n_max + self.reserve_at_most + n_max\n",
@@ -232,8 +259,8 @@ MUTANTS = {
 }
 
 
-def run(work: str, path: str, old: str, new: str) -> tuple:
-    tests = VERILOG_TESTS if path == "src/rtverilog.py" else TESTS
+def run(work: str, path: str, old: str, new: str, tests: Optional[list] = None) -> tuple:
+    tests = tests or (VERILOG_TESTS if path == "src/rtverilog.py" else TESTS)
     """What became of one mutant: its verdict, and whether the tests failed to notice it."""
     tree = os.path.join(work, "tree")
     shutil.rmtree(tree, ignore_errors=True)

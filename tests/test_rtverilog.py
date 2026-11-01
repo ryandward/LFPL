@@ -730,7 +730,8 @@ class Synthesis(unittest.TestCase):
         path = os.path.join(self.workdir.name, "run.ys")
         with open(path, "w") as handle:
             handle.write(f"read_verilog -sv {self.design}\nhierarchy -check -top checksum\n" + script)
-        done = subprocess.run(["yosys", "-q", "-l", path + ".log", path], capture_output=True, text=True)
+        done = subprocess.run(["yosys", "-q", "-l", path + ".log", path], capture_output=True, text=True,
+                              cwd=self.workdir.name)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         with open(path + ".log") as handle:
             return handle.read()
