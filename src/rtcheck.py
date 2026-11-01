@@ -818,10 +818,21 @@ class Checker:
                     raise self.fail(f"argument {operand} is {token.ty}, and {signature.name} "
                                     f"wants {want}")
                 self._hand_over_cell(token.word, operand)
-            else:
+            elif token.ty == "lit" and not self._literal_argument(token, want):
+                raise self.fail(f"the literal {operand} cannot be a {want}")
+            elif token.ty != "lit":
                 self.unify(token.ty, want, f"an argument of {signature.name}")
             tokens.append(token)
         return tokens
+
+    def _literal_argument(self, token: Tok, want: Type) -> bool:
+        value = token.word[1]
+        if want == "bool":
+            return value in (0, 1)
+        if is_scalar(want):
+            return is_int(want)
+        decl = self._decl(want)
+        return decl is not None and decl.kind == "tagless" and value == 0
 
     def _hand_over_cell(self, word: Word, operand: str) -> None:
         assert self.S is not None

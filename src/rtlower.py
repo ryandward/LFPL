@@ -675,7 +675,8 @@ class RTLower(Stage):
         """The next arm starts from the state at the branch."""
         while len(self.U) > frame.umark:
             undo = self.U.pop()
-            self.B.set(undo.index, undo.binder)
+            if undo.index < len(self.B):  # a name bound inside the arm is out of scope already
+                self.B.set(undo.index, undo.binder)
         self.G.truncate(frame.gmark)
 
     def _close_join(self, frame: Frame) -> None:
@@ -702,6 +703,7 @@ class RTLower(Stage):
             top.aux = value.off    # how many field values wait on the stack
             self.F.set_top(top)
             return
+        self._settle_pending()
         if value.kind == V_REG and value.flags & OWNED:
             register = value.reg
         else:
@@ -710,6 +712,7 @@ class RTLower(Stage):
         top.reg = register
         top.word = value.word if value.kind != V_NULL else 1
         top.state = 2
+        top.gmark, top.umark = len(self.G), len(self.U)  # consuming the scrutinee stays done
         self.F.set_top(top)
 
     def _open_arm(self, payload: bytes) -> None:
@@ -759,14 +762,13 @@ class RTLower(Stage):
 
     def _close_match(self) -> None:
         top = self.F.pop()
-        if top.state == 1:  # the fields of a known constructor have been named, and leave the stack
-            self.V.truncate(top.vmark)
         if top.dest == D_REG:
             self.label(top.l3)
         self._close_join(top)
 
     def _sep_if(self, top: Frame, payload: bytes) -> None:
         if payload[0] == 1:
+            top.gmark, top.umark = len(self.G), len(self.U)  # what the condition did, stays done
             self.label(top.l1)
             top.state = 1
         else:
@@ -827,8 +829,10 @@ class RTLower(Stage):
         width = payload[0]
         name = OP_NAMES[top.aux]
         parent = self.F.top()
-        if (parent.kind == K_CTOR and top.dest == D_ANY and left.kind == V_LOC and name in _RMW
-                and left.cell == parent.cell and right.kind in (V_LIT, V_REG)):
+        phantom = len(self.F) > 1 and self.F.at(len(self.F) - 2).kind == K_MATCH and (
+            self.F.at(len(self.F) - 2).state == 0)
+        if (parent.kind == K_CTOR and not phantom and top.dest == D_ANY and left.kind == V_LOC
+                and name in _RMW and left.cell == parent.cell and right.kind in (V_LIT, V_REG)):
             field = self.L.top()
             if field.off == left.off and field.size == left.size == width:
                 self.V.push(right)
@@ -917,8 +921,8 @@ class RTLower(Stage):
                         f"position, and non-tail recursion is refused until DESCEND and ASCEND exist")
         for index in range(arguments_from, len(self.V)):
             value = self.V.at(index)
-            if value.kind == V_CAP:
-                self._close_cell(value.cell, frozenset(), arguments_from)
+            if value.kind == V_CAP:  # a location of this cell among the arguments is read first
+                self._close_cell(value.cell, frozenset(), len(self.V))
         values = [self.V.pop() for _ in range(argc)]
         values.reverse()
         operands = ", ".join(self._operand(v) for v in values)
@@ -1171,7 +1175,8 @@ class RTLower(Stage):
         elif kind == K_MATCH:
             self._sep_match(top)
         elif kind == K_ARM:
-            pass
+            if top.state == 1:  # every field of a known constructor now has its name
+                self.V.truncate(self.F.at(len(self.F) - 2).vmark)
         elif kind == K_WITH:
             self._sep_with(top, payload)
         elif kind in (K_AND, K_OR):

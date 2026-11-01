@@ -1392,8 +1392,10 @@ class FunctionCheck:
                     tags[pointer] = x
                 elif x[0] == "not" and y[0] == "not":
                     tags[pointer] = ("not", x[1] & y[1])
+            if merged.frame != other.frame:
+                self.problems.append(Problem(self.fn.name, "a join", "two edges with different frames"))
             merged = State(regs, mem, merged.flags if merged.flags == other.flags else None,
-                           T.either(c, other.cond), tags, merged.dead | other.dead)
+                           T.either(c, other.cond), tags, merged.dead | other.dead, merged.frame)
         return merged
 
     # --- the walk over the function, in emitted order

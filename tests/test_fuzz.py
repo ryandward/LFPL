@@ -26,6 +26,7 @@ from src.lower import FailFast, build_and_run, compile_source, occupancy_bound  
 from src.symcheck import check_translation  # noqa: E402
 from src.validate import validate  # noqa: E402
 
+PIPELINE = os.environ.get("LFPL_PIPELINE", "lower")
 COUNT = int(os.environ.get("LFPL_FUZZ", "60"))
 SEED = int(os.environ.get("LFPL_FUZZ_SEED", "0"))
 WIDTHS = {8: "Int8", 16: "Int16", 32: "Int32", 64: "Int64"}
@@ -46,6 +47,20 @@ def compile_checked(source: bytes) -> str:
 
     compile_source(source, on_line=lines.append, checks=True, on_step=on_step)
     return "\n".join(lines) + "\n"
+
+
+if PIPELINE == "rt":  # the same programs, through the register-transfer path
+    from src.lfplo import compile_program as compile_checked  # noqa: E402,F811
+    from src.rtlower import Limit  # noqa: E402
+
+    def _limit_of(failure: Exception) -> str:
+        return str(failure).split(":")[0]
+else:
+    class Limit(Exception):  # type: ignore[no-redef]
+        pass
+
+    def _limit_of(failure: Exception) -> str:
+        return str(failure)
 
 
 class Scalars:
@@ -715,6 +730,9 @@ class Differential(unittest.TestCase):
                     self.assertIsNotNone(failure.limit, f"not a declared limit: {failure}\n"
                                                          f"{source.decode()}")
                     limits[failure.limit] += 1
+                    continue
+                except Limit as failure:
+                    limits[_limit_of(failure)] += 1
                     continue
                 self.assertEqual(validate(asm), [], source.decode())
                 self.assertEqual([str(p) for p in check_translation(source, asm)], [],

@@ -489,7 +489,9 @@ class CheckStage(Stage):
             found = self._g_find(E_TYPE, payload)
             self.decl_forward = -1
             if found is not None:
-                if self._g(found)[1] != _FORWARD:
+                # G's first entry is the built-in Free, which a Phase 1 program declares for
+                # itself. The runtime still checks the shape of what a handler is given.
+                if self._g(found)[1] != _FORWARD and not (self.lfplo and found == 0):
                     raise self._reject("duplicate type name")
                 self.decl_forward = found
             self.decl_type = self._g_push(E_TYPE, payload, a=kind)

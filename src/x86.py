@@ -152,6 +152,7 @@ class Backend:
         self.home: dict[int, Home] = {}
         self.owner: dict[str, int] = {}
         self.slots: set[int] = set()
+        self.clean: dict[int, int] = {}  # a value in a register that still has a copy in this slot
         self.peak = 0
         self.linear: set[int] = set()
         self.edges: dict[str, dict[int, Home]] = {}
@@ -179,6 +180,10 @@ class Backend:
     def fresh_label(self) -> str:
         self.next_label += 1
         return f"X{self.next_label}"
+
+    def asm_label(self, label: str) -> str:
+        """RT labels are numbered per function, and the assembler has one namespace."""
+        return f"{label}_{self.ordinal}"
 
     @staticmethod
     def sub(register: str, size: int) -> str:
@@ -225,11 +230,15 @@ class Backend:
             del self.owner[home]
         else:
             self.slots.discard(home)
+        copy = self.clean.pop(r, None)
+        if copy is not None:
+            self.slots.discard(copy)
 
     def _table(self, table: dict[int, Home]) -> None:
         self.home = {}
         self.owner = {}
         self.slots = set()
+        self.clean = {}
         for r, home in table.items():
             self._bind(r, home)
 
@@ -242,8 +251,10 @@ class Backend:
         for register in ALLOC:
             if register not in banned:
                 victim = self.owner[register]
-                index = self._new_slot()
-                self.ins("mov", self.slot(index), register)
+                index = self.clean.pop(victim, None)
+                if index is None:
+                    index = self._new_slot()
+                    self.ins("mov", self.slot(index), register)
                 self._free(victim)
                 self._bind(victim, index)
                 return register
@@ -256,8 +267,9 @@ class Backend:
             return home
         register = self._take(pins)
         self.ins("mov", register, self.slot(home))
-        self._free(r)
+        del self.home[r]
         self._bind(r, register)
+        self.clean[r] = home  # values do not change, so the slot stays good until this one goes
         return register
 
     @staticmethod
@@ -535,16 +547,16 @@ class Backend:
             return
         if hold[0] == "jump":
             if hold[1] != next_label:
-                self.ins("jmp", hold[1])
+                self.ins("jmp", self.asm_label(hold[1]))
             return
         _kind, cc, then, other = hold
         if other == next_label:
-            self.ins(f"j{cc}", then)
+            self.ins(f"j{cc}", self.asm_label(then))
         elif then == next_label:
-            self.ins(f"j{NEGATED[cc]}", other)
+            self.ins(f"j{NEGATED[cc]}", self.asm_label(other))
         else:
-            self.ins(f"j{cc}", then)
-            self.ins("jmp", other)
+            self.ins(f"j{cc}", self.asm_label(then))
+            self.ins("jmp", self.asm_label(other))
 
     def _label(self, label: str) -> None:
         if self.live:
@@ -552,7 +564,7 @@ class Backend:
         target = self.edges.pop(label, None)
         assert target is not None, f"{label} has no incoming edge"
         self._table(target)
-        self.place(label)
+        self.place(self.asm_label(label))
         self.live = True
 
     def _needs_moves(self, label: str, table: dict[int, Home]) -> bool:
@@ -589,10 +601,10 @@ class Backend:
             bridge = self.fresh_label()
             self.ins(f"j{cc}", bridge)
             self._arrive(other, other_table)
-            self.ins("jmp", other)
+            self.ins("jmp", self.asm_label(other))
             self.place(bridge)
             self._arrive(then, then_table)
-            self.ins("jmp", then)
+            self.ins("jmp", self.asm_label(then))
         else:
             self._arrive(then, then_table)
             self._arrive(other, other_table)

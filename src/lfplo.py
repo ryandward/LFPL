@@ -8,6 +8,7 @@ in any of them leaves nothing behind, so a program that compiled is one that pas
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import shutil
 import subprocess
@@ -66,6 +67,24 @@ def _generate(lines: Iterable[str], asm_path: str, options: Options,
                               f"bytes, and {state.initial} has {size}")
         handle.write(assembly(image))
     return image, compiled.instructions
+
+
+def compile_program(source: bytes, *, target_cells: int = 1024) -> str:
+    """A Phase 1 program, with `fn main` and no handler: the assembly, to run once and exit. The
+    runtime is not involved, so this is what shows the compiler does what the old one did."""
+    from .lower import _trailer
+
+    out: list[str] = []
+    checker = Checker()
+    backend = Backend(out.append)
+    for line in rt_lines(io.BytesIO(source)):
+        checker.feed(line)
+        backend.feed(line)
+    checker.finish()
+    main = next((f for f in checker.functions.values() if f.name == "main"), None)
+    mode = 0 if main is None else (2 if main.params else 1)
+    return ("default abs\nsection .text\nglobal _start\n" + "\n".join(out) + "\n"
+            + _trailer(mode, target_cells) + "\n")
 
 
 def _validate(source: Optional[bytes], asm_path: str, image: Image) -> None:
