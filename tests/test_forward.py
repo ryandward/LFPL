@@ -141,7 +141,7 @@ class WhatTheKernelSaid(unittest.TestCase):
     def setUp(self):
         self.workdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.workdir.cleanup)
-        self.router = Forwarder(bytes(1024), self.workdir.name)
+        self.router = Forwarder(bytes(1024), self.workdir.name, build_options=("--measure-age",))
         self.addCleanup(self.router.close)
 
     def accounted(self, now: dict) -> int:
@@ -221,6 +221,50 @@ class WhatTheKernelSaid(unittest.TestCase):
         self.assertEqual((now["malformed"], now["max_age_ns"]), (1, 0))
 
 
+class ReadingTheClock(unittest.TestCase):
+    """A system call for each item is only paid by a build that asks for what it buys."""
+
+    def assembled(self, *options: str) -> str:
+        from src import lfplo
+        from src.runtime import Options
+
+        with tempfile.TemporaryDirectory() as workdir:
+            asm, table = os.path.join(workdir, "p.asm"), os.path.join(workdir, "routes.bin")
+            with open(table, "wb") as handle:
+                handle.write(bytes(1024))
+            lfplo.build(os.path.join(ROOT, SOURCE), os.path.join(workdir, "out"),
+                        Options(41000, 41100, 41001, measure_age="--measure-age" in options),
+                        {"routes": table}, keep_asm=asm)
+            with open(asm) as handle:
+                return handle.read()
+
+    def test_a_build_that_does_not_ask_reads_no_clock_and_asks_for_no_timestamps(self):
+        text = self.assembled()
+        self.assertNotIn("note_age", text)
+        self.assertNotIn("mov eax, 228", text, "clock_gettime")
+        self.assertNotIn("mov edx, 35", text, "SO_TIMESTAMPNS")
+        self.assertIn("mov edx, 40", text, "SO_RXQ_OVFL stays: counting drops takes no system call")
+
+    def test_a_build_that_asks_does_both(self):
+        text = self.assembled("--measure-age")
+        self.assertIn("call note_age", text)
+        self.assertIn("mov eax, 228", text)
+        self.assertIn("mov edx, 35", text)
+
+    def test_max_age_stays_zero_when_nothing_asked_for_it(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            router = Forwarder(bytes(1024), workdir)
+            try:
+                router.process.send_signal(signal.SIGSTOP)
+                router.send(64, 1)
+                time.sleep(0.1)
+                router.process.send_signal(signal.SIGCONT)
+                router.outputs[0].recv(64)
+                self.assertEqual(router.settle(1)["max_age_ns"], 0)
+            finally:
+                router.close()
+
+
 class WhatTheRuntimeDoesWithIt(unittest.TestCase):
     """The two routines of src/runtime.py, assembled by themselves with what a socket cannot be made
     to do on demand: a count that wraps, and an arrival time ahead of the clock. They are the routines a
@@ -263,7 +307,8 @@ in_msg: dq 0, 0, 0, 0, in_control, 0, 0
                 handle.write(bytes(1024))
             subprocess.run([sys.executable, "-m", "src.lfplo", os.path.join(ROOT, SOURCE), "-o",
                             os.path.join(workdir, "out"), "--in-port", "41000", "--out-port", "41100",
-                            "--ctl-port", "41001", "--state", f"routes={table}", "--asm", asm],
+                            "--ctl-port", "41001", "--state", f"routes={table}", "--asm", asm,
+                            "--measure-age"],
                            cwd=ROOT, check=True, capture_output=True)
             with open(asm) as handle:
                 text = handle.read()

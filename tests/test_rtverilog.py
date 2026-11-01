@@ -105,7 +105,7 @@ def on_x86(source: str, datagrams: list) -> list:
 
 class TargetIndependence(unittest.TestCase):
     def test_it_loads_nothing_of_the_x86_backend_or_runtime(self):
-        """Through anything it imports, too: this is why it does not use src/lfplo.py's `certify`."""
+        """Through anything it imports, too: this is why `certify` has a module of its own."""
         check = ("import sys, src.rtverilog; print(sorted(m for m in sys.modules "
                  "if m in ('src.x86', 'src.runtime', 'src.lfplo', 'src.lower', 'src.validate', 'src.symcheck')))")
         done = subprocess.run([sys.executable, "-c", check], cwd=ROOT, check=True, capture_output=True, text=True)
@@ -115,7 +115,7 @@ class TargetIndependence(unittest.TestCase):
         with open(os.path.join(ROOT, "src", "rtverilog.py")) as handle:
             tree = ast.parse(handle.read())
         modules = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level}
-        self.assertEqual(modules, {"ring", "rtcheck", "rtlower", "simplex"})
+        self.assertEqual(modules, {"certify", "ring", "rtcheck", "rtlower"})
 
     STREAM = """
 type t16 abstract Bytes

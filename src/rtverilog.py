@@ -38,10 +38,10 @@ import sys
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Union
 
+from .certify import certify
 from .ring import FStarved, Reject
-from .rtcheck import NO_WORK, Bound, Checker, RTError, Unbounded
+from .rtcheck import NO_WORK, Bound, Checker, RTError
 from .rtlower import Limit, rt_lines
-from .simplex import minimize
 
 CELL_BITS = 128
 CELL_BYTES = CELL_BITS // 8
@@ -1284,20 +1284,6 @@ def _hex_lines(data: bytes, array: tuple) -> str:
     return "".join(f"{word:0{2 * size}x}\n" for word in words)
 
 
-def _certified(checker: Checker, name: str, n_max: int) -> Bound:
-    """LFPL-O section 5.5: the checker writes the linear program, the solver proposes numbers, and
-    the checker evaluates its own inequalities with them, so the solver is not trusted."""
-    program = checker.linear_program(name, n_max)
-    proposed = {}
-    for resource in ("cells", "steps"):
-        solved = minimize(program.objective(), program.constraints(resource))
-        if solved is None:
-            raise Unbounded(f"section 8.2: handler {name} has no linear bound on {resource}: no "
-                            f"amount per cell of its item pays for what it does")
-        proposed[resource] = solved
-    return checker.verify(name, proposed["cells"], proposed["steps"])
-
-
 def translate(lines: Iterable[str], *, n_max: int = 216, k_out: int = 64, cells: Optional[int] = None,
               initial: Optional[dict[str, bytes]] = None) -> Translation:
     """The only way in. rtcheck reads every line first, and the bound has to pass its certificate, so
@@ -1312,7 +1298,7 @@ def translate(lines: Iterable[str], *, n_max: int = 216, k_out: int = 64, cells:
         raise RTError(f"section 3.1: this machine serves exactly one handler, and the program "
                       f"declares {len(handlers)}")
     name = handlers[0].name
-    bound = _certified(checker, name, n_max)
+    bound = certify(checker, name, n_max)
     reserve = bound.a * n_max + bound.b
     largest_output = n_max + reserve
     count = cells if cells is not None else (K_IN * n_max + reserve + n_max + k_out * O_MAX * largest_output)

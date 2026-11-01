@@ -7,10 +7,11 @@ cannot pass by accident.
 import ast
 import os
 import unittest
+from unittest import mock
 
 from fractions import Fraction
 
-from src.lfplo import certify
+from src.certify import certify
 from src.rtcheck import Budget, RTError, Unbounded, check_stream
 from src.simplex import minimize
 
@@ -615,6 +616,18 @@ end decreasing 0,1
         self.assertIn(Budget().plus(first).plus(second, -1), signature.obligations)
         self.assertIn(Budget().plus(second).plus(first, -1), signature.obligations)
         self.assertNotIn(Budget().plus(signature.param_pots[2]).plus(first, -1), signature.obligations)
+
+
+class WhenTheSolverRunsOut(unittest.TestCase):
+    def test_a_spent_budget_is_a_refusal_with_the_section_that_declares_it(self):
+        """src.simplex.MAX_PIVOTS is what section 8.2 declares, and this holds the two together."""
+        with mock.patch("src.simplex.MAX_PIVOTS", 0):
+            with self.assertRaisesRegex(Unbounded, r"section 8\.2: .*more than 0 pivots"):
+                certify(check(ITEM, REVERSE, TWICE), "h", 216)
+
+    def test_the_budget_is_far_past_what_a_handler_needs(self):
+        with mock.patch("src.simplex.MAX_PIVOTS", 100):
+            certify(check(ITEM, REVERSE, TWICE), "h", 216)
 
 
 class Certificate(unittest.TestCase):

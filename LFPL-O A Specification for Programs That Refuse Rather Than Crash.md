@@ -368,15 +368,18 @@ Admission is the only place where running code refuses anything. It decides in c
 
 ### 6.1 The decision
 
-For an item of n cells bound for handler h, admission reads (a\_h, b\_h, c\_h, d\_h) from the admission table, computes R(n) and W(n), and checks five conditions in a fixed order. The first one that fails names the refusal.
+For an item of n cells bound for handler h, admission reads (a\_h, b\_h, c\_h, d\_h) from the admission table, computes R(n) and W(n), and checks these conditions in a fixed order. The first one that fails names the refusal.
 
 | Order | Condition | Refusal reason |
 | --- | --- | --- |
 | 1 | n ≤ N\_max | TooLarge |
 | 2 | the pool holds at least R(n) + n cells | Short |
 | 3 | egress has room for O\_max messages | Full |
-| 4 | the item's age in the queue + W(n) ≤ its deadline D\_h, if one is declared | Late |
+| 4a | the item's age ≤ its deadline D\_h on the wall clock, if one is declared | Late |
+| 4b | the steps of the work queued ahead of it + W(n) ≤ a step budget S\_h, if one is declared | Behind |
 | 5 | the program's own admission predicate holds, if one is declared | Policy |
+
+Conditions 4a and 4b are separate because they measure different things, and steps and seconds are never added together. Age is a time a clock read, and W(n) is a count the compiler proved. No constant turns one into the other on x86-64, where a step's time depends on caches and on whatever else the machine is doing. So 4a says how long this item has already waited, and 4b says how much work it would still be, and each is compared with a limit in its own units.
 
 On success, R(n) cells become the item's Free argument, n cells replenish ingress (rule ADMIT), and the handler starts. By Theorem 5.1 it cannot run out.
 
@@ -455,7 +458,7 @@ Assumption A2 in detail. At runtime the program makes only these calls:
 | --- | --- | --- |
 | ingress read (`read`, `recvmmsg`, or an AF\_XDP ring) | items; no item (0 or EAGAIN); an error | items arrive by rule ARRIVE; no item means idle; an error is counted and treated as no item |
 | egress write (`write`, `sendmmsg`, or an AF\_XDP ring) | sent; would block; an error | sent runs rule DRAIN; would block leaves the message queued, and a full queue makes admission refuse with Full; an error is counted, and the message is dropped with its cells returned |
-| clock read (`clock_gettime`, or `rdtsc`), only when a deadline is declared | a time | used by condition 4 of admission |
+| clock read (`clock_gettime`, or `rdtsc`), only when a deadline is declared | a time | used by condition 4a of admission |
 
 The runtime never calls `mmap`, `brk` or `clone`, and installs no signal handlers. Synchronous faults (SIGSEGV, SIGFPE) cannot arise unless assumption A1 or A3 is violated. The guard page is defense in depth: if a compiler bug overruns the stack, the result is a clean fault, not silent corruption.
 
@@ -504,6 +507,7 @@ With exact last uses, a scalar is moved out before its location is overwritten, 
 | global names G\_max | 2,048 | checker |
 | binders in one function | 128 | lowerer; this also bounds snapshots |
 | inequalities in one handler's linear program, with what it calls | 1,024 | resource analysis |
+| pivots to solve one linear program | 10,240, about ten times what the largest has needed | resource analysis |
 | a constructor fits one cell | B bytes | checker |
 | arguments per function | 6 | checker |
 | frame slots per function F\_max | declared | lowerer |
@@ -745,7 +749,7 @@ The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and 
 | non-tail recursion | refused, as a declared limit | DESCEND and ASCEND |
 | arrays and Fin N | `Array[N] t` of scalars, read with `idx` and `get`. N must be a power of two. A Fin N may live in a cell. | `swap`, linear elements, and any N once division exists |
 | unboxed pairs | present, as flat tuples of at most six, returned and bound and never stored | nothing |
-| handlers, serving loop, admission | one handler and one ingress, over UDP on the loopback address, one datagram per turn. Admission works out n from the datagram's length, then checks TooLarge, Short and Full. Late and Policy cannot be declared yet, so W(n) is only added to a counter, and every source refuses by Drop. | several handlers, recvmmsg or AF_XDP, Hold, deadlines, the admission predicate, and state slots of cells |
+| handlers, serving loop, admission | one handler and one ingress, over UDP on the loopback address, one datagram per turn. Admission works out n from the datagram's length, then checks TooLarge, Short and Full. Late, Behind and Policy cannot be declared yet, so W(n) is only added to a counter, and every source refuses by Drop. | several handlers, recvmmsg or AF_XDP, Hold, deadlines, the admission predicate, and state slots of cells |
 | resource analysis and certificates | present on every build. `src/rtcheck.py` writes section 5's inequalities as it types each function, `src/simplex.py` proposes numbers, and the checker evaluates every inequality with them, so the solver is not trusted. A handler can walk its body. | polynomial bounds, and k\_x86 of section 8.3, which has not been computed, so W(n) counts steps and is not yet a time |
 | stack in the image | present: S_max comes from the call graph, the stack is in the image with a guard page below it, and the depth is recomputed from the assembly | nothing |
 | startup: lock, prefault, signals | present. Each step that can fail exits with its own number, before any input. | nothing |
@@ -765,8 +769,8 @@ The implementation decides some things this text leaves open, or does not mentio
 - **Free.** A program may declare its own, for Phase 1's sake, but a handler's must be exactly `End | More(next: Free)`, because the pool is threaded through that field.
 - **Malformed.** A datagram shorter than an item's scalars is counted as malformed. That is a fifth reason at ingress, beside those of section 6.1, because it never was an item.
 - **The control port.** It is one more ingress source, bound to the loopback address. `S` answers with the counters, `P` pauses egress, `R` resumes it and `Q` shuts down. Pausing exists because loopback sends never block, so without it nothing could show that a full queue refuses.
-- **System calls.** Beyond section 7.3's list, ingress and egress use `recvmsg` and `sendmsg`, scattering a datagram straight into cells, and the control port uses `recvfrom` and `sendto`. Idling is a blocking ingress read with a 1 ms timeout, so `poll` is not needed. `setsockopt` asks for two control messages on the ingress socket, and `clock_gettime` is called once per admitted item.
-- **What the kernel says about ingress.** `SO_RXQ_OVFL` gives the socket's count of datagrams it dropped, on each datagram it delivers, and `kernel_dropped` adds the unsigned 32-bit differences. The kernel stamps a datagram with the count when it queues it, so while the socket is overflowing nothing can say so, and the count lags until the next datagram gets in. `SO_TIMESTAMPNS` gives each datagram's arrival, kept while that item is being served, and `max_age_ns` is the largest wait from there to admission, with a negative age taken as 0. Nothing refuses on it yet: section 6.1's condition 4 is to be rewritten to separate that age from W(n).
+- **System calls.** Beyond section 7.3's list, ingress and egress use `recvmsg` and `sendmsg`, scattering a datagram straight into cells, and the control port uses `recvfrom` and `sendto`. Idling is a blocking ingress read with a 1 ms timeout, so `poll` is not needed. `setsockopt` asks for control messages on the ingress socket, and in a build that keeps `max_age_ns`, `clock_gettime` is called once per admitted item.
+- **What the kernel says about ingress.** `SO_RXQ_OVFL` gives the socket's count of datagrams it dropped, on each datagram it delivers, and `kernel_dropped` adds the unsigned 32-bit differences. The kernel stamps a datagram with the count when it queues it, so while the socket is overflowing nothing can say so, and the count lags until the next datagram gets in. A build that asks for it with `--measure-age` also has `SO_TIMESTAMPNS`, which gives each datagram's arrival, kept while that item is being served, and `max_age_ns` is the largest wait from there to admission, with a negative age taken as 0. Nothing refuses on it yet: it is what section 6.1's condition 4a will compare with a deadline.
 - **Link-time options.** `--state` gives a state array its initial contents, and `--cells` can make the image smaller than section 3.4's C, which is what makes Short reachable. `--count-steps` validates the build without its counters and then rebuilds with one at each step the checker charged for, so that tests can hold running code to W(n). That rebuild is for measuring, and is not itself validated.
 - **The chain.** An item's chain may be abstract, like `data Bytes;`, or declared with the exact layout the runtime builds, `Last | Chunk(used, b0, ..., b6: Int8, next)`, which lets a handler walk it. Cells are reused, so admission clears what follows the used bytes of a chain's last cell, and a program can read nothing an earlier item left. A program can now also write the used count and grow the chain, so egress clamps each count to 7. N\_out is not declared: it is N\_max + R(N\_max), because an output can hold every cell of its item and of its reserve. One message gathers at most 1,024 chain entries, which is what `sendmsg` takes, and a longer chain counts as a send error, with its cells returned.
 - **Narrowing.** `low8`, `low16` and `low32` keep the low bits of an integer. `pack` only widens, and without these a sum worked out in Int64 could not be stored in a narrower field.

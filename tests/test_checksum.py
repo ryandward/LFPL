@@ -15,8 +15,10 @@ from fractions import Fraction
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src import certify as certifying  # noqa: E402
 from src import lfplo  # noqa: E402
-from src.lfplo import Refused, certify  # noqa: E402
+from src.certify import certify  # noqa: E402
+from src.lfplo import Refused  # noqa: E402
 from src.rtcheck import Checker, RTError  # noqa: E402
 from src.rtlower import rt_lines  # noqa: E402
 from src.runtime import Options  # noqa: E402
@@ -133,8 +135,8 @@ class TheBound(Serving):
     def test_a_solver_with_a_wrong_answer_leaves_no_binary(self):
         """This is the whole of the claim that the solver need not be trusted, so it goes through
         the driver: a build whose solver lies must fail like any other failed check."""
-        real = lfplo.minimize
-        lfplo.minimize = lambda objective, constraints: {unknown: Fraction(0) for unknown in objective}
+        real = certifying.minimize
+        certifying.minimize = lambda objective, constraints: {unknown: Fraction(0) for unknown in objective}
         try:
             with tempfile.TemporaryDirectory() as workdir:
                 exe = os.path.join(workdir, "checksum")
@@ -144,7 +146,7 @@ class TheBound(Serving):
                     lfplo.build(SOURCE, exe, Options(41000, 41100, 41001))
                 self.assertFalse(os.path.exists(exe))
         finally:
-            lfplo.minimize = real
+            certifying.minimize = real
 
 
 class TheChecksum(Serving):

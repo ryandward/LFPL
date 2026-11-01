@@ -156,8 +156,9 @@ Once a handler starts it finishes. All the memory is laid out at link time and t
 startup, and the stack is inside that image with a guard page below it, so a flood changes the
 refusal count and nothing else. A flood too fast to read is dropped by the kernel, before any of
 this, and the socket says how many on the next datagram it delivers, so that `kernel_dropped`, `served` and
-the refusals add up to what was sent. It also says when each datagram arrived, and `max_age_ns` keeps
-the longest any admitted item waited, which nothing refuses on yet. `tests/test_forward.py` checks each of these against a
+the refusals add up to what was sent. A build with `--measure-age` also asks when each datagram
+arrived, at the cost of reading the clock for every item, and `max_age_ns` keeps the longest any
+admitted item waited, which nothing refuses on yet. `tests/test_forward.py` checks each of these against a
 running binary, from outside it, including pausing egress so that a queue really does fill.
 
 ## A program that walks its item
@@ -442,7 +443,8 @@ catch all of it, apart from a short list of changes that do not alter what it me
 the reason written beside it.
 
 ```
-python3 -m unittest discover -s tests -t .
+python3 -m unittest tests.fast                                        # seconds: no sockets, no simulation
+python3 -m unittest discover -s tests -t .                            # all of it
 LFPL_FUZZ=300 LFPL_FUZZ_SEED=12 python3 -m unittest tests.test_fuzz   # a longer run
 ```
 

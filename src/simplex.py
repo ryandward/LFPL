@@ -16,6 +16,11 @@ guarantees termination on a degenerate problem. It is slower than the usual rule
 problems, and these are small: one row for each join, build and exit of a handler and of what it
 calls. Those rows name two or three unknowns each, so the tableau is kept sparse: a dense one
 spends nearly all of its time subtracting zeros.
+
+Bland's rule terminates, but its worst case is exponential, and a compiler that may not finish has
+no bound of its own. So a solve has a budget of pivots, declared in LFPL-O section 8.2, and spending
+it is a refusal and not a long wait. The linear programs handlers really make take about one pivot
+per row, so at the largest size section 8.2 allows, this is about ten times what one has needed.
 """
 from __future__ import annotations
 
@@ -26,15 +31,36 @@ V = TypeVar("V", bound=Hashable)
 Number = int | Fraction
 Line = dict[int, Fraction]  # column -> coefficient, with no zeros, and the right side at RHS
 RHS = -1
+MAX_PIVOTS = 10240  # for one solve: LFPL-O section 8.2
 
 
 class UnboundedProblem(Exception):
     """The objective can fall forever, so no minimum exists."""
 
 
-def minimize(objective: Mapping[V, Number],
-             constraints: Iterable[tuple[Mapping[V, Number], Number]]) -> Optional[dict[V, Fraction]]:
-    """The values of a minimum, for the variables anything mentions. None if nothing is feasible."""
+class PivotBudgetSpent(Exception):
+    """The solve used all the pivots it may. Nothing is known about the problem either way."""
+
+    def __init__(self, budget: int) -> None:
+        super().__init__(f"more than {budget} pivots")
+        self.budget = budget
+
+
+class _Pivots:
+    def __init__(self, budget: int) -> None:
+        self.budget = budget
+        self.left = budget
+
+    def spend(self) -> None:
+        if not self.left:
+            raise PivotBudgetSpent(self.budget)
+        self.left -= 1
+
+
+def minimize(objective: Mapping[V, Number], constraints: Iterable[tuple[Mapping[V, Number], Number]],
+             *, pivots: Optional[int] = None) -> Optional[dict[V, Fraction]]:
+    """The values of a minimum, for the variables anything mentions. None if nothing is feasible.
+    PivotBudgetSpent if finding out would take more than `pivots`, by default MAX_PIVOTS."""
     rows = [({v: Fraction(c) for v, c in row.items() if c}, Fraction(k)) for row, k in constraints]
     names: list[V] = []
     position: dict[V, int] = {}
@@ -44,13 +70,15 @@ def minimize(objective: Mapping[V, Number],
                 position[v] = len(names)
                 names.append(v)
     solved = _solve([Fraction(objective.get(v, 0)) for v in names],
-                    [([row.get(v, Fraction(0)) for v in names], k) for row, k in rows])
+                    [([row.get(v, Fraction(0)) for v in names], k) for row, k in rows],
+                    _Pivots(MAX_PIVOTS if pivots is None else pivots))
     if solved is None:
         return None
     return dict(zip(names, solved))
 
 
-def _solve(cost: list[Fraction], rows: list[tuple[list[Fraction], Fraction]]) -> Optional[list[Fraction]]:
+def _solve(cost: list[Fraction], rows: list[tuple[list[Fraction], Fraction]],
+           budget: _Pivots) -> Optional[list[Fraction]]:
     """Every row becomes an equation with a slack, -a.x + s = k. A row with k >= 0 starts with its
     slack basic. A row with k < 0 is negated, and needs an artificial variable to start from."""
     count = len(cost)
@@ -73,12 +101,12 @@ def _solve(cost: list[Fraction], rows: list[tuple[list[Fraction], Fraction]]) ->
         tableau.append(line)
     if next_artificial > first_artificial:
         artificial = {b: Fraction(1) for b in basis if b >= first_artificial}
-        _optimize(tableau, basis, _priced(artificial, tableau, basis), None)
+        _optimize(tableau, basis, _priced(artificial, tableau, basis), None, budget)
         if any(tableau[i].get(RHS) for i, b in enumerate(basis) if b >= first_artificial):
             return None
-        _drive_out_artificials(tableau, basis, first_artificial)
+        _drive_out_artificials(tableau, basis, first_artificial, budget)
     wanted = {j: value for j, value in enumerate(cost) if value}
-    _optimize(tableau, basis, _priced(wanted, tableau, basis), first_artificial)
+    _optimize(tableau, basis, _priced(wanted, tableau, basis), first_artificial, budget)
     values = [Fraction(0)] * count
     for i, column in enumerate(basis):
         if column < count:
@@ -95,7 +123,8 @@ def _priced(cost: Line, tableau: list[Line], basis: list[int]) -> Line:
     return reduced
 
 
-def _optimize(tableau: list[Line], basis: list[int], reduced: Line, limit: Optional[int]) -> None:
+def _optimize(tableau: list[Line], basis: list[int], reduced: Line, limit: Optional[int],
+              budget: _Pivots) -> None:
     """Pivot until no column can lower the cost. Columns at `limit` and past it may not enter.
     Bland's rule: the lowest column that helps, and of the tightest rows, the lowest basic column."""
     while True:
@@ -113,6 +142,7 @@ def _optimize(tableau: list[Line], basis: list[int], reduced: Line, limit: Optio
                     best, leaving = ratio, i
         if leaving is None:
             raise UnboundedProblem("the objective has no minimum")
+        budget.spend()
         _pivot(tableau, basis, leaving, entering)
         _subtract(reduced, tableau[leaving], reduced[entering])
 
@@ -136,11 +166,13 @@ def _pivot(tableau: list[Line], basis: list[int], row: int, column: int) -> None
     basis[row] = column
 
 
-def _drive_out_artificials(tableau: list[Line], basis: list[int], first_artificial: int) -> None:
+def _drive_out_artificials(tableau: list[Line], basis: list[int], first_artificial: int,
+                           budget: _Pivots) -> None:
     """Phase one ended at zero, but an artificial can still be basic at zero. Swap it for a real
     column. A row with no real column was redundant: nothing can enter it, and it stays at zero."""
     for i in range(len(tableau)):
         if basis[i] >= first_artificial:
             column = min((j for j in tableau[i] if 0 <= j < first_artificial), default=None)
             if column is not None:
+                budget.spend()
                 _pivot(tableau, basis, i, column)

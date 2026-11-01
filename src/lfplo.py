@@ -18,11 +18,11 @@ import tempfile
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
+from .certify import certify
 from .ring import FStarved, Reject, Ring
-from .rtcheck import Bound, Checker, RTError, Unbounded
+from .rtcheck import Bound, Checker, RTError
 from .rtlower import Limit, rt_lines
 from .runtime import BindingError, Image, Options, assembly, bind
-from .simplex import minimize
 from .symcheck import check_translation
 from .validate import recompute_stack
 from .x86 import Backend, Starved
@@ -50,20 +50,6 @@ def _linear(slope: int, constant: int) -> str:
     if not slope:
         return str(constant)
     return f"{slope} n + {constant}" if constant else f"{slope} n"
-
-
-def certify(checker: Checker, name: str, n_max: int) -> Bound:
-    """LFPL-O section 5.5. The checker writes the linear program, the solver proposes numbers, and
-    the checker evaluates its own inequalities with them, so the solver is not trusted."""
-    program = checker.linear_program(name, n_max)
-    proposed = {}
-    for resource in ("cells", "steps"):
-        solved = minimize(program.objective(), program.constraints(resource))
-        if solved is None:
-            raise Unbounded(f"section 8.2: handler {name} has no linear bound on {resource}: no "
-                            f"amount per cell of its item pays for what it does")
-        proposed[resource] = solved
-    return checker.verify(name, proposed["cells"], proposed["steps"])
 
 
 def _generate(lines: Iterable[str], asm_path: str, options: Options,
@@ -205,6 +191,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--asm", help="also write the assembly here")
     parser.add_argument("--count-steps", action="store_true",
                         help="count the steps that run, to measure W(n) against what they were")
+    parser.add_argument("--measure-age", action="store_true",
+                        help="keep max_age_ns, at the cost of a clock read for each admitted item")
     args = parser.parse_args(argv)
     if args.rt:
         return _print_rt(args.source)
@@ -217,7 +205,7 @@ def main(argv: list[str]) -> int:
     try:
         _remove_stale(args.output)
         options = Options(args.in_port, args.out_port, args.ctl_port, args.n_max, args.k_out,
-                          args.cells)
+                          args.cells, args.measure_age)
         report = build(args.source, args.output, options, initial, keep_asm=args.asm,
                        count_steps=args.count_steps)
     except (Refused, Reject, BindingError, OSError) as failure:

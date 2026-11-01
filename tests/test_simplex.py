@@ -13,7 +13,7 @@ from fractions import Fraction
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.simplex import UnboundedProblem, minimize  # noqa: E402
+from src.simplex import MAX_PIVOTS, PivotBudgetSpent, UnboundedProblem, minimize  # noqa: E402
 
 
 def _solve_square(matrix: list, target: list):
@@ -50,6 +50,14 @@ def vertex_minimum(cost: list, rows: list):
         if best is None or value < best:
             best = value
     return best
+
+
+def _finishes(problem: tuple, budget: int) -> bool:
+    try:
+        minimize(*problem, pivots=budget)
+    except PivotBudgetSpent:
+        return False
+    return True
 
 
 class Solver(unittest.TestCase):
@@ -94,6 +102,22 @@ class Solver(unittest.TestCase):
     def test_a_redundant_row_does_not_disturb_the_answer(self):
         solved = minimize({"x": 1}, [({"x": 1}, -2), ({"x": 1}, -2), ({"x": 2}, -4)])
         self.assertEqual(solved["x"], 2)
+
+    def test_running_out_of_pivots_says_so(self):
+        """c >= 5 + r and r >= 3 take more than one pivot, and no pivots at all cannot start."""
+        problem = ({"c": 100, "d": 1}, [({"c": 1, "r": -1}, -5), ({"r": 1}, -3), ({"d": 1}, -2)])
+        self.assertIsNotNone(minimize(*problem))
+        for budget in (0, 1):
+            with self.subTest(budget=budget), self.assertRaises(PivotBudgetSpent) as caught:
+                minimize(*problem, pivots=budget)
+            self.assertEqual(caught.exception.budget, budget)
+
+    def test_the_budget_is_spent_exactly(self):
+        """The smallest budget that works gives the same answer as the default."""
+        problem = ({"c": 100, "d": 1}, [({"c": 1, "r": -1}, -5), ({"r": 1}, -3), ({"d": 1}, -2)])
+        needed = next(budget for budget in range(MAX_PIVOTS) if _finishes(problem, budget))
+        self.assertGreater(needed, 0)
+        self.assertEqual(minimize(*problem, pivots=needed), minimize(*problem))
 
     def test_random_problems_agree_with_the_list_of_vertices(self):
         rng = random.Random(7)

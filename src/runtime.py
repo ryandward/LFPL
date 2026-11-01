@@ -55,7 +55,8 @@ CONTROL_BYTES = 64         # a timestamp takes 32, and a count 24
 # adds up W(n) for those. steps is what ran, in a build that counts them, and is otherwise 0.
 # kernel_dropped is what the ingress socket has said it dropped, which arrives on the next datagram
 # it delivers, so it lags until there is one. max_age_ns is the longest an admitted item waited, from
-# the kernel's timestamp to admission. Nothing refuses on it yet.
+# the kernel's timestamp to admission, in a build that asks for it, since that takes a system call
+# for each item, and is otherwise 0. Nothing refuses on it yet.
 COUNTERS = ("capacity", "pool", "served", "forwarded", "dropped", "too_large", "short", "full",
             "malformed", "send_errors", "recv_errors", "admitted_cells", "budget_steps", "steps",
             "kernel_dropped", "max_age_ns")
@@ -94,6 +95,7 @@ class Options:
     n_max: int = 216     # the largest item in cells: 1 header and 215 of 7 bytes, for a 1500 MTU
     k_out: int = 64      # the output queue, a power of two
     cells: Optional[int] = None  # None: section 3.4's C. Fewer can make admission refuse with Short
+    measure_age: bool = False    # ask for each datagram's arrival time, and read the clock at admission
 
     def __post_init__(self) -> None:
         for name, port in (("ingress", self.in_port), ("the control port", self.ctl_port)):
@@ -389,7 +391,8 @@ def assembly(image: Image) -> str:
     add("    test rax, rax")
     add("    js .refuse_endpoints")
     add("    mov [in_fd], rax")
-    for option in (SO_RXQ_OVFL, SO_TIMESTAMPNS):  # before bind, so that no datagram goes without
+    for option in (SO_RXQ_OVFL, SO_TIMESTAMPNS) if o.measure_age else (SO_RXQ_OVFL,):
+        # before bind, so that no datagram goes without
         add("    mov eax, 54")
         add("    mov rdi, [in_fd]")
         add(f"    mov esi, {SOL_SOCKET}")
@@ -456,7 +459,8 @@ def assembly(image: Image) -> str:
     add(".arrive:")
     add("    ; ARRIVE: the device writes one item into the slot, or the wait ends with none")
     add(f"    mov qword [in_msg+40], {CONTROL_BYTES}")
-    add("    mov qword [arrival_sec], 0")
+    if o.measure_age:
+        add("    mov qword [arrival_sec], 0")
     add("    mov eax, 47")
     add("    mov rdi, [in_fd]")
     add("    mov esi, in_msg")
@@ -492,7 +496,8 @@ def assembly(image: Image) -> str:
     add(f"    add rax, {O_MAX}")
     add(f"    cmp rax, {image.options.k_out}")
     add("    ja .full")
-    add("    call note_age")
+    if o.measure_age:
+        add("    call note_age")
     add("    ; n comes from the datagram's length, and R(n) and W(n) from the table")
     add("    add [cnt_admitted_cells], r14")
     add("    mov rax, [admission+16]")
@@ -628,15 +633,18 @@ def assembly(image: Image) -> str:
     add(f"    cmp dword [rdi+8], {SOL_SOCKET}")
     add("    jne .advance")
     add(f"    cmp dword [rdi+12], {SO_RXQ_OVFL}")
-    add("    je .drops")
-    add(f"    cmp dword [rdi+12], {SO_TIMESTAMPNS}")
-    add("    jne .advance")
-    add("    mov rdx, [rdi+16]")
-    add("    mov [arrival_sec], rdx")
-    add("    mov rdx, [rdi+24]")
-    add("    mov [arrival_nsec], rdx")
-    add("    jmp .advance")
-    add(".drops:")
+    if o.measure_age:
+        add("    je .drops")
+        add(f"    cmp dword [rdi+12], {SO_TIMESTAMPNS}")
+        add("    jne .advance")
+        add("    mov rdx, [rdi+16]")
+        add("    mov [arrival_sec], rdx")
+        add("    mov rdx, [rdi+24]")
+        add("    mov [arrival_nsec], rdx")
+        add("    jmp .advance")
+        add(".drops:")
+    else:
+        add("    jne .advance")
     add("    ; The socket's count since it was made, which wraps at 32 bits: so the 32-bit difference.")
     add("    mov edx, [rdi+16]")
     add("    mov r8d, edx")
@@ -652,35 +660,36 @@ def assembly(image: Image) -> str:
     add("    ret")
     add("; end read_control")
     add("")
-    add("; An admitted item's arrival, kept while it is the item being served, and how long it waited.")
-    add("; Nothing refuses on this yet. Keeps r12 to r15, which admission is using.")
-    add("note_age:")
-    add("    mov rdx, [arrival_sec]")
-    add("    test rdx, rdx")
-    add("    jz .done")
-    add("    mov [item_arrival_sec], rdx")
-    add("    mov rdx, [arrival_nsec]")
-    add("    mov [item_arrival_nsec], rdx")
-    add("    mov eax, 228")
-    add("    xor edi, edi")
-    add("    mov esi, clock_now")
-    add("    syscall")
-    add("    mov rax, [clock_now]")
-    add("    sub rax, [item_arrival_sec]")
-    add("    imul rax, rax, 1000000000")
-    add("    add rax, [clock_now+8]")
-    add("    sub rax, [item_arrival_nsec]")
-    add("    jns .known")
-    add("    xor eax, eax")
-    add("    ; the clock was stepped back between the two: a negative age is 0")
-    add(".known:")
-    add("    cmp rax, [cnt_max_age_ns]")
-    add("    jbe .done")
-    add("    mov [cnt_max_age_ns], rax")
-    add(".done:")
-    add("    ret")
-    add("; end note_age")
-    add("")
+    if o.measure_age:
+        add("; An admitted item's arrival, kept while it is the item being served, and how long it waited.")
+        add("; Nothing refuses on this yet. Keeps r12 to r15, which admission is using.")
+        add("note_age:")
+        add("    mov rdx, [arrival_sec]")
+        add("    test rdx, rdx")
+        add("    jz .done")
+        add("    mov [item_arrival_sec], rdx")
+        add("    mov rdx, [arrival_nsec]")
+        add("    mov [item_arrival_nsec], rdx")
+        add("    mov eax, 228")
+        add("    xor edi, edi")
+        add("    mov esi, clock_now")
+        add("    syscall")
+        add("    mov rax, [clock_now]")
+        add("    sub rax, [item_arrival_sec]")
+        add("    imul rax, rax, 1000000000")
+        add("    add rax, [clock_now+8]")
+        add("    sub rax, [item_arrival_nsec]")
+        add("    jns .known")
+        add("    xor eax, eax")
+        add("    ; the clock was stepped back between the two: a negative age is 0")
+        add(".known:")
+        add("    cmp rax, [cnt_max_age_ns]")
+        add("    jbe .done")
+        add("    mov [cnt_max_age_ns], rax")
+        add(".done:")
+        add("    ret")
+        add("; end note_age")
+        add("")
     add("; DRAIN: send what is queued, until it is empty or the socket would block")
     add("drain:")
     add("    cmp qword [egress_paused], 0")
@@ -875,11 +884,12 @@ def assembly(image: Image) -> str:
     add(f"queue: resq {image.options.k_out}")
     add(f"in_iov: resq {2 * iov_in}")
     add(f"in_control: resq {CONTROL_BYTES // 8}")
-    add("arrival_sec: resq 1")
-    add("arrival_nsec: resq 1")
-    add("item_arrival_sec: resq 1")
-    add("item_arrival_nsec: resq 1")
-    add("clock_now: resq 2")
+    if o.measure_age:
+        add("arrival_sec: resq 1")
+        add("arrival_nsec: resq 1")
+        add("item_arrival_sec: resq 1")
+        add("item_arrival_nsec: resq 1")
+        add("clock_now: resq 2")
     add("last_drops: resq 1")
     add(f"out_iov: resq {2 * out_iov}")
     for position in range(k):
