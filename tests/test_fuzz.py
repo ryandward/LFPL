@@ -118,9 +118,17 @@ class Scalars:
         else:
             left_text, left = self.value(depth - 1, env)
         if op in ("<<", ">>"):
-            count = self.rng.randrange(self.bits)
-            result = (left << count if op == "<<" else left >> count) & self.mask
-            return f"{op}({left_text}, {count})", result
+            # Section 4.4: 0 once the count reaches the width. The counts around the
+            # width and the ones x86 would mask are the ones worth trying.
+            if self.rng.random() < 0.5:
+                count = self.rng.choice((self.rng.randrange(self.bits), self.bits - 1, self.bits,
+                                         self.bits + 1, 32, 64, 70, 255, 1 << 32))
+                right_text = str(count)
+            else:
+                right_text, count = self.value(depth - 1, env)
+            shifted = left << count if op == "<<" else left >> count
+            result = shifted & self.mask if count < self.bits else 0
+            return f"{op}({left_text}, {right_text})", result
         right_text, right = self.value(depth - 1, env)
         table = {"+": left + right, "-": left - right, "*": left * right,
                  "&": left & right, "|": left | right, "^": left ^ right}
@@ -157,11 +165,13 @@ def widen(text: str, bits: int) -> str:
 def scalar_program(rng: random.Random) -> tuple[bytes, int]:
     bits = rng.choice((8, 16, 32, 64, 64))
     gen = Scalars(rng, bits)
-    params = {name: rng.randrange(gen.mask + 1) for name in ("a", "b", "c")}
+    # Four parameters, so that a shift's count has to work around a live value in rcx.
+    params = {name: rng.choice((rng.randrange(gen.mask + 1), rng.randrange(min(gen.mask, 80) + 1)))
+              for name in ("a", "b", "c", "d")}
     text, value = gen.value(rng.randrange(2, 6), params)
     ty = WIDTHS[bits]
-    source = (f"fn f(a: {ty}, b: {ty}, c: {ty}) : Int64 = {widen(text, bits)};\n"
-              f"fn main() : Int64 = f({params['a']}, {params['b']}, {params['c']});\n")
+    source = (f"fn f(a: {ty}, b: {ty}, c: {ty}, d: {ty}) : Int64 = {widen(text, bits)};\n"
+              f"fn main() : Int64 = f({params['a']}, {params['b']}, {params['c']}, {params['d']});\n")
     return source.encode(), value
 
 
@@ -190,33 +200,44 @@ def call_program(rng: random.Random) -> tuple[bytes, int]:
 
 
 def loop_program(rng: random.Random) -> tuple[bytes, int]:
-    """Tail recursion: parallel moves over parameter registers."""
+    """Tail recursion: parallel moves over parameter registers. The counter is a list
+    of cells, because rule R3 needs a structure that visibly shrinks."""
     mask = (1 << 64) - 1
-    n, x, y = rng.randrange(1, 60), rng.randrange(1 << 20), rng.randrange(1 << 20)
+    x, y = rng.randrange(1 << 20), rng.randrange(1 << 20)
     kind = rng.randrange(3)
     if kind == 0:
-        step = "go(-(n, 1), y, x)"  # a register cycle
+        step = "y, x"  # a register cycle
 
-        def run(n, x, y):
-            while n:
-                n, x, y = n - 1, y, x
-            return x
+        def advance(x, y):
+            return y, x
     elif kind == 1:
-        step = "go(-(n, 1), +(x, y), x)"
+        step = "+(x, y), x"
 
-        def run(n, x, y):
-            while n:
-                n, x, y = n - 1, (x + y) & mask, x
-            return x
+        def advance(x, y):
+            return (x + y) & mask, x
     else:
-        step = "go(-(n, 1), +(y, 1), *(x, 2))"
+        step = "+(y, 1), *(x, 2)"
 
-        def run(n, x, y):
-            while n:
-                n, x, y = n - 1, (y + 1) & mask, (x * 2) & mask
-            return x
-    return (f"fn go(n: Int64, x: Int64, y: Int64) : Int64 = if ==(n, 0) then x else {step};\n"
-            f"fn main() : Int64 = go({n}, {x}, {y});\n").encode(), run(n, x, y)
+        def advance(x, y):
+            return (y + 1) & mask, (x * 2) & mask
+    if rng.random() < 0.2:
+        cells, n = [], 1024  # the whole free list, a real loop
+        call = f"go(r0, {x}, {y}, End)"
+    else:
+        n = rng.randrange(1, 9)
+        cells = [f"c{i}" for i in range(n)]
+        chain = "End"
+        for cell in reversed(cells):
+            chain = f"More@{cell}({chain})"
+        call = f"go({chain}, {x}, {y}, r{n})"
+    for _ in range(n):
+        x, y = advance(x, y)
+    return (f"data Free = End | More(next: Free);\n"
+            f"data Res = Fail | Done(value: Int64, rest: Free);\n"
+            f"fn go(n: Free, x: Int64, y: Int64, back: Free) : Res = match n with\n"
+            f"  | End => match back with End => Fail | More(c, rest) => Done@c(x, rest) end\n"
+            f"  | More(d, r) => go(r, {step}, More@d(back)) end;\n"
+            f"fn main(r0: Free) : Res = {take_cells(cells, call)};\n").encode(), x
 
 
 RECORD = """data Free = End | More(next: Free);
@@ -478,49 +499,66 @@ def cell_call_program(rng: random.Random) -> tuple[bytes, int]:
 
 TREES = """data Free = End | More(next: Free);
 data Res = Fail | Done(value: Int64, rest: Free);
-data Pair;
-data T = Leaf | Node(v: Int64, kids: Pair);
-record Pair { l: T, r: T };
-data Stack = Empty | Push(t: T, s: Stack);
-fn swapkids(k: Pair) : Pair @k = match k with Pair(e, l, r) => Pair@e(r, l) end;
-fn mirror(t: T) : T @t = match t with
-  | Leaf => Leaf
-  | Node(d, v, k) => Node@d(v, swapkids(k)) end;
-fn bump(t: T, n: Int64) : T @t = match t with
-  | Leaf => Leaf
-  | Node(d, v, k) => Node@d(+(v, n), k) end;
-fn left(t: T, n: Int64) : T @t = match t with
-  | Leaf => Leaf
-  | Node(d, v, k) => match k with Pair(e, l, r) =>
-      Node@d(v, Pair@e(bump(l, n), r)) end end;
-fn rotate(t: T) : T = match t with
-  | Leaf => Leaf
-  | Node(d, v, k) => match k with Pair(e, l, r) => match l with
-      | Leaf => Node@d(v, Pair@e(Leaf, r))
-      | Node(d2, v2, k2) => Node@d2(+(v2, v), Pair@e(Node@d(1, k2), r))
+data T0 = L0 | N0(v: Int64);
+record P1 { l: T0, r: T0 };
+data T1 = L1 | N1(v: Int64, kids: P1);
+record P2 { l: T1, r: T1 };
+data T2 = L2 | N2(v: Int64, kids: P2);
+fn swapkids(k: P2) : P2 @k = match k with P2(e, l, r) => P2@e(r, l) end;
+fn mirror(t: T2) : T2 @t = match t with
+  | L2 => L2
+  | N2(d, v, k) => N2@d(v, swapkids(k)) end;
+fn bump(t: T2, n: Int64) : T2 @t = match t with
+  | L2 => L2
+  | N2(d, v, k) => N2@d(+(v, n), k) end;
+fn bump1(t: T1, n: Int64) : T1 @t = match t with
+  | L1 => L1
+  | N1(d, v, k) => N1@d(+(v, n), k) end;
+fn left(t: T2, n: Int64) : T2 @t = match t with
+  | L2 => L2
+  | N2(d, v, k) => match k with P2(e, l, r) =>
+      N2@d(v, P2@e(bump1(l, n), r)) end end;
+fn rotate(t: T2) : T2 = match t with
+  | L2 => L2
+  | N2(d, v, k) => match k with P2(e, l, r) => match l with
+      | L1 => N2@d(v, P2@e(L1, r))
+      | N1(d2, v2, k2) => N2@d2(+(v2, v), P2@e(N1@d(1, k2), r))
     end end end;
 fn finish(acc: Int64, free: Free) : Res = match free with
   | End => Fail | More(c, rest) => Done@c(acc, rest) end;
-fn walk(t: T, stack: Stack, acc: Int64, free: Free) : Res = match t with
-  | Node(d, v, k) => match k with Pair(e, l, r) =>
-      walk(l, Push@e(r, stack), +(*(acc, 3), v), More@d(free)) end
-  | Leaf => match stack with
-      | Empty => finish(acc, free)
-      | Push(d, next, rest) => walk(next, rest, acc, More@d(free)) end
-  end;
+fn rd0(t: T0, acc: Int64, free: Free) : Res = match t with
+  | L0 => finish(acc, free)
+  | N0(d, v) => Done@d(+(*(acc, 3), v), free) end;
+fn rd1(t: T1, acc: Int64, free: Free) : Res = match t with
+  | L1 => finish(acc, free)
+  | N1(d, v, k) => match k with P1(e, l, r) =>
+      match rd0(l, +(*(acc, 3), v), More@d(More@e(free))) with
+      | Fail => rd0(r, 0, End)
+      | Done(c, w, rest) => rd0(r, w, More@c(rest)) end end end;
+fn rd2(t: T2, acc: Int64, free: Free) : Res = match t with
+  | L2 => finish(acc, free)
+  | N2(d, v, k) => match k with P2(e, l, r) =>
+      match rd1(l, +(*(acc, 3), v), More@d(More@e(free))) with
+      | Fail => rd1(r, 0, End)
+      | Done(c, w, rest) => rd1(r, w, More@c(rest)) end end end;
 """
 
 
 def tree_program(rng: random.Random) -> tuple[bytes, int]:
     """Linear fields in nested cells: a matched field becomes a cell pointer, and
-    constructors nest, so a pointer built in place flows into another field. The
-    reader walks any tree in constant stack, with a worklist made of its own cells."""
+    constructors nest, so a pointer built in place flows into another field.
+
+    The types get smaller with depth and the reader is one function per level, because
+    a walk over both children cannot pass rule R3 and non-tail recursion is not built
+    yet: a worklist shrinks one parameter on some calls and another on the rest."""
     mask = (1 << 64) - 1
 
-    def grow(depth: int):
-        if depth == 0 or rng.random() < 0.3:
+    def grow(level: int):
+        if rng.random() < 0.3:
             return None
-        return (rng.randrange(1 << 10), grow(depth - 1), grow(depth - 1))
+        if level == 0:
+            return (rng.randrange(1 << 10), None, None)
+        return (rng.randrange(1 << 10), grow(level - 1), grow(level - 1))
 
     def bumped(t, n: int):
         return None if t is None else ((t[0] + n) & mask, t[1], t[2])
@@ -530,20 +568,23 @@ def tree_program(rng: random.Random) -> tuple[bytes, int]:
             return acc
         return fold(t[2], fold(t[1], (acc * 3 + t[0]) & mask))
 
-    # Each cell costs a match and an arm in main, so this stays within D_max.
-    state = (rng.randrange(1 << 10), grow(2), grow(2))
+    state = (rng.randrange(1 << 10), grow(1), grow(1))
     cells: list[str] = []
 
-    def text(t) -> str:
+    def text(t, level: int) -> str:
         if t is None:
-            return "Leaf"
-        node, pair = f"c{len(cells)}", f"c{len(cells) + 1}"
-        cells.extend((node, pair))
-        first = text(t[1])
-        second = text(t[2])
-        return f"Node@{node}({t[0]}, Pair@{pair}({first}, {second}))"
+            return f"L{level}"
+        node = f"c{len(cells)}"
+        cells.append(node)
+        if level == 0:
+            return f"N0@{node}({t[0]})"
+        pair = f"c{len(cells)}"
+        cells.append(pair)
+        first = text(t[1], level - 1)
+        second = text(t[2], level - 1)
+        return f"N{level}@{node}({t[0]}, P{level}@{pair}({first}, {second}))"
 
-    expression = text(state)
+    expression = text(state, 2)
     for _ in range(rng.randrange(0, 6)):
         op = rng.randrange(4)
         n = rng.randrange(1 << 10)
@@ -561,7 +602,7 @@ def tree_program(rng: random.Random) -> tuple[bytes, int]:
             v, first, second = state
             if first is not None:
                 state = ((first[0] + v) & mask, (1, first[1], first[2]), second)
-    body = take_cells(cells, f"walk({expression}, Empty, 0, r{len(cells)})")
+    body = take_cells(cells, f"rd2({expression}, 0, r{len(cells)})")
     return (TREES + f"fn main(r0: Free) : Res = {body};\n").encode(), fold(state, 0)
 
 

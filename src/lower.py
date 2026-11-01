@@ -197,8 +197,7 @@ def _trailer(mode: int, target_cells: int) -> str:
 # fix. Any other FailFast means the lowerer reached a state it has no rule for,
 # which is a bug in the lowerer, not a property of the program.
 DECLARED_LIMITS = ("register starvation", "section 1:", "section 4.1 against 4.2",
-                   "section 4.4:", "section 5.3:", "section 5.6:",
-                   "a shift count must be a literal")
+                   "section 4.4:", "section 5.3:", "section 5.6:")
 
 
 class FailFast(Exception):
@@ -2061,24 +2060,31 @@ class Lower(Stage):
             self.res = None
             return
         width = self.close_payload[0]
-        if op in ("shl", "shr") and (second is None or second[0] != "imm"):
-            raise self._fail("a shift count must be a literal in Phase 1", dest)
         if fr.l3:
             self._close_rmw(fr, dest, op, second)
             return
         w = self._work(fr)
+        assert second is not None
+        shifting = op in ("shl", "shr")
+        literal = self._literal_count(second) if shifting else None
+        vanishes = literal is not None and literal >= width * 8
         if fr.b4 == 1:
             self.locked = 1 << w
-            self._load_opnd(self._opnd(fr.q), w)
+            if not vanishes:
+                self._load_opnd(self._opnd(fr.q), w)
             self._used(self._resolve(fr.q))
-        elif fr.b4 == 2:
+        elif fr.b4 == 2 and not vanishes:
             self._mov_imm(w, fr.q)
         self.locked = 1 << w
-        assert second is not None
         wide = 8 if width == 8 else 4
-        self.i(op, (O_REG, w, wide), self._operand_of(second, width))
+        if vanishes:
+            self._mov_imm(w, 0)  # section 4.4: x86 would mask the count and shift anyway
+        elif shifting and literal is None:
+            self._shift_by_register(op, w, wide, width * 8, second)
+        else:
+            self.i(op, (O_REG, w, wide), self._operand_of(second, width))
         self._end_scratch()
-        if width < 4 and op in _NEEDS_NORMAL:
+        if width < 4 and op in _NEEDS_NORMAL and not vanishes:
             self.i("movzx", (O_REG, w, 4), (O_REG, w, width))
         if second[0] == "bind":
             self._used(self._resolve(second[1]))
@@ -2089,6 +2095,48 @@ class Lower(Stage):
         self.K.pop()
         self.last_width = width
         self._finish_work(fr, w, dest)
+
+    def _literal_count(self, value: tuple) -> Optional[int]:
+        """The count, when it is known here: a literal, or a let bound to one."""
+        if value[0] == "imm":
+            return value[1]
+        if value[0] == "bind":
+            b = self._b(self._resolve(value[1]))
+            if b.loc == L_IMM:
+                return b.word
+        return None
+
+    def _shift_by_register(self, op: str, w: int, wide: int, bits: int, count: tuple) -> None:
+        """Section 4.4: a shift is 0 when the count reaches the width. x86 takes the count
+        from cl and masks it, so this compares first and branches around the shift.
+
+        rcx is borrowed for this one operation rather than taken, so no value changes
+        home, which also keeps this legal under a condition that has already jumped.
+        Whatever rcx holds is saved around it, unless it is the count itself."""
+        source = (O_REG, count[1], 8) if count[0] == "reg" else self._opnd(count[1])
+        holds_count = source[0] == O_REG and source[1] == RCX
+        target = w
+        saved = None
+        if w == RCX:  # the value has to get out of the count's way, and the result come back
+            target = self._scratch(avoid=1 << RCX)
+            self.i("mov", (O_REG, target, 8), (O_REG, RCX, 8))
+        elif not holds_count and not self.sil.free >> RCX & 1:
+            saved = self._scratch(avoid=1 << RCX)
+            self.i("mov", (O_REG, saved, 8), (O_REG, RCX, 8))
+        if not holds_count:
+            self._load_opnd(source, RCX)
+        too_far, done = self._label(), self._label()
+        self.i("cmp", (O_REG, RCX, 8), (O_IMM, bits))
+        self.i("jcc", (O_LABEL, too_far), (O_IMM, CC_NAMES.index("ae")))
+        self.i(op, (O_REG, target, wide), (O_REG, RCX, 1))
+        self.i("jmp", (O_LABEL, done))
+        self.place(too_far)
+        self.i("xor", (O_REG, target, 4), (O_REG, target, 4))
+        self.place(done)
+        if w == RCX:
+            self.i("mov", (O_REG, RCX, 8), (O_REG, target, 8))
+        elif saved is not None:
+            self.i("mov", (O_REG, RCX, 8), (O_REG, saved, 8))
 
     def _finish_work(self, fr: Fr, w: int, dest: Dest) -> None:
         word = self._word()

@@ -56,7 +56,7 @@ class Terms:
 
     Leaves: ('c', n)  ('arg', i, size)  ('load', ptr, off, size)
             ('op', add|sub|imul|shl, width, x, y)  ('bit', and|or|xor, x, y)
-            ('shr', x, k)  ('trunc', width, x)  ('call', f, args, size)
+            ('shr', x, count)  ('trunc', width, x)  ('call', f, args, size)
             ('struct', ctor, tag, cell, ((off, size, leaf), ...))
             ('setl', width, old, low)  ('undef', why)
     Decisions: ('ite', atom, hi, lo), where an atom is ('lt', x, y) or ('eq', x, y).
@@ -244,11 +244,23 @@ class Terms:
         return self.intern(("bit", name, x, y))
 
     def shr(self, x: int, count: int) -> int:
-        if count == 0:
+        if count == self.ZERO:
             return x
-        if self.is_const(x):
-            return self.const(self.value(x) >> count)
+        if self.is_const(x) and self.is_const(count):
+            amount = self.value(count)
+            return self.const(self.value(x) >> amount if amount < 64 else 0)
         return self.intern(("shr", x, count))
+
+    def total_shift(self, name: str, width: int, x: int, count: int) -> int:
+        """What a shift means in the source: 0 once the count reaches the width in bits.
+        An unknown count becomes a decision, which the machine's guard has to match."""
+        bits = width * 8
+        if self.is_const(count) and self.value(count) >= bits:
+            return self.ZERO
+        shifted = self.arith("shl", width, x, count) if name == "shl" else self.shr(x, count)
+        if self.is_const(count):
+            return shifted
+        return self.select(self.lt(count, self.const(bits)), shifted, self.ZERO)
 
     def setl(self, width: int, old: int, low: int) -> int:
         """A write to a subregister: the low `width` bytes change, and the rest do not."""
@@ -302,7 +314,7 @@ class Terms:
         elif kind == "bit":
             result = self.bitop(node[1], sub(node[2]), sub(node[3]))
         elif kind == "shr":
-            result = self.shr(sub(node[1]), node[2])
+            result = self.shr(sub(node[1]), sub(node[2]))
         elif kind == "trunc":
             result = self.trunc(node[1], sub(node[2]))
         elif kind == "call":
@@ -331,7 +343,7 @@ class Terms:
         if kind == "bit":
             return f"{node[1]}({self.show(node[2])}, {self.show(node[3])})"
         if kind == "shr":
-            return f"shr({self.show(node[1])}, {node[2]})"
+            return f"shr({self.show(node[1])}, {self.show(node[2])})"
         if kind == "trunc":
             return f"low{node[1] * 8}({self.show(node[2])})"
         if kind == "call":
@@ -669,9 +681,9 @@ class SourceMeaning:
         width = ta if ta is not None else tb
         result_ty = width if width is not None else 8
         name = _BINOPS[op]
-        if name == "shr":
-            count = T.value(b)
-            return T.lift(lambda x: T.shr(x, count), a, key=("shr", count)), result_ty, None
+        if name in ("shl", "shr"):
+            return (T.lift(lambda x, c: T.total_shift(name, result_ty, x, c), a, b,
+                           key=("total", name, result_ty)), result_ty, None)
         if name in ("and", "or", "xor"):
             return T.lift(lambda x, y: T.bitop(name, x, y), a, b, key=("bit", name)), result_ty, None
         return (T.lift(lambda x, y: T.arith(name, result_ty, x, y), a, b,
@@ -972,8 +984,43 @@ class FunctionCheck:
             return T.lift(lambda a, b: T.arith(name, width, a, b), x, y, key=("arith", name, width))
         if name in _BITS:
             return T.lift(lambda a, b: T.bitop(name, a, b), x, y, key=("bit", name))
-        count = T.value(y)
-        return T.lift(lambda a: T.shr(a, count), x, key=("shr", count))
+        return T.lift(T.shr, x, y, key=("shr",))
+
+    def _hardware_count(self, S: State, source: tuple, width: int, where: str) -> int:
+        """The count x86 actually shifts by. It keeps the low 6 bits for a 64-bit shift
+        and the low 5 for a 32-bit one, of an immediate as much as of cl, which is how
+        `shl rax, 70` comes to shift by 6. A register count equals what the source says
+        only where the path has already established that it is in range."""
+        T = self.T
+        bound = 64 if width == 8 else 32
+        if source[0] == "imm":
+            return T.const(source[1] & bound - 1)
+        if source[1] != "rcx":
+            self.problems.append(Problem(self.fn.name, where, "a shift count must be in cl"))
+        count = S.regs.get("rcx", T.undef("rcx was clobbered or never set"))
+        for cond, leaf in T.paths(count):
+            if not self._below(T.both(S.cond, cond), leaf, bound):
+                self.problems.append(Problem(
+                    self.fn.name, where,
+                    f"shift by {T.show(leaf)} with nothing keeping it below {bound}, "
+                    f"so the hardware may mask it"))
+        return count
+
+    def _below(self, cond: int, leaf: int, bound: int) -> bool:
+        """On every path through cond, is leaf known to be below bound?"""
+        T = self.T
+        if T.is_const(leaf):
+            return T.value(leaf) < bound
+        if cond == T.ZERO:
+            return True
+        atom = T.top(cond)
+        if atom == NO_ATOM:
+            return False
+        node = T.nodes[atom]
+        settled = (node[0] == "lt" and node[1] == leaf and T.is_const(node[2])
+                   and T.value(node[2]) <= bound)
+        return ((settled or self._below(T.cof(cond, atom, True), leaf, bound))
+                and self._below(T.cof(cond, atom, False), leaf, bound))
 
     def _cond(self, S: State, cc: str, where: str) -> int:
         T = self.T
@@ -1288,6 +1335,9 @@ class FunctionCheck:
             # Setting low bits in the Horner accumulator leaves the upper bits alone.
             S.regs[dest[1]] = self._binop("or", 8, S.regs.get(dest[1], T.undef("unset accumulator")),
                                           self._val(S, source))
+        elif dest[0] == "reg" and op in ("shl", "shr"):
+            count = self._hardware_count(S, source, dest[2], where)
+            S.regs[dest[1]] = self._binop(op, dest[2], self._val(S, dest), count)
         elif dest[0] == "reg":
             S.regs[dest[1]] = self._binop(op, dest[2], self._val(S, dest), self._val(S, source))
         else:

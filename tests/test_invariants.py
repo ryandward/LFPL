@@ -748,8 +748,9 @@ class LinearityAndFailFast(unittest.TestCase):
         self.assertEqual(run(source), 13)
 
     def test_non_tail_recursion_is_rejected_until_descent_exists(self):
-        source = b"fn f(n: Int64) : Int64 = +(f(n), 1);"
-        with self.assertRaisesRegex((FailFast, Reject), "4.4|Phase 1"):
+        source = PRE + (b"fn f(l: List) : List = match l with | Nil => Nil "
+                        b"| Cons(d, h, t) => let r = f(t) in Cons@d(h, r) end;")
+        with self.assertRaisesRegex(FailFast, "section 4.4"):
             compile_text(source)
 
     def test_at_annotation_is_checked_at_every_exit(self):
@@ -1098,7 +1099,8 @@ class MeaningCheck(unittest.TestCase):
         ("registers a call clobbers are not evacuated",
          "moved = self._evacuation_moves(mask, leaving)", "moved = []",
          # The callee has to really write rdi, or leaving a value there would be correct.
-         b"fn dec(x: Int64, y: Int64) : Int64 = if ==(x, 0) then y else dec(-(x, 1), y);\n"
+         b"fn g(x: Int64) : Int64 = +(x, 1);\n"
+         b"fn dec(x: Int64, y: Int64) : Int64 = g(y);\n"
          b"fn f(a: Int64, b: Int64) : Int64 = let t = dec(a, b) in +(t, a);\n", False),
         ("a comparison branches the wrong way",
          "self._hold_flags(cc, dest.x, dest.y)", "self._hold_flags(CC.index(NEGATED[CC[cc]]), dest.x, dest.y)",
@@ -1111,6 +1113,22 @@ class MeaningCheck(unittest.TestCase):
          "        self._raw_name(\"call_name\", name)\n        self._forget_registers()\n",
          "        self._forget_registers()\n",
          H + b"fn f(a: Int64) : Int64 = let t = h(a, 1) in t;\n", False),
+        ("an oversized literal count reaches the hardware",
+         "vanishes = literal is not None and literal >= width * 8", "vanishes = False",
+         b"fn f(a: Int64) : Int64 = <<(a, 70);\n", False),
+        ("a register count is not compared with the width",
+         "        self.i(\"cmp\", (O_REG, RCX, 8), (O_IMM, bits))\n"
+         "        self.i(\"jcc\", (O_LABEL, too_far), (O_IMM, CC_NAMES.index(\"ae\")))\n", "",
+         b"fn f(a: Int64, b: Int64) : Int64 = <<(a, b);\n", False),
+        ("a register count is compared with 64 whatever the type",
+         "self.i(\"cmp\", (O_REG, RCX, 8), (O_IMM, bits))", "self.i(\"cmp\", (O_REG, RCX, 8), (O_IMM, 64))",
+         b"fn f(a: Int32, b: Int32) : Int32 = >>(a, b);\n", False),
+        ("a count past the width leaves the value instead of 0",
+         "        self.i(\"xor\", (O_REG, target, 4), (O_REG, target, 4))\n", "",
+         b"fn f(a: Int64, b: Int64) : Int64 = <<(a, b);\n", False),
+        ("the count overwrites a live value in rcx",
+         "elif not holds_count and not self.sil.free >> RCX & 1:", "elif False:",
+         b"fn f(a: Int64, b: Int64, c: Int64, d: Int64) : Int64 = +(<<(a, b), d);\n", False),
         ("a join leaves values where the arm put them",
          "        if fr.dk != D_COND and not self.dead:\n            self._normalize(bytes(fr.tail))\n"
          "            self._goto(fr.l3)\n",
@@ -1165,6 +1183,253 @@ class DeclaredLimits(unittest.TestCase):
         self.assertEqual(caught.exception.limit, "register starvation")
         self.assertIsNone(FailFast("a variable has no rule for this destination", "", "", "").limit)
         self.assertTrue(all(isinstance(key, str) and key for key in DECLARED_LIMITS))
+
+
+class StructuralRecursion(unittest.TestCase):
+    """Rule R3, section 4.6 of LFPL-O: every function terminates (termination)."""
+
+    def _refused(self, source: bytes) -> None:
+        with self.assertRaisesRegex(Reject, "R3"):
+            compile_text(source)
+
+    def _accepted(self, source: bytes) -> None:
+        compile_text(source)
+
+    def test_the_specs_spin_is_refused(self):
+        self._refused(b"fn spin(x: Int64) : Int64 = spin(x);")
+
+    def test_a_scalar_counter_is_refused(self):
+        """It would terminate, but only a structural measure is something R3 can see."""
+        self._refused(b"fn go(n: Int64) : Int64 = if ==(n, 0) then 0 else go(-(n, 1));")
+
+    def test_recursion_with_no_arguments_is_refused(self):
+        self._refused(b"fn f() : Int64 = f();")
+
+    def test_a_parameter_passed_on_unchanged_is_refused(self):
+        self._refused(PRE + b"fn f(l: List) : List = f(l);")
+
+    def test_rebuilding_the_argument_is_refused(self):
+        """This never terminates: each call rebuilds the same list and passes it on."""
+        self._refused(PRE + b"fn f(l: List) : List = match l with "
+                            b"| Cons(d, h, t) => f(Cons@d(h, t)) | Nil => Nil end;")
+
+    def test_a_field_of_a_cell_built_here_does_not_decrease(self):
+        """t is l again, through a constructor matched at once, so this loops forever.
+        A phantom match must not count as a match on the parameter."""
+        self._refused(PRE + b"fn f(l: List, c: Diamond) : List = match Cons@c(1, l) with "
+                            b"| Cons(e, h, t) => f(t, e) | Nil => Nil end;")
+        self._refused(PRE + b"fn f(l: List, c: Diamond) : List = let x = Cons@c(1, l) in "
+                            b"match x with | Cons(e, h, t) => f(t, e) | Nil => Nil end;")
+
+    def test_a_value_returned_by_a_call_does_not_decrease(self):
+        self._refused(PRE + b"fn g(l: List) : List = l;\n"
+                            b"fn f(l: List) : List = match l with "
+                            b"| Cons(d, h, t) => f(Cons@d(h, g(t))) | Nil => Nil end;")
+        self._refused(PRE + b"fn g(l: List) : List = l;\n"
+                            b"fn f(l: List) : List = f(g(l));")
+
+    def test_a_field_must_come_from_the_parameter_in_its_own_position(self):
+        self._refused(PRE + b"fn f(a: List, b: List) : List = match a with "
+                            b"| Cons(d, h, t) => f(b, Cons@d(h, t)) | Nil => b end;")
+        self._refused(PRE + b"fn f(a: List, b: List) : List = match a with "
+                            b"| Cons(d, h, t) => f(b, t) | Nil => b end;")
+
+    def test_one_position_must_decrease_in_every_call(self):
+        """Each call decreases something, but no single position decreases in both."""
+        self._refused(PRE + b"fn f(a: List, b: List) : List = match a with "
+                            b"| Cons(d, h, t) => f(t, Cons@d(h, b)) "
+                            b"| Nil => match b with "
+                            b"| Cons(d, h, t) => f(Cons@d(h, Nil), t) | Nil => Nil end end;")
+
+    def test_a_direct_field_is_accepted(self):
+        self._accepted(PRE + b"fn inc(l: List) : List @l = match l with "
+                             b"| Cons(d, h, t) => Cons@d(+(h, 1), inc(t)) | Nil => Nil end;")
+        self._accepted(PRE + b"fn rev(l: List, acc: List) : List = match l with "
+                             b"| Nil => acc | Cons(d, h, t) => rev(t, Cons@d(h, acc)) end;")
+
+    def test_a_chain_of_matches_is_accepted(self):
+        self._accepted(PRE + b"fn f(l: List, acc: List) : List = match l with | Nil => acc "
+                             b"| Cons(d, h, t) => match t with | Nil => Cons@d(h, acc) "
+                             b"| Cons(e, x, y) => f(y, Cons@d(h, Cons@e(x, acc))) end end;")
+
+    def test_a_chain_through_another_type_is_accepted(self):
+        self._accepted(b"data Pair;\ndata T = Leaf | Node(v: Int64, kids: Pair);\n"
+                       b"record Pair { l: T, r: T };\ndata S = Stop | Go(t: T, s: S);\n"
+                       b"fn f(t: T, s: S) : S = match t with | Leaf => s "
+                       b"| Node(d, v, k) => match k with Pair(e, l, r) => "
+                       b"f(l, Go@e(r, Go@d(Leaf, s))) end end;\n")
+
+    def test_let_is_a_renaming_so_it_keeps_the_chain(self):
+        self._accepted(PRE + b"fn f(l: List, acc: List) : List = match l with | Nil => acc "
+                             b"| Cons(d, h, t) => let m = t in f(m, Cons@d(h, acc)) end;")
+        self._accepted(PRE + b"fn f(l: List, acc: List) : List = let k = l in match k with "
+                             b"| Nil => acc | Cons(d, h, t) => f(t, Cons@d(h, acc)) end;")
+
+    def test_a_shadowing_binder_is_the_one_that_counts(self):
+        self._accepted(PRE + b"fn f(l: List, acc: List) : List = match l with | Nil => acc "
+                             b"| Cons(d, h, l) => f(l, Cons@d(h, acc)) end;")
+
+    def test_a_tail_call_to_an_earlier_function_is_not_recursion(self):
+        self._accepted(b"fn g(x: Int64) : Int64 = x;\nfn f(x: Int64) : Int64 = g(x);")
+
+    def test_each_function_gets_its_own_position(self):
+        self._accepted(PRE + b"fn p(a: List, b: List) : List = match a with | Nil => b "
+                             b"| Cons(d, h, t) => p(t, Cons@d(h, b)) end;\n"
+                             b"fn q(a: List, b: List) : List = match b with | Nil => a "
+                             b"| Cons(d, h, t) => q(Cons@d(h, a), t) end;")
+
+    def test_a_decreasing_program_still_runs(self):
+        source = PRE + (b"fn count(f: Free, n: Int64, out: Diamond, back: Free) : Res = "
+                        b"match f with End => Done@out(n, back) "
+                        b"| More(d, rest) => count(rest, +(n, 1), out, More@d(back)) end;\n"
+                        b"fn main(free: Free) : Res = match free with End => Fail | "
+                        b"More(out, rest) => count(rest, 0, out, End) end;")
+        self.assertEqual(run(source), 1023)
+
+
+class TotalShifts(unittest.TestCase):
+    """Section 4.4 of LFPL-O: 0 when k >= w, never the hardware's masked count."""
+
+    def _call(self, expr: bytes, a: int = 0, b: int = 0, ty: bytes = b"Int64") -> int:
+        result = expr if ty == b"Int64" else b"pack<%d>(%s)" % (
+            {b"Int8": 8, b"Int16": 16, b"Int32": 32}[ty], expr)
+        source = (b"fn f(a: %s, b: %s) : Int64 = %s;\nfn main() : Int64 = f(%d, %d);"
+                  % (ty, ty, result, a, b))
+        return run(source)
+
+    def test_a_literal_count_at_or_past_the_width_gives_zero(self):
+        top = 1 << 63
+        for expr, a, expected in ((b"<<(a, 64)", 1, 0), (b"<<(a, 70)", 1, 0), (b"<<(a, 255)", 1, 0),
+                                  (b">>(a, 64)", top, 0), (b">>(a, 70)", top, 0),
+                                  (b"<<(a, 4294967296)", 1, 0), (b">>(a, 18446744073709551615)", top, 0)):
+            with self.subTest(expr=expr):
+                self.assertEqual(self._call(expr, a), expected)
+
+    def test_a_literal_count_below_the_width_is_the_usual_shift(self):
+        top = 1 << 63
+        for expr, a, expected in ((b"<<(a, 0)", 5, 5), (b">>(a, 0)", 5, 5), (b"<<(a, 1)", 5, 10),
+                                  (b"<<(a, 63)", 1, top), (b">>(a, 63)", top, 1), (b"<<(a, 63)", 3, top)):
+            with self.subTest(expr=expr):
+                self.assertEqual(self._call(expr, a), expected)
+
+    def test_the_width_is_the_types_not_the_registers(self):
+        """x86 masks a 32-bit shift to 5 bits and has no 8-bit width here at all."""
+        for ty, bits in ((b"Int8", 8), (b"Int16", 16), (b"Int32", 32)):
+            high = 1 << bits - 1
+            for expr, a, expected in ((b">>(a, %d)" % (bits - 1), high, 1), (b">>(a, %d)" % bits, high, 0),
+                                      (b">>(a, %d)" % (bits + 8), high, 0), (b">>(a, 40)", high, 0),
+                                      (b"<<(a, %d)" % (bits - 1), 1, high), (b"<<(a, %d)" % bits, 1, 0),
+                                      (b"<<(a, 40)", 1, 0), (b"<<(a, 1)", high, 0)):
+                with self.subTest(ty=ty, expr=expr):
+                    self.assertEqual(self._call(expr, a, 0, ty), expected)
+
+    def test_two_literals(self):
+        self.assertEqual(run(b"fn main() : Int64 = <<(1, 70);"), 0)
+        self.assertEqual(run(b"fn main() : Int64 = >>(1, 70);"), 0)
+        self.assertEqual(run(b"fn main() : Int64 = <<(1, 3);"), 8)
+
+    def test_a_let_bound_literal_count(self):
+        self.assertEqual(self._call(b"let k = 70 in <<(a, k)", 1), 0)
+        self.assertEqual(self._call(b"let k = 3 in <<(a, k)", 1), 8)
+
+    def test_an_oversized_literal_emits_no_shift_at_all(self):
+        lines = body(b"fn f(a: Int64) : Int64 = <<(a, 70);\nfn main() : Int64 = 0;", "f")
+        self.assertEqual(lines, ["xor eax, eax", "ret"])
+
+    def test_a_register_count_is_compared_with_the_width_first(self):
+        top = 1 << 63
+        for count in (0, 1, 62, 63, 64, 65, 70, 128, 256, 1 << 32, (1 << 64) - 1):
+            with self.subTest(count=count):
+                self.assertEqual(self._call(b"<<(a, b)", 1, count),
+                                 1 << count if count < 64 else 0)
+                self.assertEqual(self._call(b">>(a, b)", top, count),
+                                 top >> count if count < 64 else 0)
+
+    def test_a_register_count_at_a_narrow_width(self):
+        for ty, bits in ((b"Int8", 8), (b"Int16", 16), (b"Int32", 32)):
+            high = 1 << bits - 1
+            for count in (0, 1, bits - 1, bits, bits + 1, 31, 32, 33, 63, 64, 70, 255):
+                if count >= 1 << bits:
+                    continue
+                with self.subTest(ty=ty, count=count):
+                    self.assertEqual(self._call(b">>(a, b)", high, count, ty),
+                                     high >> count if count < bits else 0)
+                    self.assertEqual(self._call(b"<<(a, b)", high, count, ty),
+                                     (high << count) & ((1 << bits) - 1) if count < bits else 0)
+
+    # rcx is the only register x86 takes a count from, so every way of already
+    # holding it has to come out the other side intact.
+    FOUR = b"fn f(a: Int64, b: Int64, c: Int64, d: Int64) : Int64 = %s;\nfn main() : Int64 = f(%d, %d, %d, %d);"
+
+    def test_a_live_value_in_rcx_survives_a_shift(self):
+        self.assertEqual(run(self.FOUR % (b"+(<<(a, b), d)", 1, 3, 0, 100)), 8 + 100)
+        self.assertEqual(run(self.FOUR % (b"+(<<(a, b), d)", 1, 70, 0, 100)), 0 + 100)
+
+    def test_the_shifted_value_can_start_in_rcx(self):
+        self.assertEqual(run(self.FOUR % (b"+(<<(d, a), d)", 3, 0, 0, 5)), 40 + 5)
+
+    def test_the_count_can_start_in_rcx(self):
+        self.assertEqual(run(self.FOUR % (b"+(<<(a, d), d)", 5, 0, 0, 3)), 40 + 3)
+        self.assertEqual(run(self.FOUR % (b"+(<<(a, d), d)", 5, 0, 0, 64)), 0 + 64)
+
+    def test_the_result_can_be_wanted_in_rcx(self):
+        source = (b"fn g(p: Int64, q: Int64, r: Int64, s: Int64) : Int64 = +(p, +(q, +(r, s)));\n"
+                  b"fn f(a: Int64, b: Int64) : Int64 = g(1, 2, 3, <<(a, b));\n"
+                  b"fn main() : Int64 = f(5, %d);")
+        self.assertEqual(run(source % 3), 1 + 2 + 3 + 40)
+        self.assertEqual(run(source % 70), 1 + 2 + 3)
+
+    def test_computed_operands(self):
+        self.assertEqual(self._call(b"<<(+(a, 1), +(b, 1))", 2, 2), 3 << 3)
+        self.assertEqual(self._call(b"<<(+(a, 1), +(b, 1))", 2, 63), 0)
+        self.assertEqual(self._call(b">>(a, if <(b, 5) then 1 else 99)", 8, 1), 4)
+        self.assertEqual(self._call(b">>(a, if <(b, 5) then 1 else 99)", 8, 9), 0)
+
+    def test_a_count_read_from_a_field(self):
+        source = PRE + (b"fn g(q: Q, free: Free) : Res = match q with Q(d, x, k) => "
+                        b"Done@d(<<(x, k), free) end;\n"
+                        b"fn main(free: Free) : Res = match free with End => Fail | "
+                        b"More(c, rest) => g(Q@c(3, %d), rest) end;")
+        self.assertEqual(run(source % 2), 12)
+        self.assertEqual(run(source % 70), 0)
+
+    def test_a_shift_inside_a_condition(self):
+        self.assertEqual(self._call(b"if <(<<(a, b), 10) then 1 else 2", 1, 2), 1)
+        self.assertEqual(self._call(b"if <(<<(a, b), 10) then 1 else 2", 1, 5), 2)
+        self.assertEqual(self._call(b"if <(<<(a, b), 10) then 1 else 2", 1, 70), 1)
+
+    def test_a_shift_into_a_field(self):
+        source = PRE + (b"fn g(q: Q, n: Int64, free: Free) : Res = match q with Q(d, x, k) => "
+                        b"Done@d(+(0, >>(x, n)), free) end;\n"
+                        b"fn main(free: Free) : Res = match free with End => Fail | "
+                        b"More(c, rest) => g(Q@c(16, 0), %d, rest) end;")
+        self.assertEqual(run(source % 2), 4)
+        self.assertEqual(run(source % 64), 0)
+
+    def test_the_symbolic_check_agrees_with_every_lowering_here(self):
+        for text in (b"<<(a, 70)", b">>(a, 64)", b"<<(a, 3)", b"<<(a, b)", b">>(a, b)",
+                     b"<<(+(a, 1), +(b, 1))", b"if <(<<(a, b), 10) then 1 else 2"):
+            source = b"fn f(a: Int64, b: Int64) : Int64 = %s;\n" % text
+            with self.subTest(text=text):
+                self.assertEqual(check_translation(source, compile_text(source)), [])
+
+    def test_the_symbolic_check_sees_the_hardware_mask(self):
+        """`shl rax, 70` assembles without a warning and shifts by 6."""
+        source = b"fn f(a: Int64) : Int64 = <<(a, 70);\n"
+        wrong = "fn_f_body:\n    mov rax, rdi\n    shl rax, 70\n    ret\n"
+        self.assertTrue(check_translation(source, wrong))
+        right = "fn_f_body:\n    xor eax, eax\n    ret\n"
+        self.assertEqual(check_translation(source, right), [])
+
+    def test_the_symbolic_check_sees_an_unguarded_register_count(self):
+        source = b"fn f(a: Int64, b: Int64) : Int64 = <<(a, b);\n"
+        wrong = ("fn_f_body:\n    mov rax, rdi\n    mov rcx, rsi\n    shl rax, cl\n    ret\n")
+        self.assertTrue(check_translation(source, wrong))
+        guarded = ("fn_f_body:\n    mov rax, rdi\n    mov rcx, rsi\n    cmp rcx, 64\n    jae L1\n"
+                   "    shl rax, cl\n    jmp L2\nL1:\n    xor eax, eax\nL2:\n    ret\n")
+        self.assertEqual(check_translation(source, guarded), [])
+        loose = guarded.replace("cmp rcx, 64", "cmp rcx, 65")
+        self.assertTrue(check_translation(source, loose))
 
 
 class Horner(unittest.TestCase):

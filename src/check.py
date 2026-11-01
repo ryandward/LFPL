@@ -5,6 +5,13 @@ Scalars are erasable, and reading one does not consume it. Lower enforces the
 one further rule a forward fold requires: overwriting a location erases the
 scalar homed there.
 
+Rule R3 makes every function terminate. In every recursive call, one fixed argument
+position must receive a variable bound by a chain of matches starting at that same
+parameter, so that position's cell count strictly falls. A binder therefore remembers
+which parameter it came from and whether a match lies in between, and `let` keeps that
+because it is only a renaming. The set of positions still decreasing in every call seen
+so far fits in a byte, so this costs no extra frames.
+
 Usage state is a 64-bit mask, so a branch frame holds its snapshots in constant
 space. That caps live linear binders per function at 64, a language limit that
 depends only on the program text, like D_max. Names go no further than this
@@ -38,7 +45,11 @@ _SIZES = {T_I8: 1, T_I16: 2, T_I32: 4, T_I64: 8, T_BOOL: 1, T_LIT: 8}
 E_TYPE, E_CTOR, E_FIELD, E_FUNC, E_PARAM = range(5)
 _ATTR = struct.Struct("<BBBBHHH")  # a, b, c, d, x, y, z
 _FRAME = struct.Struct("<BBHHHHQQQ")  # a, b, t1, t2, c1, c2, m1, m2, m3
-_BINDER = struct.Struct("<HB")  # type, linear index or 255
+_BINDER = struct.Struct("<HBB")  # type, linear index or 255, origin
+# A binder's origin is the parameter position it came from, with _BELOW set once a match
+# lies between them. Only a value with _BELOW set has fewer cells than the parameter.
+_NO_ORIGIN = 255
+_BELOW = 8
 _FORWARD, _RESOLVED = 254, 253  # the `a` attribute of a forward-declared type
 
 # Payloads for Lower.
@@ -79,6 +90,8 @@ class CheckStage(Stage):
         self.decl_field_count = 0
         self.decl_ctor = -1
         self.decl_forward = -1
+        self.origin = _NO_ORIGIN  # of the expression just finished, if it is a variable
+        self.decreasing = 0       # R3: positions that fell in every recursive call so far
         self.pending_name = b""
         self.child_seen = False
 
@@ -131,7 +144,7 @@ class CheckStage(Stage):
             raise self._reject(f"unknown type {key.decode()}")
         return found + FIRST_NAMED
 
-    def _bind(self, name: bytes, ty: int) -> int:
+    def _bind(self, name: bytes, ty: int, origin: int = _NO_ORIGIN) -> int:
         linear = 255
         if is_linear(ty):
             for bit in range(LINEAR_BINDERS_MAX):
@@ -142,13 +155,13 @@ class CheckStage(Stage):
             else:
                 raise self._reject(
                     f"more than {LINEAR_BINDERS_MAX} live linear binders in a function")
-        self.B.push(0, name.ljust(PAYLOAD_BYTES, b"\0") + _BINDER.pack(ty, linear))
+        self.B.push(0, name.ljust(PAYLOAD_BYTES, b"\0") + _BINDER.pack(ty, linear, origin))
         return len(self.B) - 1
 
     def _unbind_to(self, mark: int) -> None:
         while len(self.B) > mark:
             _, data = self.B.peek()
-            ty, linear = _BINDER.unpack_from(data, PAYLOAD_BYTES)
+            _ty, linear, _origin = _BINDER.unpack_from(data, PAYLOAD_BYTES)
             if linear != 255:
                 if not self.used >> linear & 1:
                     name = data[:PAYLOAD_BYTES].rstrip(b"\0").decode()
@@ -161,9 +174,12 @@ class CheckStage(Stage):
         for index in range(len(self.B) - 1, -1, -1):
             _, data = self.B.at(index)
             if data[:PAYLOAD_BYTES] == name:
-                ty, linear = _BINDER.unpack_from(data, PAYLOAD_BYTES)
+                ty, linear, _origin = _BINDER.unpack_from(data, PAYLOAD_BYTES)
                 return index, ty, linear
         raise self._reject(f"unbound variable {name.rstrip(bytes(1)).decode()}")
+
+    def _origin_of(self, index: int) -> int:
+        return _BINDER.unpack_from(self.B.at(index)[1], PAYLOAD_BYTES)[2]
 
     def _use(self, name: bytes) -> tuple[int, int, int]:
         index, ty, linear = self._lookup(name)
@@ -221,6 +237,8 @@ class CheckStage(Stage):
             return
         result = (self._on_open, self._on_sep, self._on_leaf, self._on_close)[cls](
             kind, payload)
+        if cls == CLOSE:
+            self.origin = _NO_ORIGIN  # a finished construct is not a plain variable
         if result is None:
             self.ring.drop(self, cell)
         else:
@@ -363,7 +381,7 @@ class CheckStage(Stage):
                     f"unknown function {payload.rstrip(bytes(1)).decode()}: a callee "
                     f"is defined before its caller, so the call graph stays acyclic")
             _, nparams, _b, _c, _d, ordinal, ret, first = self._g(found)
-            self._frame(K_CALL, a=nparams, t1=ret, c1=first)
+            self._frame(K_CALL, a=nparams, b=found == self.fn_self, t1=ret, c1=first)
             self.child_seen = False
             return kind, P_CALL.pack(ordinal, found == self.fn_self, nparams)
         elif kind == K_CTOR:
@@ -400,7 +418,7 @@ class CheckStage(Stage):
         self._store(frame)
         self.used = frame[6]  # every arm starts from the state at the match
         nctors = len(self._ctors(type_index))
-        self._frame(K_ARM, a=0 if is_null else count + 1, c1=len(self.B), c2=found)
+        self._frame(K_ARM, a=0 if is_null else count + 1, t1=frame[4], c1=len(self.B), c2=found)
         return K_ARM, P_ARM.pack(tag, tagged, is_null, arm_index, nctors)
 
     # --- sep
@@ -420,12 +438,13 @@ class CheckStage(Stage):
                 self._check_main(first, nparams)
             _, _a, b, c, d, ordinal, _y, _z = self._g(func)
             self._g_set(func, nparams, b, c, d, ordinal, self.ret_ty, first)
+            self.decreasing = (1 << nparams) - 1
             return kind, payload
         if kind == K_LET:
             ty = self.ty
             name = self.N.peek()[1][:PAYLOAD_BYTES]
             self.N.pop()
-            self._bind(name, ty)
+            self._bind(name, ty, self.origin)  # let is a renaming, so the chain survives
             return kind, P_LET.pack(1, is_linear(ty), size_of(ty))
         if kind == K_IF:
             if index == 1:
@@ -441,6 +460,7 @@ class CheckStage(Stage):
             if self.ty < FIRST_NAMED:
                 raise self._reject(f"cannot match on {self._show(self.ty)}")
             frame[2] = self.ty
+            frame[4] = self.origin  # a constructor's fields descend from nothing
             frame[6] = self.used
             self._store(frame)
         elif kind == K_ARM:
@@ -507,8 +527,25 @@ class CheckStage(Stage):
         else:
             wanted = self._g(frame[4] + position)[5]
         self._unify(wanted, self.ty, "an argument")
+        if self.K.peek()[0] == K_CALL and frame[1] and self.origin == position | _BELOW:
+            frame[6] |= 1 << position  # R3: this argument came from this parameter's cells
         frame[5] = position + 1
         self._store(frame)
+
+    def _rule_r3(self, falling: int) -> None:
+        """Keep the positions that fell in this recursive call as well as all earlier
+        ones. Termination needs one position that falls every time."""
+        name = self.G.at(self.fn_self)[1][:PAYLOAD_BYTES].rstrip(b"\0").decode()
+        if not falling:
+            raise self._reject(
+                f"rule R3: in this recursive call of {name}, no argument is a variable bound "
+                f"by a chain of matches on the parameter in its own position, so nothing "
+                f"shows that the recursion ends")
+        self.decreasing &= falling
+        if not self.decreasing:
+            raise self._reject(
+                f"rule R3: the recursive calls of {name} each shrink some argument, but no "
+                f"one position shrinks in all of them, so nothing shows the recursion ends")
 
     # --- leaf
 
@@ -527,7 +564,7 @@ class CheckStage(Stage):
                 return None
             if len(self.G) - frame[4] == 6:
                 raise self._reject("more than 6 parameters (the register budget)")
-            src = self._bind(self.pending_name, ty)
+            src = self._bind(self.pending_name, ty, origin=len(self.G) - frame[4])
             self._g_push(E_PARAM, self.pending_name, x=ty)
             return K_PARAM, P_PARAM.pack(src, size_of(ty), is_linear(ty))
         if kind == K_RESWORD:
@@ -552,9 +589,11 @@ class CheckStage(Stage):
             self.child_seen = False
             return kind, P_DIAMOND.pack(src, tag, tagged, count, off, size, linear)
         self.child_seen = True
+        self.origin = _NO_ORIGIN
         if kind == K_VAR:
             src, ty, linear = self._use(payload)
             self.ty = ty
+            self.origin = self._origin_of(src)
             return kind, P_VAR.pack(src, linear != 255, size_of(ty))
         if kind == K_INT:
             self.ty = T_LIT
@@ -582,7 +621,8 @@ class CheckStage(Stage):
             self._bind(payload, T_DIAMOND)
             return K_BINDER, P_BINDER.pack(0, 0, 8, 1)
         field = self._g(frame[5] + position)
-        self._bind(payload, field[7])
+        origin = _NO_ORIGIN if frame[2] == _NO_ORIGIN else frame[2] | _BELOW
+        self._bind(payload, field[7], origin)
         return K_BINDER, P_BINDER.pack(1, field[1], field[2], is_linear(field[7]))
 
     def _with_field(self, payload: bytes):
@@ -659,6 +699,8 @@ class CheckStage(Stage):
                 frame = self._top()
             if frame[5] != frame[0]:
                 raise self._reject(f"wrong argument count: expected {frame[0]}")
+            if kind == K_CALL and frame[1]:
+                self._rule_r3(frame[6])
             self.ty = frame[2]
         elif kind == K_PACK:
             self._need_int(self.ty, "a pack field")
