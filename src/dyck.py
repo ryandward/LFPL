@@ -11,15 +11,20 @@ emit open(+) before reading an e1 of unbounded size. Every other construct
 already begins with a keyword or a name, so one token of lookahead decides it.
 
     program ::= decl*
-    decl    ::= 'fn' id '(' [id ':' ty {',' id ':' ty}] ')' ':' ty ['@' id] '=' e ';'
+    decl    ::= ('fn'|'handler') id '(' [id ':' ty {',' id ':' ty}] ')' ':' res ['@' id] '=' e ';'
               | 'data' Name ['=' ctor {'|' ctor}] ';'
               | 'record' Name '{' id ':' ty {',' id ':' ty} '}' ';'
+              | 'state' id ':' ty ';'
     ctor    ::= Name ['(' id ':' ty {',' id ':' ty} ')']
+    ty      ::= Name | 'Array' '[' int ']' Name | 'Fin' int
+    res     ::= ty | '(' ty ',' ty {',' ty} ')'
     e       ::= id | int | 'true' | 'false'
               | ('+'|'-'|'*'|'&'|'|'|'^'|'<<'|'>>') '(' e ',' e ')'
               | ('<'|'<='|'>'|'>='|'=='|'!=') '(' e ',' e ')'
               | '&&' '(' e ',' e ')' | '||' '(' e ',' e ')' | '!' '(' e ')'
               | 'let' id '=' e 'in' e | 'if' e 'then' e 'else' e
+              | 'let' '(' id ',' id {',' id} ')' '=' e 'in' e
+              | '(' e ',' e {',' e} ')' | 'idx' '(' e ',' int ')' | 'get' '(' e ',' e ')'
               | Name | Name '@' id '(' [e {',' e}] ')'
               | 'match' e 'with' ['|'] arm {'|' arm} 'end'
               | '{' e 'with' id '=' e '}'
@@ -44,6 +49,7 @@ _TOKENS = tuple((
     "EOF IDENT NAME INT LET IN IF THEN ELSE MATCH WITH END TRUE FALSE FN DATA "
     "RECORD PACK LPAREN RPAREN LBRACE RBRACE COMMA COLON SEMI AT EQ ARROW BAR "
     "PLUS MINUS STAR AMP CARET SHL SHR LT LE GT GE EQEQ NE ANDAND OROR BANG "
+    "HANDLER STATE LBRACKET RBRACKET "
 ).split())
 (
     T_EOF, T_IDENT, T_NAME, T_INT, T_LET, T_IN, T_IF, T_THEN,
@@ -52,17 +58,19 @@ _TOKENS = tuple((
     T_SEMI, T_AT, T_EQ, T_ARROW, T_BAR, T_PLUS, T_MINUS, T_STAR,
     T_AMP, T_CARET, T_SHL, T_SHR, T_LT, T_LE, T_GT, T_GE,
     T_EQEQ, T_NE, T_ANDAND, T_OROR, T_BANG,
+    T_HANDLER, T_STATE, T_LBRACKET, T_RBRACKET,
 ) = range(len(_TOKENS))
 
 _KEYWORDS = {b"let": T_LET, b"in": T_IN, b"if": T_IF, b"then": T_THEN,
              b"else": T_ELSE, b"match": T_MATCH, b"with": T_WITH, b"end": T_END,
              b"true": T_TRUE, b"false": T_FALSE, b"fn": T_FN, b"data": T_DATA,
-             b"record": T_RECORD, b"pack": T_PACK}
+             b"record": T_RECORD, b"pack": T_PACK, b"handler": T_HANDLER, b"state": T_STATE}
 _ONE = {ord("("): T_LPAREN, ord(")"): T_RPAREN, ord("{"): T_LBRACE,
         ord("}"): T_RBRACE, ord(","): T_COMMA, ord(":"): T_COLON,
         ord(";"): T_SEMI, ord("@"): T_AT, ord("="): T_EQ, ord("|"): T_BAR,
         ord("+"): T_PLUS, ord("-"): T_MINUS, ord("*"): T_STAR, ord("&"): T_AMP,
-        ord("^"): T_CARET, ord("<"): T_LT, ord(">"): T_GT, ord("!"): T_BANG}
+        ord("^"): T_CARET, ord("<"): T_LT, ord(">"): T_GT, ord("!"): T_BANG,
+        ord("["): T_LBRACKET, ord("]"): T_RBRACKET}
 _TWO = {b"=>": T_ARROW, b"==": T_EQEQ, b"!=": T_NE, b"<=": T_LE, b">=": T_GE,
         b"<<": T_SHL, b">>": T_SHR, b"&&": T_ANDAND, b"||": T_OROR}
 _TWO_FIRST = {pair[0] for pair in _TWO}
@@ -79,14 +87,18 @@ OPEN, SEP, LEAF, CLOSE = range(4)
 _KINDS = tuple((
     "FN PARAM TYPE RESWORD DATA CTORDECL FIELD RECORD LET BINDER IF MATCH ARM "
     "WITH BINOP CMP AND OR NOT CALL CTOR DIAMOND PACK VAR INT BOOL NULLCTOR "
-    "EOF "
+    "EOF HANDLER STATE TARRAY TFIN TTUPLE TUPLE IDX GET RTDECL RTDECLMORE "
 ).split())
 (
     K_FN, K_PARAM, K_TYPE, K_RESWORD, K_DATA, K_CTORDECL, K_FIELD, K_RECORD,
     K_LET, K_BINDER, K_IF, K_MATCH, K_ARM, K_WITH, K_BINOP, K_CMP,
     K_AND, K_OR, K_NOT, K_CALL, K_CTOR, K_DIAMOND, K_PACK, K_VAR,
     K_INT, K_BOOL, K_NULLCTOR, K_EOF,
+    K_HANDLER, K_STATE, K_TARRAY, K_TFIN, K_TTUPLE, K_TUPLE, K_IDX, K_GET, K_RTDECL, K_RTDECLMORE,
 ) = range(len(_KINDS))
+
+# What an array's element can be, as Check and the payload of leaf(TARRAY) name it.
+ELEMENT_CODES = {b"Int8": 1, b"Int16": 2, b"Int32": 3, b"Int64": 4, b"Bool": 5}
 
 def ev_tag(cls: int, kind: int) -> int:
     return cls << 6 | kind
@@ -250,6 +262,8 @@ S_NOT_LP, S_NOT_E, S_NOT_END = range(58, 61)
 S_ARGS_FIRST, S_ARG, S_ARGS_NEXT = range(61, 64)
 S_CTOR_D, S_CTOR_LP = range(64, 66)
 S_PACK_LT, S_PACK_W, S_PACK_NEXT, S_PACK_LP = range(66, 70)
+S_TA_LB, S_TA_N, S_TA_RB, S_TA_ELEM, S_TF_N, S_TT_TYPE, S_TT_NEXT = range(70, 77)
+S_LTB, S_LTB_NEXT, S_ST_COLON, S_ST_TYPE, S_ST_SEMI = range(77, 82)
 
 # Expression-expecting states, and what follows the expression.
 _AFTER = {S_BODY: S_SEMI, S_LET_E1: S_LET_IN, S_IF_COND: S_IF_THEN_KW,
@@ -384,6 +398,10 @@ class Parser(Stage):
             self._emit(cell, LEAF, K_EOF)
         elif tag == T_FN:
             self._push(K_FN, S_NAME, cell)
+        elif tag == T_HANDLER:
+            self._push(K_HANDLER, S_NAME, cell)
+        elif tag == T_STATE:
+            self._push(K_STATE, S_NAME, cell)
         elif tag == T_DATA:
             self._push(K_DATA, S_NAME, cell)
         elif tag == T_RECORD:
@@ -409,6 +427,9 @@ class Parser(Stage):
         elif tag == T_MATCH:
             self._push(K_MATCH, S_M_SCRUT, cell)
             self._emit_new(OPEN, K_MATCH)
+        elif tag == T_LPAREN:
+            self._push(K_TUPLE, S_ARG, cell)
+            self._emit_new(OPEN, K_TUPLE)
         elif tag == T_LBRACE:
             self._push(K_WITH, S_W_E, cell)
             self._emit_new(OPEN, K_WITH)
@@ -454,10 +475,14 @@ class Parser(Stage):
             ring.drop(self, cell)
 
         if state == S_NAME:
-            if kind == K_FN:
+            if kind in (K_FN, K_HANDLER):
                 require(T_IDENT, "a function name")
                 self._set(S_LPAREN)
-                self._emit(cell, OPEN, K_FN, payload)
+                self._emit(cell, OPEN, kind, payload)
+            elif kind == K_STATE:
+                require(T_IDENT, "a state name")
+                self._set(S_ST_COLON)
+                self._emit(cell, OPEN, K_STATE, payload)
             else:
                 require(T_NAME, "a type name")
                 self._set(S_DATA_EQ if kind == K_DATA else S_REC_LBRACE)
@@ -466,7 +491,7 @@ class Parser(Stage):
             next_state(S_PARAM_OR_END, "'('", T_LPAREN)
         elif state in (S_PARAM_OR_END, S_REC_FIELD, S_CD_FIELD):
             if tag == T_RPAREN and state == S_PARAM_OR_END:
-                self._emit(cell, SEP, K_FN, b"\0")
+                self._emit(cell, SEP, kind, b"\0")
                 self._set(S_RET_COLON)
             else:
                 require(T_IDENT, "a field or parameter name")
@@ -478,18 +503,65 @@ class Parser(Stage):
             next_state({S_PARAM_COLON: S_PARAM_TYPE, S_REC_COLON: S_REC_TYPE,
                         S_CD_COLON: S_CD_TYPE, S_RET_COLON: S_RET_TYPE}[state],
                        "':'", T_COLON)
-        elif state in (S_PARAM_TYPE, S_REC_TYPE, S_CD_TYPE, S_RET_TYPE):
+        elif state in (S_PARAM_TYPE, S_REC_TYPE, S_CD_TYPE, S_RET_TYPE, S_ST_TYPE, S_TT_TYPE):
+            if tag == T_LPAREN and state == S_RET_TYPE:
+                self._set(S_RET_NEXT)
+                self._push(K_TTUPLE, S_TT_TYPE, None)
+                self._emit(cell, OPEN, K_TTUPLE)
+                return
             require(T_NAME, "a type")
-            self._set({S_PARAM_TYPE: S_PARAM_NEXT, S_REC_TYPE: S_REC_NEXT,
-                       S_CD_TYPE: S_CD_AFTER, S_RET_TYPE: S_RET_NEXT}[state])
-            self._emit(cell, LEAF, K_TYPE, payload)
+            self._set({S_PARAM_TYPE: S_PARAM_NEXT, S_REC_TYPE: S_REC_NEXT, S_CD_TYPE: S_CD_AFTER,
+                       S_RET_TYPE: S_RET_NEXT, S_ST_TYPE: S_ST_SEMI, S_TT_TYPE: S_TT_NEXT}[state])
+            name = payload.rstrip(b"\0")
+            if name == b"Array":
+                self._push(K_TARRAY, S_TA_LB, cell)
+            elif name == b"Fin":
+                self._push(K_TFIN, S_TF_N, cell)
+            else:
+                self._emit(cell, LEAF, K_TYPE, payload)
+        elif state == S_TA_LB:
+            next_state(S_TA_N, "'['", T_LBRACKET)
+        elif state == S_TA_N:
+            require(T_INT, "an array length")
+            frame_tag, data = self.frames.peek()
+            self.frames.rewrite(len(self.frames) - 1, frame_tag,
+                                bytes((S_TA_RB, 0)) + payload[:_PACK_FIELDS])
+            ring.drop(self, cell)
+        elif state == S_TA_RB:
+            next_state(S_TA_ELEM, "']'", T_RBRACKET)
+        elif state == S_TA_ELEM:
+            require(T_NAME, "an array's element type")
+            code = ELEMENT_CODES.get(payload.rstrip(b"\0"))
+            if code is None:
+                raise self._fail("a scalar element type: an array of linear values waits for swap")
+            length = self.frames.peek()[1][2:2 + _PACK_FIELDS]
+            self.frames.pop()
+            self._emit(cell, LEAF, K_TARRAY, length + bytes((code,)))
+        elif state == S_TF_N:
+            require(T_INT, "the bound of a Fin")
+            self.frames.pop()
+            self._emit(cell, LEAF, K_TFIN, payload[:_PACK_FIELDS])
+        elif state == S_TT_NEXT:
+            if tag == T_COMMA:
+                self._set(S_TT_TYPE)
+                ring.drop(self, cell)
+            else:
+                require(T_RPAREN, "',' or ')'")
+                self.frames.pop()
+                self._emit(cell, CLOSE, K_TTUPLE)
+        elif state == S_ST_COLON:
+            next_state(S_ST_TYPE, "':'", T_COLON)
+        elif state == S_ST_SEMI:
+            require(T_SEMI, "';'")
+            self.frames.pop()
+            self._emit(cell, CLOSE, K_STATE)
         elif state == S_PARAM_NEXT:
             if tag == T_COMMA:
                 self._set(S_PARAM_OR_END)
                 ring.drop(self, cell)
             else:
                 require(T_RPAREN, "',' or ')'")
-                self._emit(cell, SEP, K_FN, b"\0")
+                self._emit(cell, SEP, kind, b"\0")
                 self._set(S_RET_COLON)
         elif state == S_RET_NEXT:
             if tag == T_AT:
@@ -497,7 +569,7 @@ class Parser(Stage):
                 ring.drop(self, cell)
             else:
                 require(T_EQ, "'=' or '@'")
-                self._emit(cell, SEP, K_FN, b"\1")
+                self._emit(cell, SEP, kind, b"\1")
                 self._set(S_BODY)
         elif state == S_RES_NAME:
             require(T_IDENT, "a parameter name after '@'")
@@ -505,12 +577,12 @@ class Parser(Stage):
             self._set(S_BODY_EQ)
         elif state == S_BODY_EQ:
             require(T_EQ, "'='")
-            self._emit(cell, SEP, K_FN, b"\1")
+            self._emit(cell, SEP, kind, b"\1")
             self._set(S_BODY)
         elif state == S_SEMI:
             require(T_SEMI, "';'")
             self.frames.pop()
-            self._emit(cell, CLOSE, K_FN)
+            self._emit(cell, CLOSE, kind)
         elif state == S_DATA_EQ:
             if tag == T_SEMI:  # a forward declaration, for mutually recursive types
                 self.frames.pop()
@@ -559,9 +631,23 @@ class Parser(Stage):
             self.frames.pop()
             self._emit(cell, CLOSE, K_RECORD)
         elif state == S_BINDER:
+            if tag == T_LPAREN:
+                self._set(S_LTB)
+                ring.drop(self, cell)
+                return
             require(T_IDENT, "a binder")
             self._set(S_LET_EQ)
             self._emit(cell, LEAF, K_BINDER, payload)
+        elif state == S_LTB:
+            require(T_IDENT, "a binder")
+            self._set(S_LTB_NEXT)
+            self._emit(cell, LEAF, K_BINDER, payload)
+        elif state == S_LTB_NEXT:
+            if tag == T_COMMA:
+                self._set(S_LTB)
+                ring.drop(self, cell)
+            else:
+                next_state(S_LET_EQ, "',' or ')'", T_RPAREN)
         elif state == S_LET_EQ:
             next_state(S_LET_E1, "'='", T_EQ)
         elif state == S_LET_IN:

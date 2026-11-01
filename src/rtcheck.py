@@ -732,7 +732,11 @@ class Checker:
     def i_br(self, a: list[str]) -> None:
         if a[0] not in CC_NAMES:
             raise self.fail(f"unknown condition {a[0]}")
-        self._comparable(a[1], a[2])
+        self._comparable(a[1].rstrip("!"), a[2].rstrip("!"))
+        for operand in (a[1], a[2]):  # the comparison was its last use, so it goes free
+            if operand.endswith("!"):
+                assert self.S is not None
+                del self.S.regs[self.reg(operand[:-1])]
         self.edge(a[3])
         self.edge(a[4])
         self.S = None

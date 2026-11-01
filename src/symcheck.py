@@ -8,8 +8,10 @@ hold what the source says it holds.
 
 It shares no code with the compiler, which a test enforces by reading the imports:
 it has its own source parser, its own layout rule and its own reading of x86. Two
-separate mistakes would have to agree for a miscompile to get through. It is a test
-oracle, not a pipeline stage, so unlike the compiler it builds whole syntax trees.
+separate mistakes would have to agree for a miscompile to get through. It runs on every
+LFPL-O build, after the compiler has finished, so unlike the compiler it may build whole
+syntax trees: it is an oracle over one finished program, and it is what LFPL-O section 8.4
+means by Meaning.
 
 Terms and joins. A value is a canonical decision diagram: comparisons at the inner
 nodes in one fixed order, and data at the leaves. Every operation distributes over
@@ -59,6 +61,8 @@ class Terms:
             ('shr', x, count)  ('trunc', width, x)  ('call', f, args, size)
             ('struct', ctor, tag, cell, ((off, size, leaf), ...))
             ('setl', width, old, low)  ('undef', why)
+            ('tuple', members)  ('member', leaf, i, size)
+            ('aload', array, index, size): one element of an array, as it is at entry
     Decisions: ('ite', atom, hi, lo), where an atom is ('lt', x, y) or ('eq', x, y).
     Values are in unsigned integer terms, so a width only matters where it wraps.
     """
@@ -179,6 +183,10 @@ class Terms:
         if kind == "arg":
             return node[2]
         if kind == "load":
+            return node[3]
+        if kind == "aload":
+            return node[3]
+        if kind == "member":
             return node[3]
         if kind == "op":
             return node[2]
@@ -309,6 +317,12 @@ class Terms:
         sub = lambda t: self.subst(t, sigma, memo)  # noqa: E731
         if kind == "load":
             result = self.load(sub(node[1]), node[2], node[3])
+        elif kind == "aload":
+            result = self.intern(("aload", sub(node[1]), sub(node[2]), node[3]))
+        elif kind == "tuple":
+            result = self.intern(("tuple", tuple(sub(m) for m in node[1])))
+        elif kind == "member":
+            result = self.intern(("member", sub(node[1]), node[2], node[3]))
         elif kind == "op":
             result = self.arith(node[1], node[2], sub(node[3]), sub(node[4]))
         elif kind == "bit":
@@ -338,6 +352,12 @@ class Terms:
             return f"arg{node[1]}"
         if kind == "load":
             return f"[{self.show(node[1])}+{node[2]}]"
+        if kind == "aload":
+            return f"{self.show(node[1])}[{self.show(node[2])}]"
+        if kind == "tuple":
+            return "(" + ", ".join(self.show(m) for m in node[1]) + ")"
+        if kind == "member":
+            return f"{self.show(node[1])}.{node[2]}"
         if kind == "op":
             return f"{node[1]}{node[2] * 8}({self.show(node[3])}, {self.show(node[4])})"
         if kind == "bit":
@@ -367,7 +387,7 @@ class Terms:
 # ------------------------------------------------------------- source syntax
 
 _TOKEN = re.compile(r"\s+|#[^\n]*|([A-Za-z_][A-Za-z0-9_]*|\d+|=>|==|!=|<=|>=|<<|>>|&&|\|\||"
-                    r"[(){},:;@=|+\-*&^<>!])")
+                    r"[(){},:;@=|+\-*&^<>!\[\]])")
 _BINOPS = {"+": "add", "-": "sub", "*": "imul", "<<": "shl", ">>": "shr",
            "&": "and", "|": "or", "^": "xor"}
 _CMPS = ("<", "<=", ">", ">=", "==", "!=")
@@ -392,7 +412,7 @@ class TypeInfo:
 class Fn:
     name: str
     params: list
-    ret: str
+    ret: object    # a type's name, or a tuple of them when it returns several values
     at: Optional[int]
     body: tuple
 
@@ -405,6 +425,12 @@ class SourceParser:
         self.at = 0
         self.types: dict[str, TypeInfo] = {}
         self.fns: dict[str, Fn] = {}
+        self.states: list[tuple[str, str]] = []
+
+    def builtin_reserve(self) -> None:
+        """LFPL-O's Free, if the program did not declare its own."""
+        self.types.setdefault("Free", TypeInfo("Free", [
+            Ctor("End", None, True, 0), Ctor("More", None, False, 1, [("next", "Free", 0, 8)])]))
 
     def peek(self) -> Optional[str]:
         return self.tokens[self.at] if self.at < len(self.tokens) else None
@@ -426,17 +452,33 @@ class SourceParser:
                 self._data()
             elif keyword == "record":
                 self._record()
-            elif keyword == "fn":
+            elif keyword in ("fn", "handler"):
                 self._fn()
+            elif keyword == "state":
+                name = self.next()
+                self.expect(":")
+                self.states.append((name, self._type()))
+                self.expect(";")
             else:
                 raise ValueError(f"unexpected {keyword}")
+
+    def _type(self) -> str:
+        name = self.next()
+        if name == "Array":
+            self.expect("[")
+            length = self.next()
+            self.expect("]")
+            return f"Array[{length}]:{self.next()}"
+        if name == "Fin":
+            return f"Fin {self.next()}"
+        return name
 
     def _fields(self, close: str) -> list:
         fields = []
         while True:
             name = self.next()
             self.expect(":")
-            fields.append((name, self.next()))
+            fields.append((name, self._type()))
             if self.next() == close:
                 return fields
 
@@ -490,7 +532,15 @@ class SourceParser:
         else:
             params = self._fields(")")
         self.expect(":")
-        ret = self.next()
+        ret: object
+        if self.peek() == "(":
+            self.next()
+            members = [self._type()]
+            while self.next() == ",":
+                members.append(self._type())
+            ret = tuple(members)
+        else:
+            ret = self._type()
         at = None
         if self.peek() == "@":
             self.next()
@@ -518,11 +568,32 @@ class SourceParser:
         if token in ("true", "false"):
             return ("int", int(token == "true"), "Bool")
         if token == "let":
+            if self.peek() == "(":
+                self.next()
+                names = [self.next()]
+                while self.next() == ",":
+                    names.append(self.next())
+                self.expect("=")
+                bound = self.expr()
+                self.expect("in")
+                return ("lettuple", names, bound, self.expr())
             name = self.next()
             self.expect("=")
             bound = self.expr()
             self.expect("in")
             return ("let", name, bound, self.expr())
+        if token == "(":
+            members = [self.expr()]
+            while self.next() == ",":
+                members.append(self.expr())
+            return ("tuple", members)
+        if token in ("idx", "get") and token not in self.fns and self.peek() == "(":
+            self.next()
+            first = self.expr()
+            self.expect(",")
+            second = self.expr()
+            self.expect(")")
+            return (token, first, second)
         if token == "if":
             cond = self.expr()
             self.expect("then")
@@ -596,9 +667,15 @@ class SourceParser:
 # ------------------------------------------------------- the source's meaning
 
 
-def _norm(ty: str):
+def _norm(ty):
     """An integer type is its width in bytes; other types stay named."""
     return {"Int8": 1, "Int16": 2, "Int32": 4, "Int64": 8}.get(ty, ty)
+
+
+def _element(array_type: str) -> tuple[object, int]:
+    """The element type of `Array[N]:t`, normalized, and its size."""
+    element = array_type.split(":")[1]
+    return _norm(element), FIELD_SIZES[element]
 
 
 class SourceMeaning:
@@ -657,10 +734,67 @@ class SourceMeaning:
             args = [self.ev(a, env)[0] for a in e[2]]
             size = FIELD_SIZES.get(fn.ret, 8)
             built = lambda *leaves: T.call(fn.name, leaves, size)  # noqa: E731
-            return T.lift(built, *args, key=("call", fn.name)), _norm(fn.ret), None
+            result_ty = (tuple(_norm(m) for m in fn.ret) if isinstance(fn.ret, tuple)
+                         else _norm(fn.ret))
+            return T.lift(built, *args, key=("call", fn.name)), result_ty, None
         if kind == "pack":
             return self._pack(e, env)
+        if kind == "tuple":
+            evaluated = [self.ev(m, env) for m in e[1]]
+            term = T.lift(lambda *leaves: T.intern(("tuple", leaves)), *(v[0] for v in evaluated))
+            return term, tuple(v[1] for v in evaluated), None
+        if kind == "lettuple":
+            return self._let_tuple(e, env)
+        if kind == "idx":
+            value = self.ev(e[1], env)[0]
+            bound = e[2][1]
+            mask = T.const(bound - 1)
+            return T.lift(lambda x: T.bitop("and", x, mask), value), f"Fin {bound}", None
+        if kind == "get":
+            return self._get(e, env)
         raise ValueError(f"unknown expression {kind}")
+
+    def _get(self, e: tuple, env: dict) -> tuple:
+        T = self.T
+        array, array_ty, _ = self.ev(e[1], env)
+        index = self.ev(e[2], env)[0]
+        element_ty, size = _element(array_ty)
+
+        def read(base: int, position: int) -> int:
+            return T.intern(("tuple", (base, T.intern(("aload", base, position, size)))))
+
+        return T.lift(read, array, index), (array_ty, element_ty), None
+
+    def _let_tuple(self, e: tuple, env: dict) -> tuple:
+        T = self.T
+        _, names, bound, body = e
+        term, ty, _ = self.ev(bound, env)
+        member_types = ty if isinstance(ty, tuple) else tuple(self._result_types(bound))
+        result_ty: list = [None]
+
+        def on_leaf(leaf: int) -> int:
+            node = T.nodes[leaf]
+            inner = dict(env)
+            for position, name in enumerate(names):
+                member_ty = member_types[position]
+                if node[0] == "tuple":
+                    member = node[1][position]
+                else:  # a call's results: each is a value of its own, named by its position
+                    size = member_ty if isinstance(member_ty, int) else 8
+                    member = T.intern(("member", leaf, position, size))
+                inner[name] = (member, member_ty, None)
+            result, arm_ty, _ = self.ev(body, inner)
+            if result_ty[0] is None:
+                result_ty[0] = arm_ty
+            return result
+
+        return T.lift(on_leaf, term), result_ty[0], None
+
+    def _result_types(self, e: tuple) -> list:
+        """What a tuple-valued call returns: the only form whose type `ev` cannot carry alone."""
+        if e[0] == "call":
+            return [_norm(m) for m in self.fns[e[1]].ret]
+        raise ValueError(f"cannot read a tuple type from {e[0]}")
 
     def _binary(self, e: tuple, env: dict) -> tuple:
         T = self.T
@@ -829,6 +963,7 @@ for _n in range(8, 16):
     _REGISTERS.update({f"r{_n}": (f"r{_n}", 8), f"r{_n}d": (f"r{_n}", 4),
                        f"r{_n}w": (f"r{_n}", 2), f"r{_n}b": (f"r{_n}", 1)})
 _PARAMS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
+_RESULTS = ("rax", "rdx", "rcx", "rsi", "rdi", "r8")
 _SIZES = {"byte": 1, "word": 2, "dword": 4, "qword": 8}
 _ARITH = {"add", "sub", "imul", "shl"}
 _BITS = {"and", "or", "xor"}
@@ -843,6 +978,9 @@ def _operand(text: str) -> tuple:
     match = re.fullmatch(r"(byte|word|dword|qword) \[(\w+)(?:\+(\d+))?\]", text)
     if match:
         return ("mem", match.group(2), int(match.group(3) or 0), _SIZES[match.group(1)])
+    match = re.fullmatch(r"(byte|word|dword|qword) \[(\w+)\+(\w+)\*(\d)\]", text)
+    if match:
+        return ("element", match.group(2), match.group(3), int(match.group(4)), _SIZES[match.group(1)])
     if re.fullmatch(r"-?\d+", text):
         return ("imm", int(text) & MASK64)
     return ("name", text)
@@ -861,6 +999,8 @@ def parse_assembly(asm: str) -> tuple[dict, dict]:
             left, _, right = line.partition(" equ ")
             if left.startswith("L"):
                 aliases[left] = right
+            continue
+        if line.startswith(";"):
             continue
         if line.endswith(":"):
             name = line[:-1]
@@ -893,10 +1033,11 @@ class State:
     cond: int
     tags: dict
     dead: set
+    frame: int = 0  # how many `sub rsp` have not yet met their `add rsp`
 
     def copy(self) -> "State":
         return State(dict(self.regs), dict(self.mem), self.flags, self.cond,
-                     dict(self.tags), set(self.dead))
+                     dict(self.tags), set(self.dead), self.frame)
 
 
 @dataclass(frozen=True)
@@ -976,6 +1117,12 @@ class FunctionCheck:
             return T.lift(lambda x, w=o[2]: T.trunc(w, x), term, key=("trunc", o[2]))
         if o[0] == "mem":
             return T.lift(lambda leaf: self._read(S, leaf, o[2], o[3]), self._pointer(S, o[1]))
+        if o[0] == "element":
+            _kind, base, index, scale, size = o
+            if scale != size:
+                return T.undef(f"an element of {size} bytes read at a scale of {scale}")
+            return T.lift(lambda b, i: T.intern(("aload", b, i, size)),
+                          self._pointer(S, base), self._pointer(S, index))
         raise ValueError(f"cannot read {o}")
 
     def _binop(self, name: str, width: int, x: int, y: int) -> int:
@@ -1061,6 +1208,16 @@ class FunctionCheck:
             return fact[1]
         left = [c.tag for c in info.ctors if c.tag not in fact[1]]
         return left[0] if len(left) == 1 else None
+
+    def _result_of(self, S: State) -> int:
+        """What the function hands back, read from where the convention says it is."""
+        T = self.T
+        ret = self.fn.ret
+        if not isinstance(ret, tuple):
+            return self.reify(S, S.regs.get("rax", T.undef("rax never set")), _norm(ret))
+        members = [self.reify(S, S.regs.get(_RESULTS[i], T.undef(f"{_RESULTS[i]} never set")), _norm(m))
+                   for i, m in enumerate(ret)]
+        return T.lift(lambda *leaves: T.intern(("tuple", leaves)), *members)
 
     def reify(self, S: State, term: int, ty) -> int:
         """Read a value the way the source would see it: a pointer to a rebuilt cell
@@ -1277,6 +1434,9 @@ class FunctionCheck:
               placed: set, reached: list) -> Optional[State]:
         T = self.T
         where = f"line {line}"
+        if op in ("sub", "add") and ops[0] == ("name", "rsp"):
+            S.frame += 1 if op == "sub" else -1
+            return S
         if op == "mov":
             dest, source = ops
             value = self._val(S, source)
@@ -1300,15 +1460,22 @@ class FunctionCheck:
                 self.problems.append(Problem(self.fn.name, where, "test of two different operands"))
             S.flags = (self._val(S, ops[0]), T.ZERO)
         elif op == "ret":
-            self._exit(S, self.reify(S, S.regs.get("rax", T.undef("rax never set")), _norm(self.fn.ret)),
-                       want, f"ret at {where}", reached)
+            if S.frame:
+                self.problems.append(Problem(self.fn.name, where, "ret with a frame still on the stack"))
+            self._exit(S, self._result_of(S), want, f"ret at {where}", reached)
             return None
         elif op == "call":
             callee = self.fns[ops[0][1][3:]]
             result = self._invoke(S, callee)
             for register in self.clobbers.get(callee.name, ()):
                 S.regs.pop(register, None)
-            S.regs["rax"] = result
+            if isinstance(callee.ret, tuple):
+                for position, member in enumerate(callee.ret):
+                    size = FIELD_SIZES.get(member, 8)
+                    S.regs[_RESULTS[position]] = T.lift(
+                        lambda leaf, p=position, z=size: T.intern(("member", leaf, p, z)), result)
+            else:
+                S.regs["rax"] = result
             S.flags = None
         elif op == "jmp":
             return self._jump(S, ops[0][1], where, want, pending, placed, reached)
@@ -1378,6 +1545,8 @@ class FunctionCheck:
         T = self.T
         fn = self.fn
         if target.startswith("fn_"):  # a tail call to another function
+            if S.frame:
+                self.problems.append(Problem(fn.name, where, "a tail call with a frame on the stack"))
             result = self._invoke(S, self.fns[target[3:]])
             self._exit(S, result, want, f"tail call at {where}", reached)
             return None
@@ -1420,6 +1589,7 @@ def check_translation(source: bytes, asm: str) -> list[Problem]:
     """Every problem found in `asm` as a translation of `source`; [] means agreement."""
     program = SourceParser(source.decode())
     program.parse()
+    program.builtin_reserve()
     bodies, aliases = parse_assembly(asm)
     clobbers = _clobber_sets(bodies)
     problems: list[Problem] = []

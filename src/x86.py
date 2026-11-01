@@ -624,7 +624,10 @@ class Backend:
             self.ins("cmp", first, TRANSIT)
 
     def i_br(self, a: list[str]) -> None:
-        self._compare(a[1], a[2])
+        self._compare(a[1].rstrip("!"), a[2].rstrip("!"))
+        for operand in (a[1], a[2]):
+            if operand.endswith("!"):
+                self._free(self.reg(operand[:-1]))
         self._branch(a[0], a[3], a[4], dict(self.home), dict(self.home))
 
     def i_br_null(self, a: list[str]) -> None:

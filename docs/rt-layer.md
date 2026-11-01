@@ -141,7 +141,9 @@ so is claiming a store was unnecessary when it was needed.
 
     label L             the merge rule below
     jump L              an edge to L carrying the current tokens
-    br cc, a, b, Lt, Lf  a, b same scalar              an edge to each, tokens unchanged
+    br cc, a, b, Lt, Lf  a, b same scalar              an edge to each, tokens unchanged, except
+                                                       that an operand written r! goes free: a
+                                                       temporary the comparison reads for the last time
     br.null p, Ln, Lc   p = w : D, D tagless
                         Ln: free p, and w is known to be null on this edge
                         Lc: p = w : Cap, with every field of the full constructor full,
