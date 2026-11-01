@@ -29,7 +29,8 @@ the RT layer's text format, one event at a time, so they reach every reader of t
   * handlers and state, with the shape section 3.1 fixes;
   * Array[N] t, Fin N and unboxed tuples, which are types with no entry in G, because they appear
     in the middle of a parameter list and G's entries for one function must stay consecutive;
-  * idx and get, which are primitives there, while Phase 1 programs may still call a function get;
+  * idx, get and the narrowing low8, low16 and low32, which are primitives there, while Phase 1
+    programs may still call a function get;
   * a built-in Free, and a type declared but never defined, which is the runtime's own to build.
 """
 from __future__ import annotations
@@ -39,7 +40,7 @@ from typing import NamedTuple, Optional
 
 from .dyck import (CLOSE, ELEMENT_CODES, OP_NAMES, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP,
                    K_CTOR, K_CTORDECL, K_DATA, K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER,
-                   K_IDX, K_IF, K_INT, K_LET, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM,
+                   K_IDX, K_IF, K_INT, K_LET, K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM,
                    K_RECORD, K_RESWORD, K_RTDECL, K_RTDECLMORE, K_STATE, K_TARRAY, K_TFIN,
                    K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_WITH, LEAF, OPEN, SEP,
                    ev_class, ev_kind, ev_tag)
@@ -55,6 +56,8 @@ FIRST_NAMED = 16
 # A literal whose type nothing has fixed yet, by the bytes it needs. T_LIT is the widest, and
 # the only one without `lfplo`, where a literal has always fitted whatever it met.
 _LITERALS = {T_LIT8: 1, T_LIT16: 2, T_LIT32: 4, T_LIT: 8}
+_NARROWING = {b"low8": T_I8, b"low16": T_I16, b"low32": T_I32}
+_PRIMITIVES = {b"idx", b"get", *_NARROWING}
 # Types with no entry in G. A range of ids per kind, so whether a type is linear can be read from
 # its id alone, as it already can for every other type.
 FIRST_ARRAY, FIRST_FIN, FIRST_TUPLE = 0x8000, 0xC000, 0xE000
@@ -137,6 +140,7 @@ class CheckStage(Stage):
         self.decl_text = b""               # the rest of the line being written out
         self.decl_queue: list[bytes] = []  # at most one declaration's few extra lines
         self.fn_handler = False
+        self.fn_recursive = False
         self.fn_at = 0
         self.ty = T_LIT           # the type of the last completed expression
         self.used = 0             # U: linear binders consumed so far
@@ -469,7 +473,7 @@ class CheckStage(Stage):
             self.ring.drop(self, cell)
             return
         if (cls in (SEP, CLOSE) and kind == K_CALL and len(self.K)
-                and self.K.peek()[0] in (K_IDX, K_GET)):
+                and self.K.peek()[0] in (K_IDX, K_GET, K_LOW)):
             kind = self.K.peek()[0]
         result = (self._on_open, self._on_sep, self._on_leaf, self._on_close)[cls](
             kind, payload)
@@ -672,9 +676,10 @@ class CheckStage(Stage):
         if kind in (K_FN, K_HANDLER):
             if self._g_find(E_FUNC, payload) is not None:
                 raise self._reject("duplicate function name")
-            if self.lfplo and payload.rstrip(bytes(1)) in (b"idx", b"get"):
+            if self.lfplo and payload.rstrip(bytes(1)) in _PRIMITIVES:
                 raise self._reject(f"{payload.rstrip(bytes(1)).decode()} is a primitive")
             self.fn_handler = kind == K_HANDLER
+            self.fn_recursive = False
             self.fn_self = self._g_push(E_FUNC, payload, b=self.fn_handler, x=self.fn_count)
             self.used = self.lin_held = 0
             self.fn_at = 0
@@ -695,6 +700,10 @@ class CheckStage(Stage):
             primitive = K_IDX if payload.rstrip(bytes(1)) == b"idx" else K_GET
             self._frame(primitive)
             return primitive, b""
+        elif kind == K_CALL and self.lfplo and payload.rstrip(bytes(1)) in _NARROWING:
+            self._frame(K_LOW, t1=_NARROWING[payload.rstrip(bytes(1))])
+            self.child_seen = False
+            return K_LOW, b""
         elif kind == K_CALL:
             found = self._g_find(E_FUNC, payload)
             if found is None:
@@ -799,6 +808,8 @@ class CheckStage(Stage):
                 raise self._reject(f"a tuple of more than {TUPLE_MAX}")
             self.TM.push(0, struct.pack("<H", self.ty))
             return kind, payload
+        if kind == K_LOW:
+            raise self._reject("low8, low16 and low32 take one integer")
         if kind == K_IDX:
             self._need_int(self.ty, "idx's operand")
             frame[1] = 1  # the bound comes next, and it must be a literal
@@ -954,11 +965,20 @@ class CheckStage(Stage):
             if self.viable >> subset & 1 and self._falls(subset, args):
                 surviving |= 1 << subset
         self.viable = surviving
+        self.fn_recursive = True
         if not surviving:
             name = self.G.at(self.fn_self)[1][:PAYLOAD_BYTES].rstrip(b"\0").decode()
             raise self._reject(
                 f"rule R3: no fixed set of linear arguments of {name} loses cells at every "
                 f"recursive call so far, not counting Free, so nothing shows the recursion ends")
+
+    def _decreasing_set(self) -> int:
+        """The set of positions rule R3 settled on, which the RT layer's potential sits on: the
+        smallest, since a smaller set asks less of its callers. 0 if nothing recursed."""
+        if not self.fn_recursive:
+            return 0
+        sets = [s for s in range(1, 64) if self.viable >> s & 1]
+        return min(sets, key=lambda s: (bin(s).count("1"), s))
 
     def _falls(self, subset: int, args: list[Cells]) -> bool:
         """before - after must be at least 1 whatever the unknowns are, and they can all be
@@ -1113,6 +1133,14 @@ class CheckStage(Stage):
             self.K.pop()
             self.child_seen = True
             return kind, payload
+        if kind == K_LOW:
+            if not self.child_seen:
+                raise self._reject("low8, low16 and low32 take one integer")
+            self._need_int(self.ty, "a narrowing")
+            self.ty = frame[2]
+            self.K.pop()
+            self.child_seen = True
+            return kind, bytes((size_of(self.ty),))
         if kind == K_IDX:
             if frame[1] != 2:
                 raise self._reject("idx takes a value and a literal bound")
@@ -1136,7 +1164,7 @@ class CheckStage(Stage):
             self._unbind_to(0)
             self.fn_count += 1
             self.K.pop()
-            return kind, payload
+            return kind, bytes((self._decreasing_set(),)) if self.lfplo else payload
         if kind == K_LET:
             self.closing = self.form  # the value of a let is the value of its body
             self._unbind_to(frame[4])

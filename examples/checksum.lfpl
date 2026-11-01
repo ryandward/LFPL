@@ -1,0 +1,39 @@
+# The Internet checksum of a packet's payload, written in place into its header.
+#
+# On the wire a packet is [port][sum][payload], and it leaves on that port as [sum][payload], with
+# sum replaced. The payload is a chain of cells, each holding 7 bytes, as the runtime builds it.
+# Declaring that layout, instead of leaving Bytes abstract as forward.lfpl does, is what lets this
+# program read it. Bytes past a cell's used count are zero, so only the parity below needs care.
+data Bytes = Last | Chunk(used: Int8, b0: Int8, b1: Int8, b2: Int8, b3: Int8, b4: Int8, b5: Int8,
+                          b6: Int8, next: Bytes);
+record Packet { port: Int8, sum: Int16, body: Bytes };
+
+# A linear program cannot read a chain and keep it, so it takes the chain apart as it reads, moving
+# each cell onto an accumulator, which comes back reversed. Nothing is copied: only the link in
+# each cell changes.
+#
+# The sum is of 16-bit little-endian words. A byte at an even position of the stream is a low byte,
+# and one at an odd position is a high byte. 7 is odd, so that swaps from each cell to the next.
+fn add(s: Int64, odd: Int64, l: Bytes, acc: Bytes) : (Int64, Bytes) = match l with
+  | Last => (s, acc)
+  | Chunk(d, used, b0, b1, b2, b3, b4, b5, b6, next) =>
+      add(+(s, +(<<(+(pack<8>(b0), +(pack<8>(b2), +(pack<8>(b4), pack<8>(b6)))), *(odd, 8)),
+                 <<(+(pack<8>(b1), +(pack<8>(b3), pack<8>(b5))), *(^(odd, 1), 8)))),
+          ^(odd, 1), next, Chunk@d(used, b0, b1, b2, b3, b4, b5, b6, acc))
+  end;
+
+fn reverse(l: Bytes, acc: Bytes) : Bytes = match l with
+  | Last => acc
+  | Chunk(d, used, b0, b1, b2, b3, b4, b5, b6, next) =>
+      reverse(next, Chunk@d(used, b0, b1, b2, b3, b4, b5, b6, acc))
+  end;
+
+# End-around carry. Four folds bring any 64-bit sum down to 16 bits.
+fn fold(s: Int64) : Int64 = +(&(s, 65535), >>(s, 16));
+fn finish(s: Int64) : Int16 = low16(^(fold(fold(fold(fold(s)))), 65535));
+
+handler checksum(p: Packet, free: Free) : (Packet, Free) =
+  match p with Packet(d, port, old, body) =>
+    let (s, reversed) = add(0, 0, body, Last) in
+    (Packet@d(port, finish(s), reverse(reversed, Last)), free)
+  end;

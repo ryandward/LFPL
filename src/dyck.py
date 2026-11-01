@@ -25,6 +25,7 @@ already begins with a keyword or a name, so one token of lookahead decides it.
               | 'let' id '=' e 'in' e | 'if' e 'then' e 'else' e
               | 'let' '(' id ',' id {',' id} ')' '=' e 'in' e
               | '(' e ',' e {',' e} ')' | 'idx' '(' e ',' int ')' | 'get' '(' e ',' e ')'
+              | ('low8'|'low16'|'low32') '(' e ')'
               | Name | Name '@' id '(' [e {',' e}] ')'
               | 'match' e 'with' ['|'] arm {'|' arm} 'end'
               | '{' e 'with' id '=' e '}'
@@ -87,7 +88,7 @@ OPEN, SEP, LEAF, CLOSE = range(4)
 _KINDS = tuple((
     "FN PARAM TYPE RESWORD DATA CTORDECL FIELD RECORD LET BINDER IF MATCH ARM "
     "WITH BINOP CMP AND OR NOT CALL CTOR DIAMOND PACK VAR INT BOOL NULLCTOR "
-    "EOF HANDLER STATE TARRAY TFIN TTUPLE TUPLE IDX GET RTDECL RTDECLMORE "
+    "EOF HANDLER STATE TARRAY TFIN TTUPLE TUPLE IDX GET RTDECL RTDECLMORE LOW "
 ).split())
 (
     K_FN, K_PARAM, K_TYPE, K_RESWORD, K_DATA, K_CTORDECL, K_FIELD, K_RECORD,
@@ -95,6 +96,7 @@ _KINDS = tuple((
     K_AND, K_OR, K_NOT, K_CALL, K_CTOR, K_DIAMOND, K_PACK, K_VAR,
     K_INT, K_BOOL, K_NULLCTOR, K_EOF,
     K_HANDLER, K_STATE, K_TARRAY, K_TFIN, K_TTUPLE, K_TUPLE, K_IDX, K_GET, K_RTDECL, K_RTDECLMORE,
+    K_LOW,
 ) = range(len(_KINDS))
 
 # What an array's element can be, as Check and the payload of leaf(TARRAY) name it.

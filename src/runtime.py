@@ -13,9 +13,11 @@ cells never left ingress, so the next datagram simply overwrites them.
 What the source does not say, this file decides:
 
     Wire format     an item is its record's scalar fields in declaration order, little
-                    endian and packed, then the bytes of its one abstract field.
-    Abstract type   a chain of cells: used count at 0, 7 payload bytes, next at 8. Only the
-                    last cell's used count means anything, and an empty body is null.
+                    endian and packed, then the bytes of its one chain field.
+    Chain type      a chain of cells: used count at 0, 7 payload bytes, next at 8, and null for
+                    an empty body. A program can leave the type abstract, or declare exactly
+                    that layout to walk it. Bytes past the used count read as zero, so nothing
+                    from an earlier item can be seen.
     Output          a constructor with a field named `port` is sent to `out_base + port`,
                     as its other scalar fields followed by its chain. Any other constructor
                     sends nothing, and its cells go back to the pool.
@@ -31,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .rtcheck import SIZES, Checker, Ctor
+from .rtcheck import SIZES, Bound, Checker, Ctor
 
 PAGE = 4096
 CELL = 16
@@ -42,8 +44,12 @@ O_MAX = 1            # a handler returns one output
 CONTROL_EVERY = 64   # turns between looks at the control port, so a flood cannot starve it
 RUNTIME_DEPTH = 48   # the deepest the loop's own calls go: control, drain, free_chain, push_cell
 IDLE_MICROSECONDS = 1000
+MAX_IMAGE_BYTES = 1 << 30  # the code reaches the image with 32-bit displacements, which stop at 2 GiB
+WORD_LIMIT = 1 << 63       # the admission table and the arithmetic on it are 64-bit, signed in imul
+# admitted_cells adds up n, as admission worked it out from each datagram's length. budget_steps
+# adds up W(n) for those. steps is what ran, in a build that counts them, and is otherwise 0.
 COUNTERS = ("capacity", "pool", "served", "forwarded", "dropped", "too_large", "short", "full",
-            "malformed", "send_errors", "recv_errors")
+            "malformed", "send_errors", "recv_errors", "admitted_cells", "budget_steps", "steps")
 PARAMS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
 RESULTS = ("rax", "rdx", "rcx", "rsi", "rdi", "r8")
 _WIDTH = {1: "byte", 2: "word", 4: "dword", 8: "qword"}
@@ -101,8 +107,7 @@ class Image:
     item_chain: Optional[int]
     out_tagged: bool
     out: tuple[OutCtor, ...]
-    reserve_draws: int
-    steps: int
+    bound: Bound
     depth: int
     options: Options
 
@@ -112,7 +117,12 @@ class Image:
         n_max = self.options.n_max
         if self.options.cells is not None:
             return self.options.cells
-        return K_IN * n_max + self.reserve_draws + n_max + self.options.k_out * O_MAX * n_max
+        return K_IN * n_max + self.reserve_at_most + n_max + self.options.k_out * O_MAX * n_max
+
+    @property
+    def reserve_at_most(self) -> int:
+        """R(N_max)."""
+        return self.bound.a * self.options.n_max + self.bound.b
 
     @property
     def capacity(self) -> int:
@@ -130,6 +140,11 @@ class Image:
     @property
     def body_cells(self) -> int:
         return self.options.n_max - 1 if self.item_chain is not None else 0
+
+    @property
+    def bytes(self) -> int:
+        return (self.cell_count * CELL + self.stack_bytes
+                + sum(s.length * s.element_size for s in self.states))
 
 
 def bind(checker: Checker, handler_name: str, depth: int, options: Options,
@@ -169,9 +184,8 @@ def bind(checker: Checker, handler_name: str, depth: int, options: Options,
     if out_decl is None or out_decl.kind not in ("tagged", "tagless", "record"):
         raise BindingError(f"section 3.1: the output {out_type} is not a data type")
     out = tuple(_out_ctor(checker, ctor) for ctor in out_decl.ctors)
-    draws, steps = checker.bounds(handler_name)
     return Image(handler_name, tuple(states), tuple(scalars), chain, out_decl.kind == "tagged",
-                 out, draws, steps, depth, options)
+                 out, checker.bounds(handler_name), depth, options)
 
 
 def _check_reserve(checker: Checker, reserve: str) -> None:
@@ -187,6 +201,23 @@ def _check_reserve(checker: Checker, reserve: str) -> None:
         raise BindingError("section 3.1: Free must be End | More(next: Free)")
 
 
+def _is_chain(checker: Checker, ty: str) -> bool:
+    """A type the runtime can build from a datagram: abstract, or declared with the very layout it
+    uses, which is what lets a program walk it."""
+    norm = checker.norm(ty)
+    decl = checker._decl(norm)
+    if decl is None:
+        return False
+    if decl.kind == "abstract":
+        return True
+    full = [c for c in decl.ctors if c.tag != "null"]
+    if decl.kind != "tagless" or len(full) != 1 or len(full[0].fields) != BODY_PAYLOAD + 2:
+        return False
+    fields = full[0].fields
+    bytes_in_order = all(field[:3] == (position, 1, "i8") for position, field in enumerate(fields[:-1]))
+    return bytes_in_order and fields[-1][:2] == (8, 8) and checker.norm(fields[-1][2]) == norm
+
+
 def _split_fields(checker: Checker, owner: str, fields: list) -> tuple[list, Optional[int]]:
     scalars = []
     chain = None
@@ -194,11 +225,11 @@ def _split_fields(checker: Checker, owner: str, fields: list) -> tuple[list, Opt
         decl = checker._decl(checker.norm(ty))
         if decl is None:
             scalars.append((off, size))
-        elif decl.kind == "abstract" and chain is None:
+        elif _is_chain(checker, ty) and chain is None:
             chain = off
         else:
             raise BindingError(f"section 3.1: {owner}.{name} is {decl.name}, and this runtime "
-                               f"carries scalars and one abstract chain")
+                               f"carries scalars and one chain")
     return scalars, chain
 
 
@@ -230,7 +261,14 @@ def assembly(image: Image) -> str:
     o = image.options
     if image.body_cells > 1000:
         raise BindingError("section 8.2: N_max is past what one recvmsg can scatter")
-    smallest = K_IN * o.n_max + image.reserve_draws + o.n_max
+    if image.bytes > MAX_IMAGE_BYTES:
+        raise BindingError(f"section 8.2: {image.handler} needs an image of {image.bytes} bytes, and "
+                           f"this runtime takes at most {MAX_IMAGE_BYTES}")
+    if image.bound.c * o.n_max + image.bound.d >= WORD_LIMIT:
+        raise BindingError(f"section 8.2: W(N_max) of {image.handler} is "
+                           f"{image.bound.c * o.n_max + image.bound.d} steps, which admission's "
+                           f"64-bit arithmetic cannot hold")
+    smallest = K_IN * o.n_max + image.reserve_at_most + o.n_max
     if image.cell_count < smallest:
         raise BindingError(f"section 3.4: {image.cell_count} cells cannot hold ingress and one "
                            f"maximal transaction, which take {smallest}")
@@ -425,6 +463,12 @@ def assembly(image: Image) -> str:
     add(f"    add rax, {O_MAX}")
     add(f"    cmp rax, {image.options.k_out}")
     add("    ja .full")
+    add("    ; n comes from the datagram's length, and R(n) and W(n) from the table")
+    add("    add [cnt_admitted_cells], r14")
+    add("    mov rax, [admission+16]")
+    add("    imul rax, r14")
+    add("    add rax, [admission+24]")
+    add("    add [cnt_budget_steps], rax")
     add("    ; ADMIT: the item's cells leave ingress, and fresh ones from the pool take their place")
     add("    test r13, r13")
     add("    jz .linking")
@@ -434,8 +478,17 @@ def assembly(image: Image) -> str:
     add("    mov rdx, r12")
     add("    sub rdx, rcx")
     add("    shl rax, 4")
-    add(f"    mov rdi, [in_iov+{16 * item_count}+rax]")
-    add("    mov [rdi-1], dl")
+    add(f"    mov r10, [in_iov+{16 * item_count}+rax]")
+    add("    dec r10")
+    add("    ; the last cell keeps its used count and that many bytes: the rest of it is an old item's")
+    add("    lea rcx, [rdx+1]")
+    add("    shl rcx, 3")
+    add("    cmp rcx, 64")
+    add("    jae .linking")
+    add("    mov eax, 1")
+    add("    shl rax, cl")
+    add("    dec rax")
+    add("    and [r10], rax")
     add(".linking:")
     add("    xor r8d, r8d")
     add("    mov rcx, r13")
@@ -448,6 +501,7 @@ def assembly(image: Image) -> str:
     add(f"    lea rbx, [in_iov+{16 * item_count}+rax]")
     add("    mov rdi, [rbx]")
     add("    dec rdi")
+    add(f"    mov byte [rdi], {BODY_PAYLOAD}")
     add("    mov [rdi+8], r8")
     add("    mov r8, rdi")
     add("    call pop_cell")
@@ -455,6 +509,10 @@ def assembly(image: Image) -> str:
     add("    mov [rbx], rax")
     add("    jmp .link")
     add(".linked:")
+    add("    test r13, r13")
+    add("    jz .body_counted")
+    add("    mov [r10], dl")
+    add(".body_counted:")
     add("    mov r14, [slot_head]")
     if image.item_chain is not None:
         add(f"    mov [r14+{image.item_chain}], r8")
@@ -554,13 +612,16 @@ def assembly(image: Image) -> str:
             add(".chain_%d:" % position)
             add("    test rdi, rdi")
             add(f"    jz .send_ready_{position}")
+            add(f"    cmp rcx, {out_iov}")
+            add(f"    jae .too_long_{position}")
             add("    lea rax, [rdi+1]")
             add("    mov [rbx], rax")
-            add(f"    mov eax, {BODY_PAYLOAD}")
-            add("    cmp qword [rdi+8], 0")
-            add(f"    jne .whole_{position}")
+            add("    ; a program can write this count, so it can name no byte outside the cell")
             add("    movzx eax, byte [rdi]")
-            add(f".whole_{position}:")
+            add(f"    cmp eax, {BODY_PAYLOAD}")
+            add(f"    jbe .counted_bytes_{position}")
+            add(f"    mov eax, {BODY_PAYLOAD}")
+            add(f".counted_bytes_{position}:")
             add("    mov [rbx+8], rax")
             add("    add rbx, 16")
             add("    inc rcx")
@@ -577,6 +638,8 @@ def assembly(image: Image) -> str:
         add("    je .done")
         add("    test rax, rax")
         add(f"    jns .counted_{position}")
+        if ctor.chain is not None:  # a chain a program grew past what one message can gather
+            add(f".too_long_{position}:")
         add("    inc qword [cnt_send_errors]")
         add(f".counted_{position}:")
         if ctor.chain is not None:
@@ -691,7 +754,7 @@ def assembly(image: Image) -> str:
     add(f"in_msg: dq 0, 0, in_iov, {iov_in}, 0, 0, 0")
     add("out_msg: dq out_addr, 16, out_iov, 0, 0, 0, 0")
     add("; the admission table of section 6.1: R(n) = a n + b, W(n) = c n + d")
-    add(f"admission: dq 0, {image.reserve_draws}, 0, {image.steps}")
+    add(f"admission: dq {image.bound.a}, {image.bound.b}, {image.bound.c}, {image.bound.d}")
     for state in image.states:
         if state.initial is not None:
             add("align 16")

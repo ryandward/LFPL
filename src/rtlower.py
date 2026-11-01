@@ -24,7 +24,7 @@ from .check import (P_ARM_RT, P_BINDER, P_CALL_RT, P_DIAMOND_RT, P_FIELD, P_GET_
                     P_LET_RT, P_PARAM_RT, P_TYPE_RT, P_VAR, P_WITH_RT, CheckStage)
 from .dyck import (CC_NAMES, CLOSE, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP, K_CTOR,
                    K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER, K_IDX, K_IF, K_INT, K_LET,
-                   K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
+                   K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
                    K_RTDECLMORE, K_TUPLE, K_TYPE, K_VAR, K_WITH, LEAF, OP_NAMES, OPEN, SEP, Lexer,
                    Parser, ev_class, ev_kind)
 from .ring import FrameStack, Reject, Ring, Stage
@@ -980,6 +980,14 @@ class RTLower(Stage):
         self._release(value)
         self._finish(top, register)
 
+    def _close_low(self, payload: bytes) -> None:
+        top = self.F.pop()
+        value = self.V.pop()
+        register = self._result(top)
+        self.i(f"trunc r{register}, {8 * payload[0]}, {self._operand(value)}")
+        self._release(value)
+        self._finish(top, register)
+
     def _close_get(self, payload: bytes) -> None:
         top = self.F.pop()
         index, array = self.V.pop(), self.V.pop()
@@ -1302,7 +1310,8 @@ class RTLower(Stage):
             self.B.truncate(0)
             self.U.truncate(0)
             self.G.truncate(0)
-            self.emit("end")
+            decreasing = [str(p) for p in range(8) if payload[0] >> p & 1]
+            self.emit("end decreasing " + ",".join(decreasing) if decreasing else "end")
         elif kind == K_LET:
             top = self.F.pop()
             self._pop_binders(top.bmark)
@@ -1328,6 +1337,8 @@ class RTLower(Stage):
             self._close_pack()
         elif kind == K_IDX:
             self._close_idx(payload)
+        elif kind == K_LOW:
+            self._close_low(payload)
         elif kind == K_GET:
             self._close_get(payload)
         elif kind == K_TUPLE:

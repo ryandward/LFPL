@@ -24,8 +24,9 @@ before anything is built on them; Python is not meant to be the end state.
 
 A second specification, LFPL-O, asks what those rules buy a long-running service: a program
 that, once started, never crashes, hangs or leaks, and that refuses work at its boundary
-when demand exceeds what it can guarantee. The first program of that kind now runs here, a
-packet forwarder on real sockets, and it comes later in this page.
+when demand exceeds what it can guarantee. Two programs of that kind now run here on real
+sockets, a packet forwarder and a checksum whose work depends on the packet, and they come later
+in this page.
 
 ## What a program looks like
 
@@ -135,7 +136,7 @@ python3 -m src.lfplo examples/forward.lfpl -o forward \
 The compiler reports what it derived, and it refuses a handler for which it cannot derive it:
 
 ```
-handler forward: R(n) = 0 cells, W(n) = 11 steps (23 instructions), stack 8 bytes, 14256 cells, image 233216 bytes
+handler forward: R(n) = 0 cells, W(n) = 6 steps, stack 8 bytes, 14256 cells, image 233216 bytes
 ```
 
 What comes out is a static binary with no libc in it. A datagram is `[ttl][dst, little endian][body]`,
@@ -154,6 +155,72 @@ Once a handler starts it finishes. All the memory is laid out at link time and t
 startup, and the stack is inside that image with a guard page below it, so a flood changes the
 refusal count and nothing else. `tests/test_forward.py` checks each of these against a
 running binary, from outside it, including pausing egress so that a queue really does fill.
+
+## A program that walks its item
+
+The forwarder never looks at a packet's body, so it does the same work for every packet, and its
+bound is a constant. A checksum has to read every byte, so its work depends on the packet, and
+now the promise is harder: the runtime has to know how much a handler will need before starting
+it, for a packet it has never seen. `examples/checksum.lfpl` computes the Internet checksum of a
+payload and writes it in place into the header, and this is the part that does the walking:
+
+```
+data Bytes = Last | Chunk(used: Int8, b0: Int8, b1: Int8, b2: Int8, b3: Int8, b4: Int8, b5: Int8,
+                          b6: Int8, next: Bytes);
+record Packet { port: Int8, sum: Int16, body: Bytes };
+
+fn add(s: Int64, odd: Int64, l: Bytes, acc: Bytes) : (Int64, Bytes) = match l with
+  | Last => (s, acc)
+  | Chunk(d, used, b0, b1, b2, b3, b4, b5, b6, next) =>
+      add(+(s, +(<<(+(pack<8>(b0), +(pack<8>(b2), +(pack<8>(b4), pack<8>(b6)))), *(odd, 8)),
+                 <<(+(pack<8>(b1), +(pack<8>(b3), pack<8>(b5))), *(^(odd, 1), 8)))),
+          ^(odd, 1), next, Chunk@d(used, b0, b1, b2, b3, b4, b5, b6, acc))
+  end;
+
+handler checksum(p: Packet, free: Free) : (Packet, Free) =
+  match p with Packet(d, port, old, body) =>
+    let (s, reversed) = add(0, 0, body, Last) in
+    (Packet@d(port, finish(s), reverse(reversed, Last)), free)
+  end;
+```
+
+Declaring `Bytes` with the layout the runtime builds, where the forwarder left it abstract, is what
+lets the program read it. A linear program cannot read a chain and also keep it, so `add` takes
+the chain apart as it goes, moving each cell onto an accumulator, and `reverse` moves them all back.
+Nothing is copied and nothing is drawn from the reserve: only the link in each cell changes, and
+the sum replaces the old one in the same header cell. Now the report has the item's size in it,
+where `n` is the number of cells the item takes:
+
+```
+handler checksum: R(n) = 0 cells, W(n) = 28 n + 4 steps, stack 24 bytes, 14256 cells, image 232192 bytes
+```
+
+That is the potential method of Hofmann and Jost. Imagine every cell of a value carrying some
+amount of credit, the same unknown amount for each cell. Opening a cell releases its credit. Each
+instruction spends some, and building a value has to set aside the new cell's share out of what is
+in hand. So a walk has to pay for each iteration out of the one cell that iteration opened, and
+it has to pay for the credit of the cell it put on the accumulator, because the next walk will
+need it. Every one of those sentences is a linear inequality over the unknowns, so one handler's
+are one linear program, and solving it gives the smallest amounts that work: 28 steps per cell here.
+A program with no such numbers is refused, which is what happens to a walk that also reverses its
+accumulator at each step: it does quadratic work, and the inequalities have no solution.
+
+The solver is not trusted. `src/rtcheck.py` writes the inequalities as it types the code, and
+`src/simplex.py`, which shares nothing with it, proposes numbers in exact fractions. Then the
+checker puts those numbers into every inequality it wrote, and believes none of them until all hold.
+A wrong solver can therefore only cost a refusal, and that is tested by making the solver lie.
+
+At run time the promise is kept by arithmetic on the datagram's length. Admission works out `n` from
+that length alone, looks up the four numbers the compiler put in the image, and reserves `R(n)` cells
+before the handler starts, or refuses the item if the pool does not have them. A handler that draws
+from its reserve gets exactly what its bound says, and so never reaches the arm for running out.
+
+A bound is only a claim until the code it describes has been timed against it. A `--count-steps`
+build adds a counter at each step the checker charged for, and `tests/test_checksum.py` compares
+that against `W(n)` on a live socket, along with the checksum itself against one written
+independently in Python, for every short length and the longest item there is. `tests/test_walks.py`
+then does the same to handlers nobody chose: random pipelines of reversals, copies, filters and
+merges, each with a model in Python, each datagram judged on its bytes and its steps.
 
 ## How the compiler holds itself to the same rules
 
@@ -282,8 +349,9 @@ programs of certain shapes. All of that is fixed and tested. The generators it w
 `tests/reference`, each with an interpreter that shares nothing with the compiler, and
 `tests/test_generated.py` runs them on every test run, handlers included, on live sockets.
 
-For a handler, the checks are not something you run afterwards. `src/lfplo.py` runs the type check on every line, the symbolic check
-on the result and an independent recomputation of the stack on the assembly, and any failure
+For a handler, the checks are not something you run afterwards. `src/lfplo.py` runs the type check
+on every line, verifies the bound's certificate, runs the symbolic check on the result and an
+independent recomputation of the stack on the assembly, and any failure
 removes the binary, including one left by an earlier build. The test suite damages the compiled
 handler one instruction at a time, in every way that still parses, and requires the check to
 catch all of it, apart from a short list of changes that do not alter what it means, each with
@@ -342,17 +410,22 @@ arm of a conditional while it is still needed after the join.
 
 ## What is not here yet
 
-The forwarding handler is the first LFPL-O program, and it asks for less than the specification
-offers. Its bounds are constants, measured from the code: a handler is refused if recursion can
-be reached from it, because the resource analysis that would give a recursive body a bound
-`c·n + d` does not exist. So a handler cannot yet walk its own body, and a checksum is out of
-reach. Arrays hold scalars, have a power-of-two length until division exists, and can be read
-but not written, because `swap` and state slots are not built. Tuples are flat, and at most six
-wide, because they are only ever registers. There is one handler and one
-ingress, one datagram per turn, bound to the loopback address. Admission checks size, pool and
-queue, but not deadlines or a program's own predicate, since neither can be declared yet. The
-control port and pausing egress are not in the specification: without a way to look inside and
-a way to hold egress still, on loopback where sends never block, none of the rest could be shown.
+The two handlers ask for less than the specification offers. Bounds are derived and certified,
+but only `R(n)` refuses anything: deadlines cannot be declared yet, so admission works out `W(n)` and
+only adds it to a counter. Nothing relates a step to a number of machine instructions either, so
+`W(n)` is a count of the checker's steps and not a time. Arrays hold scalars, have a power-of-two
+length until division exists, and can be read but not written, because `swap` and state slots are
+not built. Tuples are flat, and at most six wide, because they are only ever registers. There is one
+handler and one ingress, one datagram per turn, bound to the loopback address. Admission checks size,
+pool and queue, but not a program's own predicate, which cannot be declared yet. The control port and
+pausing egress are not in the specification: without a way to look inside and a way to hold egress
+still, on loopback where sends never block, none of the rest could be shown.
+
+Two limits come from the bound's own arithmetic. A handler's linear program stops at 1,024
+inequalities, and because each call gets its own copy of what it calls, those multiply with the depth
+of the call graph, so a deep program can be refused for that even though a bound exists. And a
+`Free` cannot be walked: rule R3 does not count one, which is what makes the arm for running out
+unreachable, and that means a program cannot hold two.
 
 Two parts deserve less trust than the rest. The runtime in `src/runtime.py` is assembly that no
 check reads, which section 11.3 of the specification accepts on the grounds that it is small and

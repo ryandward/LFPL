@@ -587,6 +587,11 @@ class SourceParser:
             while self.next() == ",":
                 members.append(self.expr())
             return ("tuple", members)
+        if token in ("low8", "low16", "low32") and token not in self.fns and self.peek() == "(":
+            self.next()
+            inner = self.expr()
+            self.expect(")")
+            return ("low", int(token[3:]) // 8, inner)
         if token in ("idx", "get") and token not in self.fns and self.peek() == "(":
             self.next()
             first = self.expr()
@@ -769,6 +774,9 @@ class SourceMeaning:
             return T.lift(lambda x: T.bitop("and", x, mask), value), f"Fin {bound}", None
         if kind == "get":
             return self._get(e, env)
+        if kind == "low":
+            size = e[1]
+            return T.lift(lambda x: T.trunc(size, x), self.ev(e[2], env)[0], key=("trunc", size)), size, None
         raise ValueError(f"unknown expression {kind}")
 
     def _get(self, e: tuple, env: dict) -> tuple:

@@ -22,6 +22,7 @@ PARAMS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
 RESULTS = ("rax", "rdx", "rcx", "rsi", "rdi", "r8")
 SCRATCH, TRANSIT = "r10", "r11"
 SCALAR_TYPES = frozenset(("i8", "i16", "i32", "i64", "bool", "lit"))
+NO_WORK = frozenset(("drop", "open", "move"))  # they write no instruction, and are not a step
 WIDTH = {1: "byte", 2: "word", 4: "dword", 8: "qword"}
 NEGATED = {"b": "ae", "be": "a", "a": "be", "ae": "b", "e": "ne", "ne": "e"}
 ROOT = -1  # the entry word of an @k function, which `ret` returns however many iterations ran
@@ -135,8 +136,9 @@ class Function:
 class Backend:
     """Feed it the stream, one line at a time. Lines of NASM go to `emit`."""
 
-    def __init__(self, emit: Callable[[str], None]):
+    def __init__(self, emit: Callable[[str], None], *, count_steps: bool = False):
         self.out = emit
+        self.count_steps = count_steps  # to measure W(n): every step adds one to a counter
         self.ctors: dict[str, tuple[str, list]] = {}
         self.tagged: dict[str, bool] = {}
         self.tuples: dict[str, list[str]] = {}
@@ -507,6 +509,8 @@ class Backend:
         elif head in ("array", "state"):
             pass
         else:
+            if self.count_steps and head not in NO_WORK:
+                self.ins("inc", "qword [cnt_steps]")
             getattr(self, "i_" + head.replace(".", "_"))(_args(rest))
 
     def _header(self, text: str) -> None:

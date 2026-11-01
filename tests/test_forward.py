@@ -17,8 +17,8 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE = "examples/forward.lfpl"
-COUNTERS = ("capacity", "pool", "served", "forwarded", "dropped",
-            "too_large", "short", "full", "malformed", "send_errors", "recv_errors")
+COUNTERS = ("capacity", "pool", "served", "forwarded", "dropped", "too_large", "short", "full",
+            "malformed", "send_errors", "recv_errors", "admitted_cells", "budget_steps", "steps")
 
 
 def free_port() -> int:
@@ -80,7 +80,7 @@ class Forwarder:
         for _ in range(20):
             self.ctl.sendto(command, ("127.0.0.1", self.ctl_port))
             try:
-                reply = self.ctl.recv(256)
+                reply = self.ctl.recv(512)
             except TimeoutError:
                 continue
             return dict(zip(COUNTERS, struct.unpack(f"<{len(COUNTERS)}Q", reply)))
@@ -434,16 +434,22 @@ handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Ver
                                    "--ctl-port", "3"], cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(done.returncode, 0, done.stderr)
 
-    def test_a_handler_that_reaches_recursion_has_no_bound(self):
-        self.assert_refused("no\\s+derivable bound", self.HEADER + """
-state routes : Array[1024] Int8;
-data List = Nil | Cons(next: List);
-fn walk(l: List, acc: Free) : Free = match l with Nil => acc | Cons(c, rest) => walk(rest, More@c(acc)) end;
-handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Array[1024] Int8, Verdict, Free) =
-  match m with Hdr(d, ttl, dst, body) => match free with
-    | End => (routes, Drop@d(body), End)
-    | More(c, rest) => (routes, Drop@d(body), walk(Cons@c(Nil), rest))
-  end end;
+    def test_a_superlinear_walk_has_no_linear_bound(self):
+        """Terminating is not enough: rule R3 accepts this, because the first list shrinks, but it
+        reverses the whole accumulator once for each cell."""
+        self.assert_refused("no linear bound", """
+data Bytes = Last | Chunk(u: Int8, b0: Int8, b1: Int8, b2: Int8, b3: Int8, b4: Int8, b5: Int8, b6: Int8,
+                          next: Bytes);
+record P { port: Int8, body: Bytes };
+fn rev(l: Bytes, acc: Bytes) : Bytes = match l with
+  | Last => acc
+  | Chunk(d, u, b0, b1, b2, b3, b4, b5, b6, next) => rev(next, Chunk@d(u, b0, b1, b2, b3, b4, b5, b6, acc)) end;
+fn quad(l: Bytes, acc: Bytes) : Bytes = match l with
+  | Last => acc
+  | Chunk(d, u, b0, b1, b2, b3, b4, b5, b6, next) =>
+      quad(next, rev(Chunk@d(u, b0, b1, b2, b3, b4, b5, b6, acc), Last)) end;
+handler h(m: P, free: Free) : (P, Free) =
+  match m with P(d, port, body) => (P@d(port, quad(body, Last)), free) end;
 """)
 
     def test_a_state_slot_declared_after_the_handler(self):

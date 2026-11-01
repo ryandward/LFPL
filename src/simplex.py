@@ -13,7 +13,9 @@ exact Fraction.
 
 Bland's rule picks the lowest-numbered column and row whenever there is a choice, which is what
 guarantees termination on a degenerate problem. It is slower than the usual rules on large
-problems, and these are small: one row for each join, build and exit of a handler.
+problems, and these are small: one row for each join, build and exit of a handler and of what it
+calls. Those rows name two or three unknowns each, so the tableau is kept sparse: a dense one
+spends nearly all of its time subtracting zeros.
 """
 from __future__ import annotations
 
@@ -22,6 +24,8 @@ from typing import Hashable, Iterable, Mapping, Optional, TypeVar
 
 V = TypeVar("V", bound=Hashable)
 Number = int | Fraction
+Line = dict[int, Fraction]  # column -> coefficient, with no zeros, and the right side at RHS
+RHS = -1
 
 
 class UnboundedProblem(Exception):
@@ -51,101 +55,92 @@ def _solve(cost: list[Fraction], rows: list[tuple[list[Fraction], Fraction]]) ->
     slack basic. A row with k < 0 is negated, and needs an artificial variable to start from."""
     count = len(cost)
     slacks = len(rows)
-    needing = [i for i, (_a, k) in enumerate(rows) if k < 0]
-    artificial_of = {row: count + slacks + n for n, row in enumerate(needing)}
-    width = count + slacks + len(needing)
-    tableau: list[list[Fraction]] = []
+    first_artificial = next_artificial = count + slacks
+    tableau: list[Line] = []
     basis: list[int] = []
     for i, (a, k) in enumerate(rows):
-        line = [Fraction(0)] * (width + 1)
+        sign = Fraction(1) if k < 0 else Fraction(-1)
+        line: Line = {j: sign * value for j, value in enumerate(a) if value}
+        line[count + i] = -sign
+        if k:
+            line[RHS] = abs(k)
         if k < 0:
-            for j, value in enumerate(a):
-                line[j] = value
-            line[count + i] = Fraction(-1)
-            line[artificial_of[i]] = Fraction(1)
-            line[width] = -k
-            basis.append(artificial_of[i])
+            line[next_artificial] = Fraction(1)
+            basis.append(next_artificial)
+            next_artificial += 1
         else:
-            for j, value in enumerate(a):
-                line[j] = -value
-            line[count + i] = Fraction(1)
-            line[width] = k
             basis.append(count + i)
         tableau.append(line)
-    if needing:
-        phase_one = [Fraction(0)] * width
-        for column in artificial_of.values():
-            phase_one[column] = Fraction(1)
-        _optimize(tableau, basis, phase_one, width, width)
-        infeasibility = sum((tableau[i][width] for i in range(len(rows)) if basis[i] >= count + slacks),
-                            Fraction(0))
-        if infeasibility != 0:
+    if next_artificial > first_artificial:
+        artificial = {b: Fraction(1) for b in basis if b >= first_artificial}
+        _optimize(tableau, basis, _priced(artificial, tableau, basis), None)
+        if any(tableau[i].get(RHS) for i, b in enumerate(basis) if b >= first_artificial):
             return None
-        _drive_out_artificials(tableau, basis, count + slacks, width)
-    full_cost = list(cost) + [Fraction(0)] * (width - count)
-    _optimize(tableau, basis, full_cost, count + slacks, width)
+        _drive_out_artificials(tableau, basis, first_artificial)
+    wanted = {j: value for j, value in enumerate(cost) if value}
+    _optimize(tableau, basis, _priced(wanted, tableau, basis), first_artificial)
     values = [Fraction(0)] * count
     for i, column in enumerate(basis):
         if column < count:
-            values[column] = tableau[i][width]
+            values[column] = tableau[i].get(RHS, Fraction(0))
     return values
 
 
-def _optimize(tableau: list[list[Fraction]], basis: list[int], cost: list[Fraction], columns: int,
-              width: int) -> None:
-    """Pivot until no column can lower the cost. Only the first `columns` columns may enter."""
+def _priced(cost: Line, tableau: list[Line], basis: list[int]) -> Line:
+    """The reduced costs of the basis as it stands: the cost row, with every basic column cancelled."""
+    reduced = dict(cost)
+    for i, column in enumerate(basis):
+        if column in cost:
+            _subtract(reduced, tableau[i], cost[column])
+    return reduced
+
+
+def _optimize(tableau: list[Line], basis: list[int], reduced: Line, limit: Optional[int]) -> None:
+    """Pivot until no column can lower the cost. Columns at `limit` and past it may not enter.
+    Bland's rule: the lowest column that helps, and of the tightest rows, the lowest basic column."""
     while True:
-        entering = _entering(tableau, basis, cost, columns)
+        entering = min((j for j, value in reduced.items()
+                        if value < 0 and j != RHS and (limit is None or j < limit)), default=None)
         if entering is None:
             return
         leaving = None
         best = None
         for i, line in enumerate(tableau):
-            if line[entering] > 0:
-                ratio = line[width] / line[entering]
+            coefficient = line.get(entering)
+            if coefficient is not None and coefficient > 0:
+                ratio = line.get(RHS, Fraction(0)) / coefficient
                 if best is None or ratio < best or (ratio == best and basis[i] < basis[leaving]):
                     best, leaving = ratio, i
         if leaving is None:
             raise UnboundedProblem("the objective has no minimum")
         _pivot(tableau, basis, leaving, entering)
+        _subtract(reduced, tableau[leaving], reduced[entering])
 
 
-def _entering(tableau: list[list[Fraction]], basis: list[int], cost: list[Fraction],
-              columns: int) -> Optional[int]:
-    for j in range(columns):
-        if j in basis:
-            continue
-        reduced = cost[j]
-        for i, line in enumerate(tableau):
-            if line[j]:
-                reduced -= cost[basis[i]] * line[j]
-        if reduced < 0:
-            return j
-    return None
+def _subtract(line: Line, other: Line, factor: Fraction) -> None:
+    """line -= factor * other, keeping no entry that came to exactly zero."""
+    for j, value in other.items():
+        result = line.get(j, Fraction(0)) - factor * value
+        if result:
+            line[j] = result
+        else:
+            line.pop(j, None)
 
 
-def _pivot(tableau: list[list[Fraction]], basis: list[int], row: int, column: int) -> None:
-    line = tableau[row]
-    scale = line[column]
-    tableau[row] = line = [value / scale for value in line]
+def _pivot(tableau: list[Line], basis: list[int], row: int, column: int) -> None:
+    scale = tableau[row][column]
+    line = tableau[row] = {j: value / scale for j, value in tableau[row].items()}
     for i, other in enumerate(tableau):
-        if i != row and other[column]:
-            factor = other[column]
-            tableau[i] = [a - factor * b for a, b in zip(other, line)]
+        if i != row and column in other:
+            _subtract(other, line, other[column])
     basis[row] = column
 
 
-def _drive_out_artificials(tableau: list[list[Fraction]], basis: list[int], first_artificial: int,
-                           width: int) -> None:
+def _drive_out_artificials(tableau: list[Line], basis: list[int], first_artificial: int) -> None:
     """Phase one ended at zero, but an artificial can still be basic at zero. Swap it for a real
-    column, or if the row has none, the row was redundant and stays at zero for good."""
+    column. A row with no real column was redundant: nothing can enter it, and it stays at zero."""
     for i in range(len(tableau)):
-        if basis[i] < first_artificial:
-            continue
-        for j in range(first_artificial):
-            if tableau[i][j]:
-                _pivot(tableau, basis, i, j)
-                break
-        else:
-            basis[i] = width + i  # a redundant row: nothing can enter it, and nothing reads it
-            tableau[i][width] = Fraction(0)
+        if basis[i] >= first_artificial:
+            column = min((j for j in tableau[i] if 0 <= j < first_artificial), default=None)
+            if column is not None:
+                _pivot(tableau, basis, i, column)

@@ -90,7 +90,7 @@ Each rule reads: tokens required `-->` tokens left. Tokens not named are untouch
     drop s              s = w : t               -->  free s                       t scalar only
     op d, f/W, a, b     a, b : Int W, free d    -->  d = fresh : Int W
     cmp d, cc, a, b     a, b same scalar, free d -->  d = fresh : Bool
-    trunc d, W, a       a : Int V, V >= W, free d -->  d = fresh : Int W
+    trunc d, W, a       a : Int V, V >= W, free d -->  d = fresh : Int W    (the source's low8, low16, low32)
     pack d, <W...>, a...  a_i scalar, free d    -->  d = fresh : Int 64
 
 `f` is add, sub, mul, and, or, xor, shl or shr, with the meaning LFPL-O section 4.4 gives
@@ -208,20 +208,70 @@ caller receives parameter k's original word however many iterations ran.
 
 A non-tail recursive `call` is a type error until DESCEND and ASCEND exist.
 
-Functions are written `fn f(r0 : t0, ...) : t [@k]`, closed by `end`. Parameters start full
-with word `arg i`, and every other register starts free. A handler is a function whose
+Functions are written `fn f(r0 : t0, ...) : t [@k]`, closed by `end`, or by `end decreasing 0,2`
+if the function is recursive, which names the parameters rule R3 found falling. Parameters start
+full with word `arg i`, and every other register starts free. A handler is a function whose
 signature section 3.1 fixes: the state arrays, the item and the reserve go in, and the state,
 the output and the reserve come out.
 
-### Bounds
+### Potential
 
-The same pass that types the stream measures it, because it is already reading every
-instruction of every function. A function with no recursion has no back-edge, so the number of
-instructions in its body, plus those of what it calls, bounds every path through it. A
-`br.null` on a `Free` register is a draw from the reserve, so counting those bounds its cells.
-A recursive function has no bound here, and a handler that reaches one is refused until the
-resource analysis of LFPL-O section 5 exists. So a handler's `R(n)` and `W(n)` are constants
-for now: `R(n) = b`, `W(n) = d`.
+The same pass derives a handler's bounds, because it is already reading every instruction of
+every function. It uses the potential method of LFPL-O section 5, in the way that fits a checker
+that only moves forward: nothing is solved here. The pass writes down inequalities, something else
+proposes numbers, and the pass evaluates every inequality with them.
+
+Every value made of cells carries an unknown amount per cell, the same unknown for both
+resources, which are solved separately: cells drawn and steps run. Scalars, capabilities and arrays
+carry nothing, and a null has no cells to carry anything on. A budget, a sum of unknowns plus a
+constant for each resource, follows each path from the function's own unknown entry amount:
+
+    a working instruction    budget - 1 step: everything but move, drop and open, which lower to nothing
+    br.null, br.tag, open    on the arm with the cell: budget + what the value carried per cell
+    br.null on a Free        on the arm with the cell: also budget - 1 cell, the draw. The End arm,
+                             and whatever only it reaches, must type but writes no rows at all
+    build                    a fresh amount q per cell for the new value: budget - q, and every
+                             linear field it names must carry at least q
+    call, tail               budget - the callee's entry; every argument must carry at least what its
+                             parameter wants, and a result carries what the callee's result does
+    ret, tail, tailmod       every result must carry at least what the function's result does, and
+                             what is left in the budget must not be negative
+    a label                  each edge's budget must cover a fresh one, unless all the edges have
+                             the same unknowns, when the join takes the smallest constant; each
+                             register's amount must cover a fresh one if the edges disagree
+
+Each "must" is one row of a linear program, whose unknowns may not be negative. A handler's
+reserve carries nothing, because those cells are paid for by being drawn. So the program's rows
+say R(n) = a n + b and W(n) = c n + d hold, where a and c are the item parameter's amount per cell,
+and b and d are the handler's entry. The objective is section 5.5's: the bound at N_max.
+
+A recursive call uses the function's own unknowns, which is what makes a walk's inequalities
+bite: each iteration must be paid for by the cells it released, and nothing else. `end decreasing`
+ties the parameters it names to one amount per cell, because R3 only says that their total falls,
+and the cell that left may have been any of them. Other linear parameters may carry their own
+amounts, and they have to, because a walk that moves cells onto an accumulator hands the next walk's
+budget over with them. So a recursive function that released nothing could not pay for itself, which
+is a second proof of termination, and it is why `end` must name a set if the function recursed.
+
+A call of a function that has already ended gets its own copy of that function's unknowns and rows,
+which is the callee's derivation again with other numbers in it. With one set of numbers per
+function, reversing the result of a reversal would be refused, because the function's result
+would have to carry its parameter's amount, which covers the walk and has the result's amount
+left over, so that amount would have to exceed itself. A callee with no cells going in or out is
+shared and not copied, because nothing connects its calls. Rows therefore multiply with the depth of
+the call graph, and a handler's are capped: past 1,024 it is refused, as section 8.2's limit.
+
+Leaving the End arm out is section 5.3's DRAW, and it is sound only because every Free on a path
+that has not taken an End arm is the handler's reserve. A second one could never be got rid of. A
+More arm leaves as many Frees as it found, R3 will not walk a Free, an output cannot hold one, and a
+handler returns exactly one, so any program that makes a second Free has an arm it cannot finish,
+and is refused. `tests/test_walks.py` pins each of those refusals, because relaxing any of them would
+make this rule wrong: a program's own End would be reachable with its cost left out of the bound.
+
+The certificate is the solver's numbers. `src/simplex.py` shares nothing with this pass, and
+`Checker.verify` evaluates each row with what it proposes, in exact fractions, so a wrong solver
+can only cost a refusal. An `--count-steps` build adds one to a counter at each working instruction,
+the same list this pass charges for, so that tests can hold running code to the W(n) it was given.
 
 ## Phantom construction
 

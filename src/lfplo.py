@@ -18,9 +18,10 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
 from .ring import FStarved, Reject, Ring
-from .rtcheck import Checker, RTError
+from .rtcheck import Bound, Checker, RTError, Unbounded
 from .rtlower import Limit, rt_lines
 from .runtime import BindingError, Image, Options, assembly, bind
+from .simplex import minimize
 from .symcheck import check_translation
 from .validate import recompute_stack
 from .x86 import Backend, Starved
@@ -33,22 +34,45 @@ class Refused(Exception):
 @dataclass(frozen=True)
 class Report:
     handler: str
-    reserve: int
-    steps: int
-    instructions: int
+    bound: Bound
     stack: int
     cells: int
     image_bytes: int
 
+    def __str__(self) -> str:
+        return (f"handler {self.handler}: R(n) = {_linear(self.bound.a, self.bound.b)} cells, "
+                f"W(n) = {_linear(self.bound.c, self.bound.d)} steps, stack {self.stack} bytes, "
+                f"{self.cells} cells, image {self.image_bytes} bytes")
+
+
+def _linear(slope: int, constant: int) -> str:
+    if not slope:
+        return str(constant)
+    return f"{slope} n + {constant}" if constant else f"{slope} n"
+
+
+def certify(checker: Checker, name: str, n_max: int) -> Bound:
+    """LFPL-O section 5.5. The checker writes the linear program, the solver proposes numbers, and
+    the checker evaluates its own inequalities with them, so the solver is not trusted."""
+    program = checker.linear_program(name, n_max)
+    proposed = {}
+    for resource in ("cells", "steps"):
+        solved = minimize(program.objective(), program.constraints(resource))
+        if solved is None:
+            raise Unbounded(f"section 8.2: handler {name} has no linear bound on {resource}: no "
+                            f"amount per cell of its item pays for what it does")
+        proposed[resource] = solved
+    return checker.verify(name, proposed["cells"], proposed["steps"])
+
 
 def _generate(lines: Iterable[str], asm_path: str, options: Options,
-              initial: dict[str, str]) -> tuple[Image, int]:
+              initial: dict[str, str], *, count_steps: bool = False) -> Image:
     """The stream goes through the checker and then the backend, one line at a time, so nothing
     is lowered that has not been typed, and nothing is held that is not in flight."""
     checker = Checker()
     with open(asm_path, "w") as handle:
         handle.write("default abs\nsection .text\nglobal _start\n")
-        backend = Backend(lambda line: handle.write(line + "\n"))
+        backend = Backend(lambda line: handle.write(line + "\n"), count_steps=count_steps)
         for line in lines:
             checker.feed(line)
             backend.feed(line)
@@ -58,8 +82,8 @@ def _generate(lines: Iterable[str], asm_path: str, options: Options,
             raise Refused(f"section 3.1: this runtime serves exactly one handler, and the program "
                           f"declares {len(handlers)}")
         name = handlers[0].name
-        compiled = next(f for f in backend.functions.values() if f.name == name)
-        depth = compiled.depth
+        depth = next(f.depth for f in backend.functions.values() if f.name == name)
+        certify(checker, name, options.n_max)
         image = bind(checker, name, depth, options, dict(initial))
         for state in image.states:
             if state.initial is None:
@@ -69,7 +93,7 @@ def _generate(lines: Iterable[str], asm_path: str, options: Options,
                 raise Refused(f"state {state.name} needs {state.length * state.element_size} "
                               f"bytes, and {state.initial} has {size}")
         handle.write(assembly(image))
-    return image, compiled.instructions
+    return image
 
 
 def compile_program(source: bytes, *, target_cells: int = 1024,
@@ -125,7 +149,8 @@ def _remove_stale(exe_path: str) -> None:
 
 
 def build(source_path: str, exe_path: str, options: Options,
-          initial: Optional[dict[str, str]] = None, *, keep_asm: Optional[str] = None) -> Report:
+          initial: Optional[dict[str, str]] = None, *, keep_asm: Optional[str] = None,
+          count_steps: bool = False) -> Report:
     """Compile. A stale binary is removed first, so failure can never leave one behind."""
     _remove_stale(exe_path)
     initial = {name: os.path.abspath(path) for name, path in (initial or {}).items()}
@@ -135,17 +160,17 @@ def build(source_path: str, exe_path: str, options: Options,
             with open(source_path, "rb") as handle:
                 source = handle.read()
                 handle.seek(0)
-                image, instructions = _generate(rt_lines(handle), asm_path, options, initial)
+                image = _generate(rt_lines(handle), asm_path, options, initial)
         except (RTError, BindingError, Starved, Limit, FStarved) as failure:
             raise Refused(str(failure)) from failure
         if keep_asm is not None:
             shutil.copy(asm_path, keep_asm)
         _validate(source, asm_path, image)
+        if count_steps:  # the code just validated, with a counter added at each step
+            with open(source_path, "rb") as handle:
+                _generate(rt_lines(handle), asm_path, options, initial, count_steps=True)
         _link(asm_path, exe_path)
-    size = (image.cell_count * 16 + image.stack_bytes
-            + sum(s.length * s.element_size for s in image.states))
-    return Report(image.handler, image.reserve_draws, image.steps, instructions, image.depth,
-                  image.cell_count, size)
+    return Report(image.handler, image.bound, image.depth, image.cell_count, image.bytes)
 
 
 def _print_rt(source_path: str) -> int:
@@ -177,6 +202,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--k-out", type=int, default=64, help="the output queue's capacity")
     parser.add_argument("--cells", type=int, help="cells in the image, instead of section 3.4's C")
     parser.add_argument("--asm", help="also write the assembly here")
+    parser.add_argument("--count-steps", action="store_true",
+                        help="count the steps that run, to measure W(n) against what they were")
     args = parser.parse_args(argv)
     if args.rt:
         return _print_rt(args.source)
@@ -190,16 +217,15 @@ def main(argv: list[str]) -> int:
         _remove_stale(args.output)
         options = Options(args.in_port, args.out_port, args.ctl_port, args.n_max, args.k_out,
                           args.cells)
-        report = build(args.source, args.output, options, initial, keep_asm=args.asm)
+        report = build(args.source, args.output, options, initial, keep_asm=args.asm,
+                       count_steps=args.count_steps)
     except (Refused, Reject, BindingError, OSError) as failure:
         print(f"{args.source}: refused: {failure}", file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as failure:
         print(f"{args.source}: the assembler or linker failed:\n{failure.stderr}", file=sys.stderr)
         return 1
-    print(f"handler {report.handler}: R(n) = {report.reserve} cells, W(n) = {report.steps} steps "
-          f"({report.instructions} instructions), stack {report.stack} bytes, {report.cells} cells, "
-          f"image {report.image_bytes} bytes")
+    print(report)
     return 0
 
 

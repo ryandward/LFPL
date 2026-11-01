@@ -9,17 +9,31 @@ It keeps the first specification's memory bound: the only state is the tokens of
 being read, and one merged token state for each label still open. Control flow is structured,
 so that is at most one state per enclosing construct.
 
-A pass over every instruction can also measure, so this is where a handler's bounds come from
-until LFPL-O section 5 exists. A function with no recursion has no back-edge, so the number of
-instructions in it, plus those of what it calls, bounds every path through it. A `br.null` on
-a Free is a draw from the reserve. A recursive function has no bound, and a handler that
-reaches one is refused.
+The same pass derives a handler's bounds, by the potential method of LFPL-O section 5. Every cell
+of a value carries an unknown amount of each resource, which is released when the cell is opened
+and paid again when a value is built in it. Each instruction costs a step, and each draw from a
+Free costs a cell. A budget follows every path, and at each exit, join and call this writes down an
+inequality that has to hold. Those are linear in the unknowns, so a handler's are one linear program.
+
+This module does not solve it. Something else proposes the numbers, and `verify` evaluates every
+inequality with them, exactly, so a wrong solver can only cost a refusal. The numbers filled into
+the inequalities are the certificate of section 5.5.
+
+A recursive function is where the bound comes from, and rule R3's decreasing set, which `end` states,
+is what carries it: its parameters share one amount per cell. R3 says their total falls by at least
+one cell at each recursive call, so each call releases that amount, and the inequality at the
+recursive call says that pays for the iteration. Other linear parameters and results may carry
+potential too, because a walk that moves cells onto an accumulator has to hand the second pass's
+budget over with them. This is also a second proof of termination: a recursive call that released
+nothing would have to pay for itself, and no numbers satisfy that.
 """
 from __future__ import annotations
 
 import re
+import math
 from dataclasses import dataclass, field, replace
-from typing import Iterable, Optional, Union
+from fractions import Fraction
+from typing import Iterable, Mapping, Optional, Union
 
 SCALARS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64}
 SIZES = {"i8": 1, "i16": 2, "i32": 4, "i64": 8, "bool": 1}
@@ -27,6 +41,8 @@ OP_NAMES = {"add", "sub", "mul", "and", "or", "xor", "shl", "shr"}
 READ_MODIFY_WRITE = {"add", "sub", "and", "or", "xor"}  # what one x86 instruction does in memory
 CC_NAMES = {"b", "be", "a", "ae", "e", "ne"}
 RESERVE = "Free"
+NO_WORK = {"drop", "open", "move"}  # these move tokens and lower to nothing, so they cost no step
+MAX_OBLIGATIONS = 1024  # one handler's, with its callees': the size of a linear program, section 8.2
 
 Type = Union[str, tuple]  # a builtin name, ("named", id), ("array", N, t) or ("fin", N)
 Word = tuple
@@ -37,7 +53,57 @@ class RTError(Exception):
 
 
 class Unbounded(RTError):
-    """A handler has no derivable bound: a limit of the language, LFPL-O section 8.2."""
+    """A handler has no linear bound: a limit of the language, LFPL-O section 8.2."""
+
+
+@dataclass(frozen=True)
+class Budget:
+    """What is available at a point in the code: unknowns times whole numbers, plus a constant for
+    each resource. Used as an obligation, it says this much must not be negative."""
+    terms: tuple = ()  # sorted (unknown, coefficient) pairs, none of them zero
+    cells: int = 0
+    steps: int = 0
+
+    def plus(self, unknown: Optional[int], coefficient: int = 1) -> "Budget":
+        if unknown is None:
+            return self
+        terms = dict(self.terms)
+        terms[unknown] = terms.get(unknown, 0) + coefficient
+        if not terms[unknown]:
+            del terms[unknown]
+        return Budget(tuple(sorted(terms.items())), self.cells, self.steps)
+
+    def spend(self, *, cells: int = 0, steps: int = 0) -> "Budget":
+        return Budget(self.terms, self.cells - cells, self.steps - steps)
+
+
+@dataclass(frozen=True)
+class Bound:
+    """Section 6.1's admission table, for one handler: R(n) = a n + b and W(n) = c n + d."""
+    a: int
+    b: int
+    c: int
+    d: int
+
+
+@dataclass(frozen=True)
+class ResourceProgram:
+    """One handler's linear program, as the checker derived it, for a solver to propose numbers.
+    Every row must not be negative, and neither may any unknown."""
+    rows: tuple
+    item: Optional[int]
+    entry: int
+    n_max: int
+
+    def objective(self) -> dict[int, int]:
+        """Section 5.5: the bound at the largest item."""
+        objective = {self.entry: 1}
+        if self.item is not None:
+            objective[self.item] = self.n_max
+        return objective
+
+    def constraints(self, resource: str) -> list[tuple[dict[int, int], int]]:
+        return [(dict(row.terms), getattr(row, resource)) for row in self.rows]
 
 
 def is_scalar(ty: Type) -> bool:
@@ -56,6 +122,7 @@ def is_fin(ty: Type) -> bool:
 class Tok:
     ty: Type
     word: Word
+    pot: Optional[int] = None  # the unknown per cell. None: it has none, or no cells to carry it
 
 
 @dataclass(frozen=True)
@@ -63,6 +130,7 @@ class Loc:
     full: bool
     word: Word
     ty: Type
+    pot: Optional[int] = None
 
 
 @dataclass
@@ -77,11 +145,13 @@ class State:
     cells: dict
     nulls: frozenset
     ruled: dict
+    budget: Budget = Budget()
+    unreachable: bool = False  # past the End arm of a reserve: it must type, and is charged nothing
 
     def copy(self) -> "State":
         return State(dict(self.regs),
                      {c: Cell(v.tag, dict(v.locs)) for c, v in self.cells.items()},
-                     self.nulls, dict(self.ruled))
+                     self.nulls, dict(self.ruled), self.budget, self.unreachable)
 
 
 @dataclass
@@ -108,8 +178,12 @@ class Signature:
     ret: str
     at: Optional[int]
     handler: bool
-    steps: Optional[int] = None  # None: no bound, because recursion is reachable from here
-    draws: Optional[int] = None
+    entry: int = 0                  # the unknown budget a call of this function must bring
+    param_pots: list = field(default_factory=list)
+    result_pots: list = field(default_factory=list)
+    obligations: dict = field(default_factory=dict)  # inequalities, its callees' included: a set in order
+    recursive: bool = False
+    too_large: bool = False
 
 
 def _args(text: str) -> list[str]:
@@ -154,22 +228,101 @@ class Checker:
         self.S: Optional[State] = None
         self.pending: dict[str, list[State]] = {}
         self.next_word = 0
+        self.next_unknown = 0
         self.line_number = 0
-        self.steps = 0
-        self.draws = 0
-        self.callee_steps: Optional[int] = 0
-        self.callee_draws: Optional[int] = 0
-        self.recursive = False
+        self.certified: dict[str, Bound] = {}
 
     # --- what the checker concluded, for the driver
 
-    def bounds(self, name: str) -> tuple[int, int]:
-        """(R, W) for a handler that has passed."""
+    def _handler_named(self, name: str) -> Signature:
         for signature in self.functions.values():
             if signature.name == name:
-                assert signature.draws is not None and signature.steps is not None
-                return signature.draws, signature.steps
+                return signature
         raise KeyError(name)
+
+    def _rows(self, handler: Signature) -> tuple:
+        """Every inequality the handler must meet, which includes those of everything it calls.
+        Section 3.1 gives a handler its reserve with nothing on it: those cells are paid for by
+        being drawn."""
+        if handler.too_large:
+            raise Unbounded(f"section 8.2: {handler.name} and what it calls come to more than "
+                            f"{MAX_OBLIGATIONS} inequalities, past what one linear program may hold")
+        rows = dict(handler.obligations)
+        reserve = handler.param_pots[-1]
+        if reserve is not None:
+            rows[Budget(((reserve, -1),))] = None
+        return tuple(rows)
+
+    def linear_program(self, name: str, n_max: int) -> ResourceProgram:
+        handler = self._handler_named(name)
+        return ResourceProgram(self._rows(handler), handler.param_pots[-2], handler.entry, n_max)
+
+    def verify(self, name: str, cells: Mapping[int, Fraction], steps: Mapping[int, Fraction]) -> Bound:
+        """The certificate: proposed numbers for each resource. They are evaluated in every
+        inequality this module derived, so nothing is taken from whoever proposed them."""
+        handler = self._handler_named(name)
+        rows = self._rows(handler)
+        for resource, values in (("cells", cells), ("steps", steps)):
+            if any(value < 0 for value in values.values()):
+                raise RTError(f"the certificate for {name} gives an unknown a negative {resource}")
+            for row in rows:
+                total = sum((coefficient * Fraction(values.get(unknown, 0))
+                             for unknown, coefficient in row.terms), Fraction(getattr(row, resource)))
+                if total < 0:
+                    raise RTError(f"the certificate for {name} falls {-total} {resource} short at "
+                                  f"{self._show_row(row)}")
+
+        def whole(values: Mapping[int, Fraction], unknown: Optional[int]) -> int:
+            return 0 if unknown is None else math.ceil(Fraction(values.get(unknown, 0)))
+
+        item = handler.param_pots[-2]
+        bound = Bound(whole(cells, item), whole(cells, handler.entry),
+                      whole(steps, item), whole(steps, handler.entry))
+        self.certified[name] = bound
+        return bound
+
+    @staticmethod
+    def _show_row(row: Budget) -> str:
+        terms = " + ".join(f"{c} u{u}" for u, c in row.terms)
+        return f"{terms} + ({row.cells} cells, {row.steps} steps) >= 0"
+
+    def bounds(self, name: str) -> Bound:
+        """The admission table of a handler whose certificate has passed."""
+        return self.certified[name]
+
+    # --- the potential method
+
+    def unknown(self) -> int:
+        self.next_unknown += 1
+        return self.next_unknown
+
+    def _carries(self, ty: Type) -> bool:
+        """Scalars have no cells, a capability's cell is empty, and an array is not made of cells."""
+        return self._decl(ty) is not None
+
+    def _pot_for(self, ty: Type) -> Optional[int]:
+        return self.unknown() if self._carries(ty) else None
+
+    def obligate(self, row: Budget) -> None:
+        fn = self.fn
+        assert fn is not None
+        if self.S is not None and self.S.unreachable:
+            return
+        if not row.terms and row.cells >= 0 and row.steps >= 0:
+            return
+        if fn.too_large:
+            return
+        fn.obligations[row] = None
+        if len(fn.obligations) > MAX_OBLIGATIONS:
+            fn.too_large = True
+            fn.obligations = {}
+
+    def at_least(self, have: Optional[int], need: Optional[int]) -> None:
+        """A value carrying `have` per cell, used where `need` per cell is wanted. None on the
+        left is a null, which has no cells to pay for."""
+        if have is None or need is None or have == need:
+            return
+        self.obligate(Budget().plus(have).plus(need, -1))
 
     # --- helpers
 
@@ -276,8 +429,8 @@ class Checker:
             if not loc.full:
                 raise self.fail(f"r{base}[{off}:{size}] is a hole: its value was taken")
             if consume and not is_scalar(loc.ty):
-                cell.locs[key] = Loc(False, loc.word, loc.ty)
-            return Tok(loc.ty, loc.word)
+                cell.locs[key] = Loc(False, loc.word, loc.ty, loc.pot)
+            return Tok(loc.ty, loc.word, loc.pot)
         r, token = self.full(text)
         if consume and not is_scalar(token.ty):
             assert self.S is not None
@@ -321,10 +474,10 @@ class Checker:
                     raise self.fail(f"r{r} holds {present.ty} on one edge and nothing on another")
                 continue
             ty = self.unify(x.ty, y.ty, f"r{r} at a join") if x.ty != y.ty else x.ty
-            regs[r] = Tok(ty, self._merge_word(x.word, y.word))
+            regs[r] = Tok(ty, self._merge_word(x.word, y.word), self._merge_pot(x.pot, y.pot, a, b))
         cells = {}
         for word in set(a.cells) & set(b.cells):
-            cells[word] = self._merge_cell(word, a.cells[word], b.cells[word])
+            cells[word] = self._merge_cell(word, a.cells[word], b.cells[word], a, b)
         for r, token in regs.items():
             if token.ty == "cap" and token.word not in cells:
                 # The capability of two different cells: which one is not known here, so all
@@ -338,9 +491,37 @@ class Checker:
         ruled = {}
         for word in set(a.ruled) & set(b.ruled):
             ruled[word] = a.ruled[word] & b.ruled[word]
-        return State(regs, cells, nulls, ruled)
+        return State(regs, cells, nulls, ruled, self._merge_budget(a, b),
+                     a.unreachable and b.unreachable)
 
-    def _merge_cell(self, word: Word, a: Cell, b: Cell) -> Cell:
+    def _merge_pot(self, x: Optional[int], y: Optional[int], a: State, b: State) -> Optional[int]:
+        """After a join, a value carries what every edge that can run vouches for."""
+        if b.unreachable or x == y or y is None:
+            return x
+        if a.unreachable or x is None:
+            return y
+        joined = self.unknown()
+        self.at_least(x, joined)
+        self.at_least(y, joined)
+        return joined
+
+    def _merge_budget(self, a: State, b: State) -> Budget:
+        """After a join, only what every edge that can run has left can be spent. With the same
+        unknowns that is the smaller constant, and needs no new unknown, which keeps an `if` from
+        growing the linear program."""
+        if b.unreachable:
+            return a.budget
+        if a.unreachable:
+            return b.budget
+        if a.budget.terms == b.budget.terms:
+            return Budget(a.budget.terms, min(a.budget.cells, b.budget.cells),
+                          min(a.budget.steps, b.budget.steps))
+        joined = self.unknown()
+        self.obligate(a.budget.plus(joined, -1))
+        self.obligate(b.budget.plus(joined, -1))
+        return Budget().plus(joined)
+
+    def _merge_cell(self, word: Word, a: Cell, b: Cell, edge_a: State, edge_b: State) -> Cell:
         locs = {}
         for key in set(a.locs) | set(b.locs):
             x, y = a.locs.get(key), b.locs.get(key)
@@ -360,7 +541,8 @@ class Checker:
             if x.full != y.full and not is_scalar(x.ty):
                 raise self.fail(f"[{key[0]}:{key[1]}] of {word} is full on one edge and a hole "
                                 f"on another")
-            locs[key] = Loc(x.full and y.full, self._merge_word(x.word, y.word), x.ty)
+            locs[key] = Loc(x.full and y.full, self._merge_word(x.word, y.word), x.ty,
+                            self._merge_pot(x.pot, y.pot, edge_a, edge_b))
         tag = None
         if a.tag == b.tag:
             tag = a.tag
@@ -408,15 +590,18 @@ class Checker:
             raise self.fail(f"unknown constructor {text}")
         return ctor
 
-    def _open_cell(self, word: Word, ctor: Ctor) -> Cell:
+    def _open_cell(self, word: Word, ctor: Ctor, pot: Optional[int]) -> Cell:
         """A dispatched cell: every field of the constructor is full, each with a word of its
         own. That word cannot be just w.o: a cell that has been rebuilt and is opened again holds
         new values at the same offsets, and a value taken before the rebuild must not pass for
-        what is there now, or RESTORE would skip a store that was needed."""
+        what is there now, or RESTORE would skip a store that was needed. What a value carries
+        per cell is carried by every cell reachable from it, so its linear fields carry the same."""
         locs = {}
         opening = self.fresh()
         for off, size, ty, _name in ctor.fields:
-            locs[(off, size)] = Loc(True, ("field", opening, off), self.norm(ty))
+            norm = self.norm(ty)
+            locs[(off, size)] = Loc(True, ("field", opening, off), norm,
+                                    None if is_scalar(norm) else pot)
         tag = ("is", int(ctor.tag)) if ctor.tag.isdigit() else None
         return Cell(tag, locs)
 
@@ -445,11 +630,12 @@ class Checker:
         if self.fn is None:
             raise self.fail(f"{head} outside a function")
         if head == "end":
-            self._end()
+            self._end(rest)
             return
         if self.S is None:
             raise self.fail(f"{head} cannot be reached: control left before it")
-        self.steps += 1
+        if head not in NO_WORK:
+            self.S.budget = self.S.budget.spend(steps=1)
         handler = getattr(self, "i_" + head.replace(".", "_"), None)
         if handler is None:
             raise self.fail(f"unknown instruction {head}")
@@ -468,22 +654,25 @@ class Checker:
         kind, ordinal, name, params, ret, at = match.groups()
         parts = _args(params)
         signature = Signature(ordinal, name, [], ret, int(at) if at else None, kind == "handler")
+        signature.entry = self.unknown()
         regs = {}
         for position, part in enumerate(parts):
             register, _, ty = part.partition(" : ")
             if self.reg(register) != position:
                 raise self.fail(f"parameter {position} must be r{position}")
             signature.params.append(ty.strip())
-            regs[position] = Tok(self.norm(ty.strip()), ("arg", position))
+            norm = self.norm(ty.strip())
+            pot = self._pot_for(norm)
+            signature.param_pots.append(pot)
+            regs[position] = Tok(norm, ("arg", position), pot)
+        members = self.tuples.get(self._resolve(ret), [ret])
+        signature.result_pots = [self._pot_for(self.norm(member)) for member in members]
         self.fn = signature
-        self.S = State(regs, {}, frozenset(), {})
+        self.S = State(regs, {}, frozenset(), {}, Budget().plus(signature.entry))
         for position, token in regs.items():
             if token.ty == "cap":
                 self.S.cells[token.word] = Cell()
         self.pending = {}
-        self.steps = self.draws = 0
-        self.callee_steps = self.callee_draws = 0
-        self.recursive = False
         if signature.handler:
             self._check_handler_shape(signature)
         if at is not None and not (0 <= int(at) < len(parts)):
@@ -507,7 +696,7 @@ class Checker:
                 self.norm(results[-1])):
             raise self.fail("a handler's last parameter and last result must be Free")
 
-    def _end(self) -> None:
+    def _end(self, rest: str) -> None:
         if self.S is not None:
             raise self.fail("control runs off the end of the function")
         if self.pending:
@@ -515,17 +704,28 @@ class Checker:
                             f"{sorted(self.pending)}")
         fn = self.fn
         assert fn is not None
-        if self.recursive or self.callee_steps is None or self.callee_draws is None:
-            fn.steps = fn.draws = None
-        else:
-            fn.steps = self.steps + self.callee_steps
-            fn.draws = self.draws + self.callee_draws
-        if fn.handler and fn.steps is None:
-            raise Unbounded(f"section 8.2: handler {fn.name} reaches recursion, so it has no "
-                            f"derivable bound until the resource analysis of section 5 exists")
+        self._tie_decreasing_set(fn, rest)
         self.functions[fn.ordinal] = fn
         self.fn = None
         self.S = None
+
+    def _tie_decreasing_set(self, fn: Signature, rest: str) -> None:
+        """Rule R3's set carries the recursion: one amount per cell across all of it, since its
+        total falls at each recursive call whichever member the cell left."""
+        words = rest.split()
+        if not words:
+            if fn.recursive:
+                raise self.fail(f"{fn.name} is recursive, and `end` names no decreasing set")
+            return
+        if words[0] != "decreasing" or len(words) != 2:
+            raise self.fail(f"malformed end: {rest}")
+        positions = [int(p) for p in words[1].split(",")]
+        pots = [fn.param_pots[p] for p in positions]
+        if any(pot is None for pot in pots):
+            raise self.fail(f"a decreasing set of {fn.name} names a parameter with no cells")
+        for first, second in zip(pots, pots[1:]):
+            self.at_least(first, second)
+            self.at_least(second, first)
 
     def _label(self, label: str) -> None:
         if self.fn is None:
@@ -535,6 +735,7 @@ class Checker:
             edges.append(self.S)
         if not edges:
             raise self.fail(f"label {label} has no incoming edge")
+        self.S = None  # the rows of a join belong to its edges, whatever path fell into it
         self.S = self.merge(edges)
 
     # --- values
@@ -657,7 +858,7 @@ class Checker:
         self.set(a[0], token)
 
     def _build(self, base: str, ctor_id: str, tag: str, sources: list[str],
-               star: Optional[Tok]) -> tuple[int, Ctor]:
+               star: Optional[Tok]) -> tuple[int, Ctor, int]:
         """The atomic constructor. `star` is the value `*` stands for, or None if it is banned."""
         r, word, cell = self.cap(base)
         ctor = self._ctor_of(ctor_id)
@@ -667,12 +868,14 @@ class Checker:
                             f"{len(sources)} sources")
         named = set()
         stars = 0
+        carried = self.unknown()  # what the new value carries per cell
         for source, (off, size, ty_text, name) in zip(sources, ctor.fields):
             ty = self.norm(ty_text)
             key = (off, size)
             where = f"{ctor.name}.{name}"
             held = cell.locs.get(key)
             if source == "=":
+                self.at_least(held.pot if held is not None else None, None if is_scalar(ty) else carried)
                 if held is None or not held.full:
                     raise self.fail(f"{where} says STAY, and [{off}:{size}] holds no full value")
                 if held.ty != ty and not (is_int(held.ty) and is_int(ty)):
@@ -685,12 +888,14 @@ class Checker:
                 if held is None or held.full or held.word != star.word:
                     raise self.fail(f"{where}: `*` needs a hole holding the word the call returns")
                 self.unify(star.ty, ty, where)
+                self.at_least(star.pot, carried)
             elif source.endswith("!"):
                 r_source, token = self.full(source[:-1])
                 if held is None or held.full or held.word != token.word:
                     raise self.fail(f"{where} says RESTORE, and [{off}:{size}] is not a hole "
                                     f"holding {token.word}")
                 self.unify(token.ty, ty, where)
+                self.at_least(token.pot, carried)
                 assert self.S is not None
                 del self.S.regs[r_source]
             elif _LIT.match(source):
@@ -704,6 +909,7 @@ class Checker:
                     raise self.fail(f"{where}: {source} is a hole")
                 self.unify(found.ty, ty, where)
                 self._name_once(named, other, found, where)
+                self.at_least(found.pot, None if is_scalar(ty) else carried)
             elif _FUNC.match(source):
                 self._computed(source, cell, ty, where, key)
             else:
@@ -713,6 +919,7 @@ class Checker:
                                     f"{'`=`' if held.full else 'RESTORE'}, Theorem 6.1")
                 self.unify(token.ty, ty, where)
                 self.fits(token, ty, where)
+                self.at_least(token.pot, carried)
         if star is not None and stars != 1:
             raise self.fail("tailmod needs exactly one `*`")
         for key, loc in cell.locs.items():
@@ -720,7 +927,9 @@ class Checker:
                 raise self.fail(f"[{key[0]}:{key[1]}] still holds a linear {loc.ty} that "
                                 f"{ctor.name} does not name, so it would be lost")
         self._tag_rule(tag, ctor, decl, cell)
-        return r, ctor
+        assert self.S is not None
+        self.S.budget = self.S.budget.plus(carried, -1)  # the new cell's share, paid now
+        return r, ctor, carried
 
     def _name_once(self, named: set, key: tuple[int, int], loc: Loc, where: str) -> None:
         """A linear value can stay or move once. Two sources naming it would be two owners."""
@@ -778,10 +987,10 @@ class Checker:
             raise self.fail(f"{ctor.name} is tagged, so build must say keep or write, not {tag}")
 
     def i_build(self, a: list[str]) -> None:
-        r, ctor = self._build(a[0], a[1], a[2], a[3:], None)
+        r, ctor, carried = self._build(a[0], a[1], a[2], a[3:], None)
         assert self.S is not None
         word = self.S.regs[r].word
-        self.S.regs[r] = Tok(("named", self._resolve(ctor.type)), word)
+        self.S.regs[r] = Tok(("named", self._resolve(ctor.type)), word, carried)
         del self.S.cells[word]
         self.S.ruled.pop(word, None)  # what a test ruled out was about what the cell used to hold
 
@@ -803,28 +1012,36 @@ class Checker:
         self.edge(a[4])
         self.S = None
 
-    def _dispatched(self, r: int, word: Word, ctor: Ctor) -> None:
+    def _dispatched(self, r: int, token: Tok, ctor: Ctor) -> None:
+        """The cell opens, and what it carried becomes spendable."""
         assert self.S is not None
-        self.S.regs[r] = Tok("cap", word)
-        self.S.cells[word] = self._open_cell(word, ctor)
+        self.S.regs[r] = Tok("cap", token.word)
+        self.S.cells[token.word] = self._open_cell(token.word, ctor, token.pot)
+        self.S.budget = self.S.budget.plus(token.pot)
 
     def i_br_null(self, a: list[str]) -> None:
         r, token = self.full(a[0])
         decl = self._decl(token.ty)
         if decl is None or decl.kind != "tagless":
             raise self.fail(f"br.null on {token.ty}: it is not a tagless type")
-        if self.is_reserve(token.ty):
-            self.draws += 1
         assert self.S is not None
         base = self.S
         null_edge = base.copy()
         del null_edge.regs[r]
         null_edge.nulls = null_edge.nulls | {token.word}
+        reserve = self.is_reserve(token.ty)
+        # Section 5.3's DRAW: the arm with a cell costs a cell. The End arm has to type, and it is
+        # not charged, because a reserve that holds R(n) cells does not reach it. Every Free a
+        # program holds is that reserve: a second one could never be got rid of, since R3 will not
+        # walk a Free, an output cannot hold one, and a handler returns exactly one.
+        null_edge.unreachable = base.unreachable or reserve
         self.S = null_edge
         self.edge(a[1])
         full_ctor = next(c for c in decl.ctors if c.tag != "null")
         self.S = base
-        self._dispatched(r, token.word, full_ctor)
+        if reserve:
+            self.S.budget = self.S.budget.spend(cells=1)
+        self._dispatched(r, token, full_ctor)
         self.edge(a[2])
         self.S = None
 
@@ -844,7 +1061,7 @@ class Checker:
         base = self.S
         yes = base.copy()
         self.S = yes
-        self._dispatched(r, token.word, ctor)
+        self._dispatched(r, token, ctor)
         self.edge(a[2])
         no = base.copy()
         no.ruled[token.word] = ruled | {tag}
@@ -863,7 +1080,7 @@ class Checker:
         left = [c for c in decl.ctors if not c.tag.isdigit() or int(c.tag) not in ruled]
         if left != [ctor]:
             raise self.fail(f"open as {ctor.name} with {[c.name for c in left]} still possible")
-        self._dispatched(r, token.word, ctor)
+        self._dispatched(r, token, ctor)
 
     # --- calls and exits
 
@@ -872,10 +1089,11 @@ class Checker:
             raise self.fail(f"{signature.name} takes {len(signature.params)} arguments, "
                             f"not {len(operands)}")
         tokens = []
-        for operand, ty in zip(operands, signature.params):
+        for position, (operand, ty) in enumerate(zip(operands, signature.params)):
             want = self.norm(ty)
             token = self.operand(operand)
             self.fits(token, want, f"an argument of {signature.name}")
+            self.at_least(token.pot, signature.param_pots[position])
             if want == "cap" or token.ty == "cap":
                 if token.ty != want:
                     raise self.fail(f"argument {operand} is {token.ty}, and {signature.name} "
@@ -910,20 +1128,51 @@ class Checker:
                 raise self.fail(f"{where} with a linear value still at [{key[0]}:{key[1]}]")
 
     def _callee(self, ordinal: str) -> Signature:
+        """Whoever is called, the caller brings what it asks for."""
+        fn = self.fn
+        assert fn is not None and self.S is not None
         signature = self.functions.get(ordinal)
         if signature is None:
-            assert self.fn is not None
-            if ordinal == self.fn.ordinal:
-                self.recursive = True
-                return self.fn
-            raise self.fail(f"{ordinal} is not defined yet: a callee comes before its caller")
-        if signature.steps is None:
-            self.callee_steps = self.callee_draws = None
-        elif self.callee_steps is not None and self.callee_draws is not None:
-            assert signature.draws is not None
-            self.callee_steps += signature.steps
-            self.callee_draws += signature.draws
+            if ordinal != fn.ordinal:
+                raise self.fail(f"{ordinal} is not defined yet: a callee comes before its caller")
+            fn.recursive = True
+            signature = fn
+        else:
+            signature = self._at_its_own_numbers(signature)
+        self.S.budget = self.S.budget.plus(signature.entry, -1)
         return signature
+
+    def _at_its_own_numbers(self, callee: Signature) -> Signature:
+        """A call of a finished function gets its own copy of the callee's unknowns and of every
+        inequality over them, which is the callee's derivation again with other numbers in it. One
+        set of numbers per function would refuse linear programs: reversing what a reversal
+        returned would need the function's result to carry its parameter's amount, which pays for
+        the walk and has its result's amount left, so that amount would have to exceed itself.
+        Only a recursive call stays at the numbers of the call it is part of.
+
+        A callee with no cells going in or out needs no copy, because nothing connects its calls:
+        they all want one smallest entry, so sharing it costs nothing and keeps the rows few."""
+        fn = self.fn
+        assert fn is not None
+        renamed: dict[int, int] = {}
+        carries_nothing = all(pot is None for pot in (*callee.param_pots, *callee.result_pots))
+
+        def copy(unknown: int) -> int:
+            if carries_nothing:
+                return unknown
+            if unknown not in renamed:
+                renamed[unknown] = self.unknown()
+            return renamed[unknown]
+
+        def copy_pot(unknown: Optional[int]) -> Optional[int]:
+            return None if unknown is None else copy(unknown)
+
+        fn.too_large = fn.too_large or callee.too_large
+        for row in callee.obligations:
+            self.obligate(Budget(tuple(sorted((copy(u), c) for u, c in row.terms)), row.cells, row.steps))
+        return replace(callee, entry=copy(callee.entry),
+                       param_pots=[copy_pot(pot) for pot in callee.param_pots],
+                       result_pots=[copy_pot(pot) for pot in callee.result_pots])
 
     def i_call(self, a: list[str]) -> None:
         signature = self._callee(a[1])
@@ -934,16 +1183,16 @@ class Checker:
         word = tokens[signature.at].word if signature.at is not None else self.fresh()
         results = self.tuples.get(self._resolve(signature.ret))
         if results is None:
-            self._result(a[0], self.norm(signature.ret), word)
+            self._result(a[0], self.norm(signature.ret), word, signature.result_pots[0])
             return
         names = _args(a[0].strip("()"))
         if len(names) != len(results):
             raise self.fail(f"{signature.name} returns {len(results)} values")
-        for name, ty in zip(names, results):
-            self._result(name, self.norm(ty), self.fresh())
+        for name, ty, pot in zip(names, results, signature.result_pots):
+            self._result(name, self.norm(ty), self.fresh(), pot)
 
-    def _result(self, register: str, ty: Type, word: Word) -> None:
-        self.set(register, Tok(ty, word))
+    def _result(self, register: str, ty: Type, word: Word, pot: Optional[int]) -> None:
+        self.set(register, Tok(ty, word, pot))
         if ty == "cap":  # a capability that comes back is an empty cell, whatever it held before
             assert self.S is not None
             self.S.cells[word] = Cell()
@@ -973,10 +1222,11 @@ class Checker:
         wanted = results if results is not None else [fn.ret]
         if len(a) != len(wanted):
             raise self.fail(f"ret of {len(a)} values from a function returning {len(wanted)}")
-        for operand, ty in zip(a, wanted):
+        for position, (operand, ty) in enumerate(zip(a, wanted)):
             r, token = self.full(operand)
             self.unify(token.ty, self.norm(ty), "a result")
             self.fits(token, self.norm(ty), "a result")
+            self.at_least(token.pot, fn.result_pots[position])
             if not is_scalar(token.ty):
                 assert self.S is not None
                 del self.S.regs[r]
@@ -985,6 +1235,8 @@ class Checker:
             if results is None:
                 self._word_leaving(token.word, "ret")
         self._no_linear_left("ret")
+        assert self.S is not None
+        self.obligate(self.S.budget)
         self.S = None
 
     def i_tail(self, a: list[str]) -> None:
@@ -999,6 +1251,11 @@ class Checker:
                 raise self.fail(f"{fn.name} is declared @{fn.at}, and {signature.name} is not")
             self._word_leaving(tokens[signature.at].word, "tail")
         self._no_linear_left("tail")
+        if signature is not fn:  # what it returns, this function returns
+            for theirs, ours in zip(signature.result_pots, fn.result_pots):
+                self.at_least(theirs, ours)
+        assert self.S is not None
+        self.obligate(self.S.budget)
         self.S = None
 
     def i_tailmod(self, a: list[str]) -> None:
@@ -1018,14 +1275,16 @@ class Checker:
         if fn.at is None:
             raise self.fail(f"tailmod in {fn.name}, which is not declared @")
         tokens = self._consume_arguments(signature, operands)
-        star = Tok(self.norm(signature.ret), tokens[fn.at].word)
-        r, _built = self._build(a[0], a[1], a[2], sources, star)
+        star = Tok(self.norm(signature.ret), tokens[fn.at].word, fn.result_pots[0])
+        r, _built, carried = self._build(a[0], a[1], a[2], sources, star)
+        self.at_least(carried, fn.result_pots[0])  # the root that comes back is one of these cells
         assert self.S is not None
         token = self.S.regs[r]
         self._word_leaving(token.word, "tailmod")
         del self.S.regs[r]
         del self.S.cells[token.word]
         self._no_linear_left("tailmod")
+        self.obligate(self.S.budget)
         self.S = None
 
 

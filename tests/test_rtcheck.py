@@ -8,7 +8,11 @@ import ast
 import os
 import unittest
 
-from src.rtcheck import RTError, Unbounded, check_stream
+from fractions import Fraction
+
+from src.lfplo import certify
+from src.rtcheck import Budget, RTError, Unbounded, check_stream
+from src.simplex import minimize
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -69,7 +73,7 @@ fn f1 inc(r0 : t16) : t16 @0
 L3: tailmod r0, c18, none, add([0:8], #1), *, f1, r0[8:8]
 L2: const r1, #0 : t16
     ret r1
-end
+end decreasing 0
 """
 
 
@@ -82,9 +86,9 @@ class Accepted(unittest.TestCase):
         check(LIST, INC)
 
     def test_the_forwarding_handler(self):
-        checker = check(FORWARD, HANDLER)
-        self.assertEqual(checker.bounds("forward")[0], 0)
-        self.assertGreater(checker.bounds("forward")[1], 0)
+        bound = certify(check(FORWARD, HANDLER), "forward", 216)
+        self.assertEqual((bound.a, bound.b, bound.c), (0, 0, 0))
+        self.assertGreater(bound.d, 0)
 
 
 class Refused(unittest.TestCase):
@@ -349,7 +353,33 @@ end
 """
         self.refuse(r"hole|still", LIST, stream)
 
-    def test_a_handler_that_reaches_recursion_has_no_bound(self):
+    def test_the_end_arm_of_a_draw_must_type_and_is_not_charged(self):
+        """Section 5.3's DRAW, on both sides of a join: what only that arm reaches costs nothing,
+        and what comes after the join is charged as the arm with a cell left it."""
+        template = """
+handler f1 h(r0 : t32768, r1 : t17, r2 : t30) : t32770
+    open r1, c18
+    build r1, c23, write, =
+    br.null r2, L1, L2
+L1: const r3, #0 : t30
+{end_arm}    jump L3
+L2: move r3, r2
+    build r3, c32, none, =
+    jump L3
+L3: const r9, #1 : i8
+    drop r9
+    ret r0, r1, r3
+end
+"""
+        costly = "".join(f"    const r{10 + k}, #1 : i8\n    drop r{10 + k}\n" for k in range(40))
+        plain = certify(check(FORWARD, template.format(end_arm="")), "h", 216)
+        dear = certify(check(FORWARD, template.format(end_arm=costly)), "h", 216)
+        self.assertEqual(plain, dear)
+        self.assertEqual(dear.b, 1)
+        broken = template.format(end_arm="    drop r77\n")
+        self.refuse("r77", FORWARD, broken)
+
+    def test_a_walk_over_the_reserve_has_no_bound_because_the_reserve_carries_nothing(self):
         stream = """
 fn f0 walk(r0 : t30, r1 : t30) : t30
     br.null r0, L1, L2
@@ -357,7 +387,7 @@ L1: ret r1
 L2: take r2, r0[0:8]
     build r0, c32, none, r1
     tail f0, r2, r0
-end
+end decreasing 0
 handler f1 h(r0 : t32768, r1 : t17, r2 : t30) : t32770
     const r3, #0 : t30
     call r4, f0, r2, r3
@@ -367,7 +397,7 @@ handler f1 h(r0 : t32768, r1 : t17, r2 : t30) : t32770
 end
 """
         with self.assertRaises(Unbounded):
-            check(FORWARD, stream)
+            certify(check(FORWARD, stream), "h", 216)
 
     def test_a_draw_from_the_reserve_is_counted(self):
         stream = """
@@ -381,7 +411,198 @@ L2: build r2, c32, none, =
     ret r0, r1, r2
 end
 """
-        self.assertEqual(check(FORWARD, stream).bounds("h")[0], 1)
+        self.assertEqual(certify(check(FORWARD, stream), "h", 216).b, 1)
+
+
+ITEM = LIST + """
+type t26 record Item
+ctor c27 t26 - Item
+field c27 0 1 i8 port
+field c27 8 8 t16 body
+type t30 tagless Free
+ctor c31 t30 null End
+ctor c32 t30 - More
+field c32 0 8 t30 next
+tuple t50 t26 t30
+"""
+REVERSE = """
+fn f0 rev(r0 : t16, r1 : t16) : t16
+    br.null r0, L1, L2
+L1: ret r1
+L2: take r2, r0[8:8]
+    build r0, c18, none, =, r1
+    tail f0, r2, r0
+end decreasing 0
+"""
+ONCE = """
+handler f1 h(r0 : t26, r1 : t30) : t50
+    open r0, c27
+    take r2, r0[8:8]
+    const r3, #0 : t16
+    call r4, f0, r2, r3
+    build r0, c27, none, =, r4
+    ret r0, r1
+end
+"""
+TWICE = """
+handler f1 h(r0 : t26, r1 : t30) : t50
+    open r0, c27
+    take r2, r0[8:8]
+    const r3, #0 : t16
+    call r4, f0, r2, r3
+    const r5, #0 : t16
+    call r6, f0, r4, r5
+    build r0, c27, none, =, r6
+    ret r0, r1
+end
+"""
+
+
+class Potential(unittest.TestCase):
+    """The bounds of LFPL-O section 5, worked out by hand beside what the checker derives. rev's
+    loop is br.null, take, build and tail: four steps, so four per cell. Its null path is br.null
+    and ret, so its entry is two. A handler's own steps are what its header cell's four do not cover."""
+
+    def test_a_walk_is_paid_for_by_the_cells_it_releases(self):
+        bound = certify(check(ITEM, REVERSE, ONCE), "h", 216)
+        self.assertEqual((bound.a, bound.b, bound.c, bound.d), (0, 0, 4, 3))
+
+    def test_a_walk_over_what_the_same_walk_returned_pays_for_both(self):
+        """One set of numbers per function would need rev's result to carry its parameter's amount,
+        which pays for the loop and has that result's amount left: it would exceed itself."""
+        bound = certify(check(ITEM, REVERSE, TWICE), "h", 216)
+        self.assertEqual((bound.a, bound.b, bound.c, bound.d), (0, 0, 8, 3))
+
+    def test_recursion_is_not_given_new_numbers_at_each_call(self):
+        """Otherwise this would have a linear bound: reversing the accumulator at every step."""
+        quadratic = """
+fn f1 quad(r0 : t16, r1 : t16) : t16
+    br.null r0, L1, L2
+L1: ret r1
+L2: take r2, r0[8:8]
+    build r0, c18, none, =, r1
+    const r3, #0 : t16
+    call r4, f0, r0, r3
+    tail f1, r2, r4
+end decreasing 0
+handler f2 h(r0 : t26, r1 : t30) : t50
+    open r0, c27
+    take r2, r0[8:8]
+    const r3, #0 : t16
+    call r4, f1, r2, r3
+    build r0, c27, none, =, r4
+    ret r0, r1
+end
+"""
+        with self.assertRaisesRegex(Unbounded, "no linear bound on steps"):
+            certify(check(ITEM, REVERSE, quadratic), "h", 216)
+
+    def test_recursion_that_releases_nothing_cannot_pay_for_itself(self):
+        """The checker does not look at R3's argument, so this is its own proof of termination."""
+        spin = """
+fn f0 spin(r0 : t16) : t16
+    tail f0, r0
+end decreasing 0
+handler f1 h(r0 : t26, r1 : t30) : t50
+    open r0, c27
+    take r2, r0[8:8]
+    call r3, f0, r2
+    build r0, c27, none, =, r3
+    ret r0, r1
+end
+"""
+        with self.assertRaisesRegex(Unbounded, "no linear bound on steps"):
+            certify(check(ITEM, spin), "h", 216)
+
+    def test_recursion_has_to_name_what_falls(self):
+        with self.assertRaisesRegex(RTError, "names no decreasing set"):
+            check(LIST, REVERSE.replace("end decreasing 0", "end"))
+
+    def test_only_a_parameter_made_of_cells_can_fall(self):
+        walk = """
+fn f0 walk(r0 : t16, r1 : i64) : i64
+    br.null r0, L1, L2
+L1: ret r1
+L2: take r2, r0[8:8]
+    drop r0
+    tail f0, r2, r1
+end decreasing 1
+"""
+        with self.assertRaises(RTError):
+            check(LIST, walk)
+
+    def test_the_decreasing_set_shares_one_amount(self):
+        """R3 only says the set's total falls, so a cell that leaves may be any member's."""
+        weave = """
+fn f0 weave(r0 : t16, r1 : t16, r2 : t16) : t16
+    br.null r0, L1, L2
+L1: br.null r1, L3, L4
+L3: ret r2
+L4: take r4, r1[8:8]
+    build r1, c18, none, =, r2
+    const r3, #0 : t16
+    tail f0, r3, r4, r1
+L2: take r5, r0[8:8]
+    build r0, c18, none, =, r2
+    tail f0, r1, r5, r0
+end decreasing 0,1
+"""
+        checker = check(LIST, weave)
+        signature = checker.functions["f0"]
+        first, second = signature.param_pots[:2]
+        self.assertIn(Budget().plus(first).plus(second, -1), signature.obligations)
+        self.assertIn(Budget().plus(second).plus(first, -1), signature.obligations)
+        self.assertNotIn(Budget().plus(signature.param_pots[2]).plus(first, -1), signature.obligations)
+
+
+class Certificate(unittest.TestCase):
+    """Section 5.5: whatever proposed the numbers, verify evaluates every inequality with them."""
+
+    def setUp(self):
+        self.checker = check(ITEM, REVERSE, TWICE)
+        self.program = self.checker.linear_program("h", 216)
+        self.cells = minimize(self.program.objective(), self.program.constraints("cells"))
+        self.steps = minimize(self.program.objective(), self.program.constraints("steps"))
+
+    def verify(self, steps):
+        return self.checker.verify("h", self.cells, steps)
+
+    def test_the_solvers_numbers_pass_and_are_what_is_reported(self):
+        bound = self.verify(self.steps)
+        self.assertEqual((bound.c, bound.d), (8, 3))
+        self.assertEqual(self.checker.bounds("h"), bound)
+
+    def test_nothing_in_the_table_comes_from_the_solver_being_right(self):
+        """A number too low anywhere in the derivation is refused, the item's or an inner one's."""
+        for unknown, value in self.steps.items():
+            if not value:
+                continue
+            for forged in (value - 1, value - Fraction(1, 216)):
+                changed = {**self.steps, unknown: forged}
+                with self.subTest(unknown=unknown, forged=forged):
+                    if forged < 0:
+                        with self.assertRaisesRegex(RTError, "negative"):
+                            self.verify(changed)
+                    else:
+                        with self.assertRaisesRegex(RTError, "short"):
+                            self.verify(changed)
+
+    def test_an_empty_answer_and_a_negative_one_are_refused(self):
+        with self.assertRaisesRegex(RTError, "short"):
+            self.verify({})
+        with self.assertRaisesRegex(RTError, "negative"):
+            self.verify({**self.steps, self.program.entry: Fraction(-1)})
+
+    def test_numbers_that_hold_pass_whoever_found_them(self):
+        """The certificate is about the inequalities and not the optimum. Raising the handler's
+        entry by one leaves every row true, and the table says what the numbers say."""
+        raised = {**self.steps, self.program.entry: self.steps[self.program.entry] + 1}
+        self.assertEqual(self.verify(raised).d, 4)
+
+    def test_a_fraction_rounds_up(self):
+        """Three cells' worth over two is 1.5 per cell, and the table takes integers."""
+        raised = {**self.steps, self.program.entry: self.steps[self.program.entry] + Fraction(1, 2)}
+        self.assertEqual(self.verify(raised).d, 4)
 
 
 PAIR = """
@@ -516,7 +737,7 @@ fn f1 g(r0 : t16) : t40 @0
 L3: tailmod r0, c42, none, =, *, f1, r0[8:8]
 L2: const r1, #0 : t40
     ret r1
-end
+end decreasing 0
 """
         self.refuse("against", LIST, stream)
 
@@ -538,7 +759,7 @@ fn f0 inner(r0 : t16) : t16 @0
 L1: const r1, #0 : t16
     ret r1
 L2: tailmod r0, c18, none, add([0:8], #1), *, f0, r0[8:8]
-end
+end decreasing 0
 fn f1 outer(r0 : t16) : t16 @0
     br.null r0, L1, L2
 L1: const r1, #0 : t16

@@ -335,7 +335,7 @@ The judgment reads: with context Γ and q units free beforehand, e evaluates to 
 Two things differ from Hofmann and Jost:
 
 - **There is no sharing rule.** Linear data are never duplicated, so potential never has to be split between two uses of one value.
-- **DRAW types only the `More` arm against the budget.** The `End` arm must still type-check, but Theorem 5.1 shows it is unreachable when the reserve is large enough. Its cost therefore never enters the bound.
+- **DRAW types only the `More` arm against the budget.** The `End` arm must still type-check, but Theorem 5.1 shows it is unreachable when the reserve is large enough. Its cost therefore never enters the bound. This rests on every Free a program holds being that reserve. A second one could never be got rid of: a `More` arm leaves as many as it found, R3 does not count a Free, an output cannot hold one, and a handler returns exactly one. Relaxing any of those would make a program's own `End` reachable, with its cost left out of the bound.
 
 ### 5.4 Soundness
 
@@ -344,6 +344,8 @@ Two things differ from Hofmann and Jost:
 ### 5.5 Inference
 
 Every annotation is an unknown non-negative rational, and every rule instance contributes linear inequalities. The compiler solves one linear program per handler, minimizing R(N\_max) and then W(N\_max), and rounds the coefficients up to integers.
+
+A call of a finished function is typed by its own copy of that function's unknowns and inequalities, which is App with a fresh annotation of f. One annotation per function would refuse linear programs, such as reversing what a reversal returned: the function's result would have to carry the amount its parameter does, which pays for the walk and has the result's amount left, so that amount would have to exceed itself. A recursive call stays at the annotation of the call it is part of, since otherwise the inequalities would say nothing about the walk. Rule R3's decreasing set, the parameters whose total falls, shares one amount per cell, since the cell that leaves can be any of theirs. Other linear parameters may carry amounts of their own, and they have to: a walk that moves cells onto an accumulator hands the next walk's budget over with them.
 
 - **Feasible:** the solution gives a, b, c and d, written into the admission table.
 - **Infeasible:** the handler has no linear bound, and the program is refused, which is a declared limit (section 8.2).
@@ -473,7 +475,7 @@ The compiler refuses a program only for a type error or a declared limit, never 
 1. **Lex and parse** forward, as in the first specification. The token stream also goes to a file on disk.
 2. **The right-to-left pass** reads that file backward with O(D) state and writes one annotation record at each construct's opening position.
 3. **Check:** linear typing, exhaustive matching, rule R3, and the arity and size limits.
-4. **Resource analysis** generates constraints as it goes and solves one linear program per handler at the handler's end (section 5.5). Functions are capped in size by a declared limit, so each linear program is bounded.
+4. **Resource analysis** generates constraints as it goes and solves one linear program per handler at the handler's end (section 5.5). A handler's inequalities, with the copies for what it calls, are capped by a declared limit, so each linear program is bounded.
 5. **Lower** forward with destination passing, reading the annotations in the same order as the source.
 6. **Validate:** translation validation, the resource certificate, and the stack bound (section 8.4). Any failure refuses the program, and no binary is written.
 7. **Emit** the assembly, the admission table and the image layout.
@@ -500,12 +502,15 @@ With exact last uses, a scalar is moved out before its location is overwritten, 
 | --- | --- | --- |
 | nesting depth D\_max | 64 | parser |
 | global names G\_max | 2,048 | checker |
-| binders in one function | 128 | lowerer; this also bounds snapshots and each linear program |
+| binders in one function | 128 | lowerer; this also bounds snapshots |
+| inequalities in one handler's linear program, with what it calls | 1,024 | resource analysis |
 | a constructor fits one cell | B bytes | checker |
 | arguments per function | 6 | checker |
 | frame slots per function F\_max | declared | lowerer |
 | stack S\_max | declared | lowerer |
 | N\_max, K\_in, K\_out, O\_max, N\_out, S\_cap | declared per program | linker |
+| the image, which includes R(N\_max) cells | 1 GiB, because the code reaches it with 32-bit displacements | linker |
+| W(N\_max) | below 2^63, because admission computes it in 64 bits | linker |
 | every handler has a linear bound | — | resource analysis |
 | the admission predicate draws nothing and takes constant steps | — | resource analysis |
 | non-tail recursion | refused until DESCEND and ASCEND are built | lowerer |
@@ -740,8 +745,8 @@ The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and 
 | non-tail recursion | refused, as a declared limit | DESCEND and ASCEND |
 | arrays and Fin N | `Array[N] t` of scalars, read with `idx` and `get`. N must be a power of two. A Fin N may live in a cell. | `swap`, linear elements, and any N once division exists |
 | unboxed pairs | present, as flat tuples of at most six, returned and bound and never stored | nothing |
-| handlers, serving loop, admission | one handler and one ingress, over UDP on the loopback address, one datagram per turn. Admission checks TooLarge, Short and Full. Late and Policy cannot be declared yet, and every source refuses by Drop. | several handlers, recvmmsg or AF_XDP, Hold, deadlines, the admission predicate, and state slots of cells |
-| resource analysis and certificates | **absent**. `src/rtcheck.py` measures constant bounds instead: W(n) = d counts the instructions of a handler and what it calls, R(n) = b counts its draws, and a handler that reaches recursion is refused. | section 5, so that a handler can walk its body |
+| handlers, serving loop, admission | one handler and one ingress, over UDP on the loopback address, one datagram per turn. Admission works out n from the datagram's length, then checks TooLarge, Short and Full. Late and Policy cannot be declared yet, so W(n) is only added to a counter, and every source refuses by Drop. | several handlers, recvmmsg or AF_XDP, Hold, deadlines, the admission predicate, and state slots of cells |
+| resource analysis and certificates | present on every build. `src/rtcheck.py` writes section 5's inequalities as it types each function, `src/simplex.py` proposes numbers, and the checker evaluates every inequality with them, so the solver is not trusted. A handler can walk its body. | polynomial bounds, and k\_x86 of section 8.3, which has not been computed, so W(n) counts steps and is not yet a time |
 | stack in the image | present: S_max comes from the call graph, the stack is in the image with a guard page below it, and the depth is recomputed from the assembly | nothing |
 | startup: lock, prefault, signals | present. Each step that can fail exits with its own number, before any input. | nothing |
 | register-transfer layer | present: `src/rtlower.py`, `src/rtcheck.py` and `src/x86.py`, and every Phase 1 generator passes through it | move `tests/test_invariants.py` over, so that `src/lower.py` can go |
@@ -761,7 +766,10 @@ The implementation decides some things this text leaves open, or does not mentio
 - **Malformed.** A datagram shorter than an item's scalars is counted as malformed. That is a fifth reason at ingress, beside those of section 6.1, because it never was an item.
 - **The control port.** It is one more ingress source, bound to the loopback address. `S` answers with the counters, `P` pauses egress, `R` resumes it and `Q` shuts down. Pausing exists because loopback sends never block, so without it nothing could show that a full queue refuses.
 - **System calls.** Beyond section 7.3's list, ingress and egress use `recvmsg` and `sendmsg`, scattering a datagram straight into cells, and the control port uses `recvfrom` and `sendto`. Idling is a blocking ingress read with a 1 ms timeout, so `poll` is not needed.
-- **Link-time options.** `--state` gives a state array its initial contents, and `--cells` can make the image smaller than section 3.4's C, which is what makes Short reachable.
+- **Link-time options.** `--state` gives a state array its initial contents, and `--cells` can make the image smaller than section 3.4's C, which is what makes Short reachable. `--count-steps` validates the build without its counters and then rebuilds with one at each step the checker charged for, so that tests can hold running code to W(n). That rebuild is for measuring, and is not itself validated.
+- **The chain.** An item's chain may be abstract, like `data Bytes;`, or declared with the exact layout the runtime builds, `Last | Chunk(used, b0, ..., b6: Int8, next)`, which lets a handler walk it. Cells are reused, so admission clears what follows the used bytes of a chain's last cell, and a program can read nothing an earlier item left. A program can now also write the used count and grow the chain, so egress clamps each count to 7, and a chain longer than one message can gather counts as a send error, with its cells returned.
+- **Narrowing.** `low8`, `low16` and `low32` keep the low bits of an integer. `pack` only widens, and without these a sum worked out in Int64 could not be stored in a narrower field.
+- **Steps.** A step is one instruction of the register-transfer stream, except `move`, `drop` and `open`, which lower to nothing.
 
 The plan, with what is done marked. Arrays and tuples came ahead of resource analysis, because the handler needs them:
 
@@ -769,7 +777,7 @@ The plan, with what is done marked. Arrays and tuples came ahead of resource ana
 2. **The register-transfer layer.** Done, except that `tests/test_invariants.py` still runs against `src/lower.py`. This turned 8 of the 12 Phase 1 bug classes into type errors.
 3. **Stack in the image, and the startup sequence.** Done. This closes F3, F4 and F10 on x86-64.
 4. **A serving loop with admission.** Done, with measured constant bounds instead of hand-written ones. This closes F6 and F7 for a handler that does not recurse.
-5. **Resource analysis,** which replaces the measured bounds with derived and certified ones.
+5. **Resource analysis,** which replaces the measured bounds with derived and certified ones. Done. `examples/checksum.lfpl` is the first handler that needs it: R(n) = 0 and W(n) = c·n + d.
 6. **Arrays, Fin N with R3's Fin N case, unboxed pairs and division,** for router tables. Arrays, Fin N and tuples are done, to the extent the table says. R3's Fin N case, division and `swap` are not.
 7. **DESCEND and ASCEND,** which lift the limit on non-tail recursion.
 8. **The right-to-left pass,** for exact last uses and the inferred result cell. This removes the remaining internal refusals (T8).
