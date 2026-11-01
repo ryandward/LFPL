@@ -119,8 +119,9 @@ so is claiming a store was unnecessary when it was needed.
 agrees on it. A word that disagrees becomes a fresh one, which can never satisfy `r!`, and a
 tag that disagrees becomes unknown, which forces `write`. Scalar registers free on any edge
 are free at the label. Any other disagreement, such as a linear register or location that is
-full on one edge and not another, is a type error. Backends need no moves here: both arms
-already deliver into the same register.
+full on one edge and not another, is a type error. At this level no moves are needed: both
+arms already deliver into the same register. A backend whose homes can differ from edge to
+edge still needs them; see `label` in the x86 lowering.
 
 ### Calls and exits
 
@@ -132,10 +133,18 @@ already deliver into the same register.
 
     tail f, o_1 ... o_n      the same consumption, then control leaves
     ret s                    s = w : t  -->  control leaves
-    tailmod p, C, tag, s_1 ... s_n, f, o_1 ... o_m    build, then a recursive tail call
+    tailmod p, C, tag, s_1 ... s_n, f, o_1 ... o_m
+        in this order: consume o_1 ... o_m, then build, then consume p, then jump to f
 
-In `tailmod`, exactly one source is `*`. Its location must be a hole holding the word of
-f's argument k, where f is declared `@k`, so RESTORE applies. This is LFPL-O's tail recursion
+In `tailmod`, exactly one source is `*`, and the order above matters twice. The call's
+operands are consumed first, because an operand may be a location of the cell being built,
+such as `r0[8:8]` in `inc`, and `build` removes every token of that cell. Consuming that
+operand is also what leaves the hole that `*` needs: its location must be a hole holding the
+word of f's argument k, where f is declared `@k`, so RESTORE applies. After the build, `p`
+holds the new value, and `tailmod` consumes it, because the link to it already exists: the
+previous iteration's `*` field points at this cell, or on the first iteration the root does,
+which is the word `@k` returns. Without that step `p` would still be full when control
+leaves, and the exit rule below would refuse every `tailmod`. This is LFPL-O's tail recursion
 modulo cons, with no store to that field.
 
 Every exit needs all linear tokens gone. The checker therefore repeats exactly-once
@@ -177,7 +186,13 @@ partial result is ever special. All the failures Phase 1 reports about registers
     br                     cmp; jcc, with the fall-through chosen by the next label
     br.null                test p, p; jcc
     br.tag                 cmp byte [p], k; jne
-    open, label            nothing, or a label
+    open                   nothing
+    label                  the label, after every incoming edge's homes are made equal. The
+                           label's home table is the one at the branch point the arms start
+                           from, and each arm that spilled or moved a value ends with one
+                           parallel move back to it, before its jump or fall-through. This is
+                           Phase 1's _normalize. Without it, a value spilled in one arm would
+                           be read from the wrong home after the join.
     call                   one parallel move covering the arguments and the evacuation of
                            every live value in the callee's clobber set; call; result in rax
     tail, tailmod          parallel move to the parameter registers; jmp
