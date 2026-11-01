@@ -1,0 +1,13 @@
+# LFPL-O section 4.7: the forwarding handler, as the specification writes it.
+data Bytes;
+record Hdr { ttl: Int8, dst: Int32, body: Bytes };
+data Verdict = Drop(body: Bytes) | Fwd(port: Int8, ttl: Int8, dst: Int32, body: Bytes);
+state routes : Array[1024] Int8;
+
+handler forward(routes: Array[1024] Int8, h: Hdr, free: Free)
+    : (Array[1024] Int8, Verdict, Free) =
+  match h with Hdr(d, ttl, dst, body) =>
+    if <=(ttl, 1) then (routes, Drop@d(body), free)
+    else let (routes2, port) = get(routes, idx(dst, 1024)) in
+         (routes2, Fwd@d(port, -(ttl, 1), dst, body), free)
+  end;
