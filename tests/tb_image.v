@@ -19,7 +19,7 @@
 
 module tb;
     localparam P = `POINTER_BITS;
-    localparam LIMIT = 100000000;
+    localparam LIMIT = 10000000;
 
     reg clk = 1'b0;
     always #5 clk = ~clk;

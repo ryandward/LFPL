@@ -96,6 +96,13 @@ fn sums(l: Bytes, acc: Bytes) : Bytes = match l with
           sums(rest, Chunk@e(used, +(b0, c0), b1, b2, b3, b4, b5, b6, Chunk@d({C2}, acc)))
       end
   end;
+fn again(l: Bytes) : Bytes = let r = rev(l, Last) in r;
+fn later(l: Bytes) : Bytes = match l with
+  | Last => Last
+  | Chunk(d, {FIELDS}, next) =>
+      let r = again(next) in
+      Chunk@d(used, +(b0, 1), b1, b2, b3, b4, b5, b6, r)
+  end;
 fn late(l: Bytes) : Bytes = match l with
   | Last => Last
   | Chunk(d, {FIELDS}, next) =>
@@ -247,6 +254,7 @@ STEPS = {
     "choose": ("let {out} = choose({x}) in\n", model_choose, 1),
     "sums": ("let {out} = sums({x}, Last) in\n", model_sums, 1),
     "late": ("let {out} = late({x}) in\n", model_late, 1),
+    "later": ("let {out} = later({x}) in\n", model_late, 1),
     "early": ("let {out} = early({x}) in\n", model_early, 1),
     "touch": ("let {out} = touch({x}) in\n", model_touch, 1),
     "incr": ("let {out} = incr({x}) in\n", model_incr, 1),

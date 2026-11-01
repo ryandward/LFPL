@@ -435,6 +435,11 @@ class RandomWalks(unittest.TestCase):
             with self.subTest(name):
                 self.run_pipeline([name], random.Random(SEED), name)
 
+    def test_what_an_at_function_returns_is_the_cell_it_was_given(self):
+        """By itself its result only goes back where it came from, with no store, so nothing reads
+        it. A walk over the result has to find the first cell, and not where the last iteration got to."""
+        self.run_pipeline(["incr", "rev"], random.Random(SEED), "an @ function, then a walk")
+
     def test_every_pipeline_agrees_with_the_x86_binary_and_keeps_to_its_bound(self):
         for seed in range(1000 * SEED, 1000 * SEED + COUNT // 3):
             rng = random.Random(seed)

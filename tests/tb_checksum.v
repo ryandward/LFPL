@@ -33,7 +33,7 @@
 module tb;
     localparam P = `POINTER_BITS;
     localparam PAYLOAD = 7;           // the bytes of one chain cell, as the type declares it
-    localparam LIMIT = 100000000;     // cycles: more than this for one item is a hang
+    localparam LIMIT = 10000000;      // cycles: more than this for one item is a hang
 
     reg clk = 1'b0;
     always #5 clk = ~clk;
