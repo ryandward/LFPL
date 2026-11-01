@@ -647,6 +647,8 @@ class CheckStage(Stage):
         if len(self.K) and self.K.peek()[0] == K_IDX and self._top()[1]:
             raise self._reject("the bound of idx must be a literal")
         if kind == K_TTUPLE:
+            if not self.lfplo:
+                raise self._reject("a tuple belongs to LFPL-O: compile this with src.lfplo")
             self._frame(K_TTUPLE, c1=len(self.TM))
             return None
         if kind == K_HANDLER and not self.lfplo:

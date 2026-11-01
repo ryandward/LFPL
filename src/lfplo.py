@@ -21,6 +21,8 @@ from .ring import Reject, Ring
 from .rtcheck import Checker, RTError
 from .rtlower import Limit, rt_lines
 from .runtime import BindingError, Image, Options, assembly, bind
+from .symcheck import check_translation
+from .validate import recompute_stack
 from .x86 import Backend, Starved
 
 
@@ -89,17 +91,13 @@ def compile_program(source: bytes, *, target_cells: int = 1024,
             + _trailer(mode, target_cells) + "\n")
 
 
-def _validate(source: Optional[bytes], asm_path: str, image: Image) -> None:
+def _validate(source: bytes, asm_path: str, image: Image) -> None:
     """Section 8.4. Meaning, and the stack. A build that fails either has no binary."""
-    from .symcheck import check_translation
-    from .validate import recompute_stack
-
     with open(asm_path) as handle:
         asm = handle.read()
-    if source is not None:
-        problems = check_translation(source, asm)
-        if problems:
-            raise Refused("translation validation failed:\n" + "\n".join(f"  {p}" for p in problems))
+    problems = check_translation(source, asm)
+    if problems:
+        raise Refused("translation validation failed:\n" + "\n".join(f"  {p}" for p in problems))
     deepest = recompute_stack(asm)
     if deepest != image.depth:
         raise Refused(f"the stack recomputed from the assembly is {deepest} bytes, and the "
@@ -127,14 +125,9 @@ def build(source_path: str, exe_path: str, options: Options,
         asm_path = os.path.join(work, "program.asm")
         try:
             with open(source_path, "rb") as handle:
-                if source_path.endswith(".rt"):
-                    lines: Iterable[str] = (raw.decode() for raw in handle)
-                    source = None
-                    image, instructions = _generate(lines, asm_path, options, initial)
-                else:
-                    source = handle.read()
-                    handle.seek(0)
-                    image, instructions = _generate(rt_lines(handle), asm_path, options, initial)
+                source = handle.read()
+                handle.seek(0)
+                image, instructions = _generate(rt_lines(handle), asm_path, options, initial)
         except (RTError, BindingError, Starved, Limit) as failure:
             raise Refused(str(failure)) from failure
         if keep_asm is not None:
