@@ -171,3 +171,30 @@ def validate(asm: str) -> list[Violation]:
             elif _memory(dest) is not None and op not in ("cmp", "test"):
                 mem[_memory(dest)] = new_word()
     return found
+
+
+def recompute_stack(asm: str) -> int:
+    """LFPL-O section 8.4: the deepest stack the serving loop's call to the handler can reach,
+    from the assembly alone. A function costs its return address and its frame, plus the
+    deepest thing it calls. A tail call has already released the frame. Callees come before
+    callers, so one pass in order has every number it needs."""
+    frames = dict(re.findall(r"^F_(\w+) equ (\d+)$", asm, re.M))
+    depths: dict[str, int] = {}
+    current = None
+    calls: list[str] = []
+    tails: list[str] = []
+    handler = re.search(r"call fn_(\w+)\n\s+; DONE", asm)
+    for raw in asm.splitlines():
+        line = raw.strip()
+        if line.endswith("_body:") and line.startswith("fn_"):
+            current, calls, tails = line[3:-6], [], []
+        elif line.startswith("F_") and current is not None and " equ " in line:
+            frame = 8 + int(frames[current])
+            frame += max((depths[c] for c in calls), default=0)
+            depths[current] = max([frame] + [depths[t] for t in tails])
+            current = None
+        elif current is not None and line.startswith("call fn_"):
+            calls.append(line[8:])
+        elif current is not None and line.startswith("jmp fn_"):
+            tails.append(line[7:])
+    return depths[handler.group(1)] if handler else 0

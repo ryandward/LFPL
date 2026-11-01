@@ -15,8 +15,9 @@ import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SOURCE = "examples/forward.lfpl"
 COUNTERS = ("capacity", "pool", "served", "forwarded", "dropped",
-            "too_large", "short", "full", "malformed", "send_errors")
+            "too_large", "short", "full", "malformed", "send_errors", "recv_errors")
 
 
 def free_port() -> int:
@@ -25,26 +26,36 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
+def egress_block() -> tuple[int, list]:
+    """Egress ports are a base plus the handler's port number, so 8 in a row, held open."""
+    while True:
+        base = free_port()
+        held = []
+        try:
+            for number in range(8):
+                out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                held.append(out)
+                out.bind(("127.0.0.1", base + number))
+                out.settimeout(0.5)
+            return base, held
+        except OSError:
+            for out in held:
+                out.close()
+
+
 class Forwarder:
     """Builds examples/forward.lfpl with a route table, and runs it."""
 
     def __init__(self, routes: bytes, workdir: str, limit_lock: bool = False):
+        self.out_base, self.outputs = egress_block()
         self.in_port, self.ctl_port = free_port(), free_port()
-        # Egress ports are out_base + the handler's port number: 8 consecutive free ones.
-        self.out_base = free_port()
-        self.outputs = []
-        for number in range(8):
-            out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            out.bind(("127.0.0.1", self.out_base + number))
-            out.settimeout(0.5)
-            self.outputs.append(out)
         table = os.path.join(workdir, "routes.bin")
         with open(table, "wb") as handle:
             handle.write(routes)
         exe = os.path.join(workdir, "forward")
-        subprocess.run([sys.executable, "-m", "src.lfplo", "examples/forward.lfpl", "-o", exe,
+        subprocess.run([sys.executable, "-m", "src.lfplo", SOURCE, "-o", exe,
                         "--in-port", str(self.in_port), "--out-port", str(self.out_base),
-                        "--ctl-port", str(self.ctl_port), "--routes", table],
+                        "--ctl-port", str(self.ctl_port), "--state", f"routes={table}"],
                        cwd=ROOT, check=True, capture_output=True, text=True)
         self.exe = exe
         limits = (lambda: resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))) if limit_lock else None
