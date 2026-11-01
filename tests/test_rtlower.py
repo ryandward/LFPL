@@ -305,6 +305,15 @@ fn f(k: Bool, a: Diamond, b: Diamond) : List =
         self.assertEqual(self.answer(two_cells(definitions, "f(true, c0, c1)")), 102)
         self.assertEqual(self.answer(two_cells(definitions, "f(false, c0, c1)")), 304)
 
+    def test_a_cell_only_another_arm_wrote_to_is_still_itself(self):
+        """On the path that does not touch it, nothing has to say which constructor it holds."""
+        program = one_cell(TAGGED + """
+fn f(p: Bool, s: S) : (Int8, S) = (1, if p then match s with
+    | A(d, x) => A@d(+(x, 1))
+    | B(d, y) => B@d(y) end else s);""", """let (k, v) = f(false, A@c0(41)) in match v with
+    | A(e, x) => Done@e(pack<32>(x), r1) | B(e, y) => Done@e(0, r1) end""")
+        self.assertEqual(self.answer(program), 41)
+
     def test_a_shift_count_past_the_width_is_legal_and_gives_zero(self):
         self.assertEqual(self.answer(b"""fn f(a: Int8) : Int8 = <<(a, 300);
 fn main() : Int64 = pack<8>(f(5));"""), 0)

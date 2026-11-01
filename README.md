@@ -272,8 +272,17 @@ redundant moves the model says cannot occur. That is a check for waste rather th
 correctness, since a lost store leaves nothing redundant behind and passes it.
 
 Every generator runs through both Lowers, and running them through the new one found six bugs
-in it the moment it was tried on anything but the handler. For a handler, the checks are not
-something you run afterwards. `src/lfplo.py` runs the type check on every line, the symbolic check
+in it the moment it was tried on anything but the handler. Then an independent review, told only
+to report failures it could reproduce, found much worse, because it did not share the author's idea
+of what a program looks like. A single datagram could crash a running binary through a program's
+own definition of `Free`. An `Int8` literal of 300 gave a wrong answer past every check, because it
+was 44 to `+` and not 44 to `==`. The type checker for the RT layer accepted streams that lost
+pointers, forged array indices or skipped stores. And the symbolic check refused most correct
+programs of certain shapes. All of that is fixed and tested. The generators it wrote are now in
+`tests/reference`, each with an interpreter that shares nothing with the compiler, and
+`tests/test_generated.py` runs them on every test run, handlers included, on live sockets.
+
+For a handler, the checks are not something you run afterwards. `src/lfplo.py` runs the type check on every line, the symbolic check
 on the result and an independent recomputation of the stack on the assembly, and any failure
 removes the binary, including one left by an earlier build. The test suite damages the compiled
 handler one instruction at a time, in every way that still parses, and requires the check to
@@ -338,7 +347,8 @@ offers. Its bounds are constants, measured from the code: a handler is refused i
 be reached from it, because the resource analysis that would give a recursive body a bound
 `c·n + d` does not exist. So a handler cannot yet walk its own body, and a checksum is out of
 reach. Arrays hold scalars, have a power-of-two length until division exists, and can be read
-but not written, because `swap` and state slots are not built. There is one handler and one
+but not written, because `swap` and state slots are not built. Tuples are flat, and at most six
+wide, because they are only ever registers. There is one handler and one
 ingress, one datagram per turn, bound to the loopback address. Admission checks size, pool and
 queue, but not deadlines or a program's own predicate, since neither can be declared yet. The
 control port and pausing egress are not in the specification: without a way to look inside and
@@ -356,6 +366,11 @@ passes every generator, but it does not yet match the old one's output everywher
 bound by `let` and then matched is built before it is taken apart, a `match` on a known null still
 tests it, `pack` does not fold constants, and every function adjusts its frame even when the frame
 is empty, because the frame's size is not known until the right-to-left pass exists.
+
+A scalar read after its cell was rebuilt or handed over is refused, with the rule and a way around
+it, because reading forward nothing says at that point that it is wanted later. A good share of
+generated programs stop there, so it is not a corner case: the right-to-left pass in the
+specification is what removes it. A diamond that passes through a join counts as handed over.
 
 The largest gap in the language itself is non-tail recursion over a structure, the model's DESCEND
 and ASCEND, which is rejected for now. A tree therefore cannot be walked by recursing into both

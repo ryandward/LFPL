@@ -1281,9 +1281,28 @@ class FunctionCheck:
             return term
         return self._on_paths(term, path, lambda leaf, p: self._reify_leaf(S, leaf, ty, p, within))
 
+    def _unchanged_on(self, S: State, pointer: int, path: int) -> bool:
+        """On this path, does this cell and everything reached through it hold what it held on
+        entry? Another arm may have written to it, which says nothing about this path."""
+        T = self.T
+        for key, value in S.mem.items():
+            at = key[0]
+            while at != pointer:
+                node = T.nodes[at]
+                if node[0] != "load":
+                    break
+                at = node[1]
+            if at != pointer:
+                continue
+            original = T.load(key[0], key[1], key[2])
+            for cond, leaf in T.paths(value):
+                if leaf != original and T.both(path, cond) != T.ZERO:
+                    return False
+        return True
+
     def _reify_leaf(self, S: State, leaf: int, ty: str, path: int, within: frozenset) -> int:
         T = self.T
-        if leaf == T.ZERO or not self._touched(S, leaf):
+        if leaf == T.ZERO or not self._touched(S, leaf) or self._unchanged_on(S, leaf, path):
             return leaf
         owned = self._dead(S, leaf)
         if owned != T.ZERO:
@@ -1318,6 +1337,8 @@ class FunctionCheck:
             return T.select(cond, hi, lo)
 
         def on_tag(tag_leaf: int, p: int) -> int:
+            if self._unchanged_on(S, leaf, p):  # the tag facts have split the path by now
+                return leaf
             tag = self._tag_of(fact, tag_leaf, info)
             ctor = next((c for c in info.ctors if c.tag == tag), None)
             if ctor is None:
