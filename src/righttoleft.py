@@ -61,7 +61,7 @@ from .check import CELL_FIELDS_MAX, TUPLE_MAX
 from .dyck import (CLOSE, DEFAULT_D_MAX, K_ARM, K_BINDER, K_BOOL, K_CALL, K_CTOR, K_DIAMOND, K_ENUM, K_EOF, K_FIELD, K_FN,
                    K_HANDLER, K_IF, K_INT, K_LET, K_LIVE, K_MATCH, K_NULLCTOR, K_PARAM, K_RECORD, K_RESWORD, K_TARRAY,
                    K_TFIN, K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_VARAT, K_VARLAST, K_WITH, LEAF, OPEN, SEP, VARAT, ev_class,
-                   ev_kind, ev_tag)
+                   ev_kind, ev_tag, FUNCTIONS)
 from .ring import Reject, Stage
 from .spans import CELLS_PER_DEPTH as SPAN_CELLS_PER_DEPTH, Spans
 from .tokens import PAYLOAD_BYTES
@@ -176,7 +176,7 @@ class RightToLeft(Stage):
             self.spans.hold(cls, kind, payload)
             self.ring.drop(self, cell)
             return
-        if not self.in_function and not (cls == OPEN and kind in (K_FN, K_HANDLER)):
+        if not self.in_function and not (cls == OPEN and kind in FUNCTIONS):
             self.ring.replay_line = None
             if cls == OPEN and kind == K_ENUM:
                 self.E.push(0, payload)
@@ -190,7 +190,7 @@ class RightToLeft(Stage):
             stamp, count = self._forward(ev_class(new_tag), ev_kind(new_tag), new_payload)
             self._append(new_tag, new_payload, stamp, count)
         self.ring.drop(self, cell)
-        if cls == CLOSE and kind in (K_FN, K_HANDLER):
+        if cls == CLOSE and kind in FUNCTIONS:
             self.in_function = False
             self.cursor = self.records
             self.live = 0
@@ -261,7 +261,7 @@ class RightToLeft(Stage):
     def _in_exit_position(self) -> bool:
         """Is the expression starting now the last thing this path of the function evaluates?"""
         kind, frame = self._top()
-        if kind in (K_FN, K_HANDLER):
+        if kind in FUNCTIONS:
             return frame.state == S_BODY
         if kind in (K_LET, K_ARM):
             return frame.state == 1 and bool(frame.exit)
@@ -295,7 +295,7 @@ class RightToLeft(Stage):
         return NO_POSITION, 0
 
     def _open(self, kind: int, payload: bytes) -> None:
-        if kind in (K_FN, K_HANDLER):
+        if kind in FUNCTIONS:
             self.in_function = True
             self.fn_name = payload
             self.inferring = kind == K_FN
@@ -331,7 +331,7 @@ class RightToLeft(Stage):
     def _sep(self, kind: int, payload: bytes) -> tuple[int, int]:
         top_kind, frame = self._top()
         index = payload[0]
-        if kind in (K_FN, K_HANDLER):
+        if kind in FUNCTIONS:
             if index == 0:
                 frame.state = S_RESULT
             else:
@@ -470,7 +470,7 @@ class RightToLeft(Stage):
     def _close(self, kind: int) -> None:
         _kind, frame = self._top()
         self.K.pop()
-        if kind in (K_FN, K_HANDLER):
+        if kind in FUNCTIONS:
             self._end_function()
         elif kind == K_TTUPLE:
             pass
@@ -578,7 +578,7 @@ class RightToLeft(Stage):
             else:
                 self.live |= before
                 self.R.pop()
-        elif kind == K_ARM or (kind == K_WITH and index == 2) or (kind in (K_FN, K_HANDLER) and index == 1):
+        elif kind == K_ARM or (kind == K_WITH and index == 2) or (kind in FUNCTIONS and index == 1):
             self._annotate(self.cursor, record, F_LIVE, self.live)
         elif kind == K_LET:
             self._annotate(self.cursor, record, F_LIVE, self.live)
@@ -601,7 +601,7 @@ class RightToLeft(Stage):
         self.cursor += 1
         self.ring.replay_line = line
         cls, kind = ev_class(tag), ev_kind(tag)
-        if cls == SEP and kind in (K_FN, K_HANDLER) and payload[0] == 1 and self.write_at:
+        if cls == SEP and kind in FUNCTIONS and payload[0] == 1 and self.write_at:
             self.after.append((ev_tag(LEAF, K_RESWORD), self.write_at))
         if flags & F_LAST and kind == K_VARAT:
             payload = VARAT.pack(VARAT.unpack_from(payload)[0], 1)

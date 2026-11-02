@@ -25,8 +25,8 @@ from .check import (ATTR_LINEAR, ATTR_WIRE, P_ARM_RT, P_BINDER, P_CALL_RT, P_DIA
 from .dyck import (CC_NAMES, CLOSE, DEFAULT_D_MAX, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP, K_CTOR,
                    K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER, K_IDX, K_IF, K_INT, K_LET, K_LIVE,
                    K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
-                   K_RTDECLMORE, K_TUPLE, K_TYPE, K_VALUE, K_VAR, K_VARLAST, K_WITH, LEAF, OP_NAMES, OPEN, SEP,
-                   VALUE, Lexer, Parser, ev_class, ev_kind)
+                   K_RTDECLMORE, K_TUPLE, K_TURN, K_TYPE, K_VALUE, K_VAR, K_VARLAST, K_WITH, LEAF, OP_NAMES, OPEN,
+                   SEP, VALUE, FUNCTIONS, Lexer, Parser, ev_class, ev_kind)
 from .righttoleft import CELLS_PER_DEPTH, MASK_BITS, RightToLeft
 from .spans import HELD_CELLS
 from .ring import FrameStack, Reject, Ring, Stage
@@ -395,7 +395,7 @@ class RTLower(Stage):
         """Where the expression opening now delivers, as its enclosing construct decides."""
         top = self.F.top()
         kind = top.kind
-        if kind in (K_FN, K_HANDLER):
+        if kind in FUNCTIONS:
             return top.as_dest()
         if kind == K_LET:
             return Dest(D_ANY, count=top.aux) if top.state == 0 else top.as_dest()
@@ -538,9 +538,10 @@ class RTLower(Stage):
     # --- open
 
     def _open(self, kind: int, payload: bytes) -> None:
-        if kind in (K_FN, K_HANDLER):
+        if kind in FUNCTIONS:
             self.fn_name = payload.rstrip(b"\0")
             self.fn_handler = kind == K_HANDLER
+            self.fn_turn = kind == K_TURN
             self.ordinal += 1
             self.next_reg = self.next_label = 0
             self.next_word = 2
@@ -713,6 +714,11 @@ class RTLower(Stage):
         position = top.aux
         top.aux += 1
         self.F.set_top(top)
+        if kind == 2:  # a field of an enum, out of the register the match holds: `off` is which field
+            register = self.fresh()
+            self.i(f"efield r{register}, r{top.reg}, c{top.l2}, {off}")
+            self._push_binder(Binder(Value(V_REG, register, word=self.new_word(), flags=OWNED)))
+            return
         if top.state == 1:  # a known constructor: the names are its field values
             if kind == 0:
                 self._push_binder(Binder(Value(V_CAP, top.reg, off=top.l1, word=top.word,
@@ -864,8 +870,11 @@ class RTLower(Stage):
         self.F.set_top(top)
 
     def _open_arm(self, payload: bytes) -> None:
-        tag, tagged, is_null, arm_index, nctors, ctor = P_ARM_RT.unpack_from(payload)
+        tag, tagged, is_null, arm_index, nctors, ctor, enum = P_ARM_RT.unpack_from(payload)
         match = self.F.top()
+        if enum:
+            self._open_enum_arm(match, tag, arm_index, nctors, ctor)
+            return
         if match.state == 1:
             if ctor != match.l1:
                 self.dead = 1
@@ -899,6 +908,29 @@ class RTLower(Stage):
         self.F.set_top(match)
         self.F.push(Frame(K_ARM, dest=match.dest, d=match.d, count=match.count, t=match.t, f=match.f,
                           reg=match.reg, word=match.word, cell=cell, bmark=len(self.B), l1=known))
+
+    def _open_enum_arm(self, match: Frame, tag: int, arm_index: int, nctors: int, ctor: int) -> None:
+        """An enum is a register. Its tag is read once, and each arm but the last tests it. Every arm then reads the
+        fields it binds out of the register, and lets go of the copy the match made."""
+        self._rollback(match)
+        if nctors > 1:
+            if arm_index == 0:
+                match.aux = self.fresh()
+                self.i(f"etag r{match.aux}, r{match.reg}")
+            if arm_index < nctors - 1:
+                if arm_index > 0:
+                    self.label(match.l1)
+                yes, no = self.new_label(), self.new_label()
+                self.i(f"br e, r{match.aux}, #{tag}, L{yes}, L{no}")
+                self.live = False
+                match.l1 = no
+                self.label(yes)
+            else:
+                self.label(match.l1)
+            self.i(f"drop r{match.aux}")
+        self.F.set_top(match)
+        self.F.push(Frame(K_ARM, state=3, dest=match.dest, d=match.d, count=match.count, t=match.t, f=match.f,
+                          reg=match.reg, word=match.word, cell=self.new_cell(), bmark=len(self.B), l2=ctor))
 
     def _forget_cells_from(self, first: int) -> None:
         """The cells opened since this number are out of scope, and nothing can name them. What
@@ -1396,7 +1428,7 @@ class RTLower(Stage):
 
     def _sep(self, kind: int, payload: bytes) -> None:
         top = self.F.top()
-        if kind in (K_FN, K_HANDLER):
+        if kind in FUNCTIONS:
             self._header()
         elif kind == K_LET:
             self._sep_let(top, payload)
@@ -1407,6 +1439,8 @@ class RTLower(Stage):
         elif kind == K_ARM:
             if top.state == 1:  # every field of a known constructor now has its name
                 self.V.truncate(self.F.at(len(self.F) - 2).vmark)
+            elif top.state == 3:  # every field of an enum has been read out, and its copy is let go
+                self.i(f"drop r{top.reg}")
         elif kind == K_WITH:
             self._sep_with(top, payload)
         elif kind in (K_AND, K_OR):
@@ -1420,7 +1454,7 @@ class RTLower(Stage):
 
     def _header(self) -> None:
         params = [f"r{index} : {_type_text(ty)}" for index, ty in enumerate(self.param_types)]
-        word = "handler" if self.fn_handler else "fn"
+        word = "handler" if self.fn_handler else "turn" if self.fn_turn else "fn"
         at = f" @{self.at}" if self.at is not None else ""
         self.emit(f"{word} f{self.ordinal} {self.fn_name.decode()}({', '.join(params)}) : "
                   f"{_type_text(self.ret_ty)}{at}")
@@ -1433,7 +1467,7 @@ class RTLower(Stage):
     def _close(self, kind: int, payload: bytes) -> None:
         if kind == K_TYPE:  # a tuple type: Check has interned its members into one id
             self.ret_ty = P_TYPE_RT.unpack_from(payload)[0]
-        elif kind in (K_FN, K_HANDLER):
+        elif kind in FUNCTIONS:
             self.F.pop()
             self.B.truncate(0)
             self.U.truncate(0)

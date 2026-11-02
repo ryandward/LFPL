@@ -513,7 +513,7 @@ class SourceParser:
                 self._record()
             elif keyword == "enum":
                 self._enum()
-            elif keyword in ("fn", "handler"):
+            elif keyword in ("fn", "handler", "turn"):
                 self._fn()
             elif keyword == "state":
                 name = self.next()
@@ -1099,6 +1099,8 @@ class SourceMeaning:
         if kind == "ctor":
             return self._ctor(e, env)
         if kind == "match":
+            if self.ev(e[1], env)[1] in {enum for enum, _tag, _fields in self.enums.values()}:
+                return self._match_enum(e, env)
             return self._match(e, env)
         if kind == "with":
             return self._with(e, env)
@@ -1316,6 +1318,29 @@ class SourceMeaning:
             for ctor in reversed(ordered[:-1]):
                 body = run(by_name[ctor.name], leaf, ctor.tag, opaque_fields(ctor, leaf))
                 result = T.select(T.eq(tag_read, T.const(ctor.tag)), body, result)
+            return result
+
+        return T.lift(on_leaf, term), result_ty[0], None
+
+    def _match_enum(self, e: tuple, env: dict) -> tuple:
+        """An enum's tag is its low byte, and each field is its own bytes of the value. The arms are tested in the
+        order they are written, and the last is what is left."""
+        T = self.T
+        _, scrutinee, arms = e
+        term = self.ev(scrutinee, env)[0]
+        result_ty: list = [None]
+
+        def on_leaf(leaf: int) -> int:
+            result = None
+            for name, binders, body in reversed(arms):
+                _enum, tag, fields = self.enums[name]
+                inner = dict(env)
+                for binder, (_f, fty, off, size) in zip(binders, fields):
+                    inner[binder] = (T.trunc(size, T.shr(leaf, T.const(8 * off))), _norm(fty), None)
+                value, arm_ty, _ = self.ev(body, inner)
+                result_ty[0] = _joined(result_ty[0], arm_ty)
+                result = value if result is None else T.select(T.eq(T.trunc(1, leaf), T.const(tag)), value, result)
+            assert result is not None
             return result
 
         return T.lift(on_leaf, term), result_ty[0], None

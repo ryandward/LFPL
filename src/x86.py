@@ -118,7 +118,7 @@ _LOC = re.compile(r"r(\d+)\[(\d+):(\d+)\]$")
 _LIT = re.compile(r"#(\d+)$")
 _INNER = re.compile(r"\[(\d+):(\d+)\]$")
 _FUNC = re.compile(r"(\w+)\(\s*\[(\d+):(\d+)\]\s*,\s*(.+)\)$")
-_HEADER = re.compile(r"(?:fn|handler) (f\d+) (\w+)\((.*)\) : (\S+)(?: @(\d+))?$")
+_HEADER = re.compile(r"(?:fn|handler|turn) (f\d+) (\w+)\((.*)\) : (\S+)(?: @(\d+))?$")
 _LABEL = re.compile(r"(L\d+):\s*(.*)$")
 _X86_OP = {"add": "add", "sub": "sub", "mul": "imul", "and": "and", "or": "or", "xor": "xor"}
 
@@ -493,7 +493,7 @@ class Backend:
             if self._only_a_jump(head, rest):
                 return
             self._place_waiting()
-        if head in ("fn", "handler"):
+        if head in ("fn", "handler", "turn"):
             self._header(text)
         elif head == "end":
             self._end()
@@ -878,6 +878,24 @@ class Backend:
         for bits, place in zip(widths[position:], places[position:]):
             self.ins("shl", register, str(bits))
             self._or_into(register, bits // 8, place)
+        self._define(a[0], register)
+
+    def i_etag(self, a: list[str]) -> None:
+        x, pins = self._operand(a[1], frozenset())
+        assert isinstance(x, Reg), x
+        register = self._take(pins)
+        self.ins("movzx", self.sub(register, 4), self.sub(x.name, 1))
+        self._define(a[0], register)
+
+    def i_efield(self, a: list[str]) -> None:
+        """The field's bytes, shifted down to the bottom, and nothing above them."""
+        _tag, fields = self.ctors[a[2]]
+        off, size = fields[int(a[3])]
+        x, pins = self._operand(a[1], frozenset())
+        register = self._take(pins)
+        self._load(register, x)
+        self.ins("shr", register, str(8 * off))
+        self._narrow(register, size)
         self._define(a[0], register)
 
     def i_enum(self, a: list[str]) -> None:

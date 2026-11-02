@@ -438,10 +438,138 @@ fn h(v: Verdict) : (Verdict, Verdict, Verdict) = let w = g(v) in (g(w), w, v);
         check_stream(lines)
 
 
+class MatchingAnEnum(unittest.TestCase):
+    """An arm of a match on an enum binds its constructor's fields, and there is no cell to bind first."""
+
+    CODE = VERDICT + """fn code(v: Verdict) : Int64 = match v with Malformed => 1 | Expired => 2 | Send(p) => +(pack<8>(p), 100) end;
+"""
+
+    def test_each_arm_is_taken_by_its_tag(self):
+        source = self.CODE + "fn main() : Int64 = +(*(code(Send(7)), 1000), +(*(code(Expired), 10), code(Malformed)));\n"
+        self.assertEqual(answer(self, source), 107021)
+
+    def test_fields_at_every_offset(self):
+        source = """enum Wide = A(x: Int8, y: Int16, z: Int32) | B(w: Int32) | C;
+fn sum(v: Wide) : Int64 = match v with
+  | A(x, y, z) => +(pack<8>(x), +(*(pack<16>(y), 256), *(pack<32>(z), 16777216)))
+  | B(w) => pack<32>(w)
+  | C => 9 end;
+fn main() : Int64 = +(sum(A(0x12, 0x3456, 0x789A)), +(sum(B(0xFFFFFFFF)), sum(C)));
+"""
+        self.assertEqual(answer(self, source), (0x12 + 0x3456 * 256 + 0x789A * 16777216 + 0xFFFFFFFF + 9) % (1 << 64))
+
+    def test_the_arms_can_be_in_any_order(self):
+        source = self.CODE.replace("Malformed => 1 | Expired => 2 | Send(p) => +(pack<8>(p), 100)",
+                                   "Send(p) => +(pack<8>(p), 100) | Malformed => 1 | Expired => 2")
+        source += "fn main() : Int64 = +(*(code(Send(7)), 1000), +(*(code(Expired), 10), code(Malformed)));\n"
+        self.assertEqual(answer(self, source), 107021)
+
+    def test_one_built_and_matched_in_the_same_function(self):
+        source = VERDICT + """fn f(x: Int8, y: Bool) : Int64 = match if y then Send(x) else Expired with
+  Send(p) => pack<8>(p) | Expired => 77 | Malformed => 88 end;
+fn main() : Int64 = +(*(f(5, true), 1000), f(5, false));
+"""
+        self.assertEqual(answer(self, source), 5077)
+
+    def test_a_field_named_like_an_outer_name(self):
+        source = VERDICT + """fn f(p: Int8, v: Verdict) : Int64 = match v with Send(p) => pack<8>(p) | Expired => 0 | Malformed => 1 end;
+fn main() : Int64 = f(3, Send(9));
+"""
+        self.assertEqual(answer(self, source), 9)
+
+    def test_its_tag_is_read_once_and_each_field_where_it_is(self):
+        lines = rt(self.CODE)
+        body = [line.strip() for line in lines[next(i for i, l in enumerate(lines) if l.startswith("fn")):]]
+        self.assertEqual(len([line for line in body if line.startswith("etag")]), 1, body)
+        self.assertEqual(len([line for line in body if line.startswith("efield")]), 1, body)
+
+    def test_one_constructor_needs_no_test(self):
+        lines = rt("enum One = Only(a: Int16);\nfn f(v: One) : Int16 = match v with Only(a) => a end;\n")
+        body = [line.strip() for line in lines[next(i for i, l in enumerate(lines) if l.startswith("fn")):]]
+        self.assertFalse([line for line in body if line.startswith(("etag", "br"))], body)
+
+
+class WhoCallsWhat(unittest.TestCase):
+    """A handler is an entry point, and the runtime's turn is the one thing that may call it. Nothing calls a turn."""
+
+    HANDLER = VERDICT + FRAME + """handler h(f: Frame, free: Free) : (Verdict, Frame, Free) =
+  match f with Frame(d, a, ttl, length, body) => (Expired, Frame@d {}, free) end;
+"""
+
+    def test_a_turn_calls_a_handler(self):
+        rt(self.HANDLER + "turn t(f: Frame, free: Free) : (Verdict, Frame, Free) = h(f, free);\n")
+
+    def test_nothing_else_does(self):
+        with self.assertRaisesRegex(Reject, "only the runtime's turn can call one"):
+            rt(self.HANDLER + "fn g(f: Frame, free: Free) : (Verdict, Frame, Free) = h(f, free);\n")
+
+    def test_nothing_calls_a_turn(self):
+        for caller in ("fn", "turn"):
+            with self.subTest(caller), self.assertRaisesRegex(Reject, "nothing can call one"):
+                rt(f"turn t(x: Int8) : Int8 = x;\n{caller} f(x: Int8) : Int8 = t(x);\n")
+
+
+class RuleR3AndAFree(unittest.TestCase):
+    """R3 does not count a Free anywhere a handler can reach. After the handler, which nothing there can be, it does:
+    the runtime's turn gives the reserve a handler returns back to its pool, and that is a walk over it."""
+
+    HANDLER = VERDICT + FRAME + """handler h(f: Frame, free: Free) : (Verdict, Frame, Free) =
+  match f with Frame(d, a, ttl, length, body) => (Expired, Frame@d {}, free) end;
+"""
+    PRELUDE = "data Free2 = None2 | More2(next: Free2);\n"
+    GIVE = ("fn give(free: Free, acc: Free2) : Free2 = match free with End => acc "
+            "| More(c, rest) => give(rest, More2@c(acc)) end;\n")
+
+    def test_not_where_a_handler_can_reach(self):
+        with self.assertRaisesRegex(Reject, "rule R3"):
+            rt(self.PRELUDE + self.GIVE + self.HANDLER)
+
+    def test_after_the_handler(self):
+        self.assertIn("end decreasing 0", rt(self.PRELUDE + self.HANDLER + self.GIVE))
+
+    def test_after_the_handler_what_else_shrinks_carries_it(self):
+        both = """fn give2(l: Free2, acc: Free2) : Free2 = match l with None2 => acc | More2(c, rest) => give2(rest, More2@c(acc)) end;
+fn both(free: Free, l: Free2, acc: Free2) : Free2 = match free with
+  | End => give2(l, acc)
+  | More(c, rest) => match l with
+      | None2 => give(rest, More2@c(acc))
+      | More2(e, t) => both(rest, t, More2@c(More2@e(acc)))
+    end end;
+"""
+        self.assertIn("end decreasing 1", rt(self.PRELUDE + self.HANDLER + self.GIVE + both))
+
+    def test_a_walk_that_draws_from_the_reserve_is_carried_by_what_it_walks(self):
+        """The reserve and the chain both shrink at each call, and the chain carries the walk."""
+        source = """data Bytes = Last | Chunk(used: Int8, b0: Int8, b1: Int8, b2: Int8, b3: Int8, b4: Int8, b5: Int8, b6: Int8, next: Bytes);
+record P { port: Int8, length: Int16, body: Bytes };
+data Out = Gone | Send(port: Int8, body: Bytes);
+fn copy(free: Free, l: Bytes, acc: Bytes) : (Free, Bytes, Bytes) = match l with
+  | Last => (free, Last, acc)
+  | Chunk(d, used, b0, b1, b2, b3, b4, b5, b6, next) => match free with
+      | End => (End, Chunk@d(used, b0, b1, b2, b3, b4, b5, b6, next), acc)
+      | More(c, rest) => copy(rest, next, Chunk@c(used, b0, b1, b2, b3, b4, b5, b6, Chunk@d(used, b0, b1, b2, b3, b4, b5, b6, acc)))
+      end
+  end;
+fn back(l: Bytes, free: Free) : Free = match l with Last => free | Chunk(d, used, b0, b1, b2, b3, b4, b5, b6, next) => back(next, More@d(free)) end;
+handler h(p: P, free: Free) : (Out, Free) = match p with P(d, port, length, body) =>
+  let (f, rest, copied) = copy(free, body, Last) in (Send@d(port, copied), back(rest, f)) end;
+"""
+        self.assertRegex(report(self, source), r"R\(n\) = \d+ n")
+        self.assertIn("end decreasing 1", rt(source))
+
+
 class RefusedVerdicts(unittest.TestCase):
-    def test_matching_one_is_not_built_yet(self):
+    def test_a_match_that_misses_a_constructor(self):
+        refused(self, VERDICT + "fn f(v: Verdict) : Int8 = match v with Malformed => 0 | Send(p) => p end;\n",
+                "non-exhaustive match on Verdict")
+
+    def test_an_arm_that_binds_a_cell(self):
         refused(self, VERDICT + "fn f(v: Verdict) : Int8 = match v with Malformed => 0 | Expired => 1 "
-                                "| Send(p) => p end;\n", "Verdict is an enum.*section 12")
+                                "| Send(d, p) => p end;\n", "pattern has too many binders: expected 1")
+
+    def test_an_arm_of_another_type(self):
+        refused(self, VERDICT + "data L = N | C(v: Int8);\nfn f(v: Verdict) : Int8 = match v with N => 0 "
+                                "| Expired => 1 | Send(p) => p end;\n", "N is not a constructor of Verdict")
 
     def test_it_cannot_be_stored_in_a_cell_yet(self):
         refused(self, VERDICT + "record R { v: Verdict, a: Int8 };\n", "an enum cannot be stored in a cell")
@@ -522,6 +650,22 @@ class WhatRtcheckRefuses(unittest.TestCase):
         head = self.HEAD + ["type t60001 tagless L", "ctor c3 t60001 null N", "ctor c4 t60001 - C",
                             "field c4 0 8 i64 v"]
         self.refused(["fn f0 f() : t60001", "    enum r0, c3", "    ret r0", "end"], "not an enum", head)
+
+    def test_its_tag_and_its_fields(self):
+        check_stream(self.HEAD + ["fn f0 f(r0 : t60000) : i8", "    etag r1, r0", "    efield r2, r0, c2, 0",
+                                  "    drop r1", "    ret r2", "end"])
+
+    def test_a_field_of_another_enums_constructor(self):
+        head = self.HEAD + ["type t60001 enum F", "ctor c3 t60001 0 G", "field c3 1 1 i8 y"]
+        self.refused(["fn f0 f(r0 : t60000) : i8", "    efield r1, r0, c3, 0", "    ret r1", "end"], "not a constructor",
+                     head)
+
+    def test_a_field_of_a_constructor_it_does_not_have(self):
+        self.refused(["fn f0 f(r0 : t60000) : i8", "    efield r1, r0, c2, 1", "    ret r1", "end"], "field")
+        self.refused(["fn f0 f(r0 : t60000) : i8", "    efield r1, r0, c1, 0", "    ret r1", "end"], "field")
+
+    def test_a_tag_of_what_is_not_an_enum(self):
+        self.refused(["fn f0 f(r0 : i64) : i8", "    etag r1, r0", "    ret r1", "end"], "enum")
 
     def test_compared_or_computed_with(self):
         self.refused(["fn f0 f(r0 : t60000) : bool", "    cmp r1, e, r0, #0", "    ret r1", "end"], "enum")

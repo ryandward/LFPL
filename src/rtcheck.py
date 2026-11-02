@@ -97,11 +97,14 @@ class ResourceProgram:
     item: Optional[int]
     entry: int
     n_max: int
+    sizes: Optional[Mapping[int, int]] = None  # a turn's: the unknown per cell of each sized parameter, and its cells
 
     def objective(self) -> dict[int, int]:
-        """Section 5.5: the bound at the largest item."""
+        """Section 5.5: the bound at the largest item, or for a turn, with every sized parameter at its largest."""
         objective = {self.entry: 1}
-        if self.item is not None:
+        if self.sizes is not None:
+            objective.update(self.sizes)
+        elif self.item is not None:
             objective[self.item] = self.n_max
         return objective
 
@@ -192,6 +195,10 @@ class Signature:
     recursive: bool = False
     too_large: bool = False
     makes_a_free: bool = False      # on a path that can run: see _made
+    turn: bool = False              # the runtime's turn: see turn_program
+    # The inequalities past a reserve's End arm, which DRAW leaves out of a handler's bound. A turn counts its own
+    # helpers': the Free it walks is what a handler gave back, and that one does run out.
+    beyond_end: dict = field(default_factory=dict)
 
 
 def _args(text: str) -> list[str]:
@@ -217,7 +224,7 @@ _LOC = re.compile(r"r(\d+)\[(\d+):(\d+)\]$")
 _LIT = re.compile(r"#(\d+)$")
 _INNER = re.compile(r"\[(\d+):(\d+)\]$")
 _FUNC = re.compile(r"(\w+)\(\s*\[(\d+):(\d+)\]\s*,\s*(.+)\)$")
-_HEADER = re.compile(r"(fn|handler) (f\d+) (\w+)\((.*)\) : (\S+)(?: @(\d+))?$")
+_HEADER = re.compile(r"(fn|handler|turn) (f\d+) (\w+)\((.*)\) : (\S+)(?: @(\d+))?$")
 _LABEL = re.compile(r"(L\d+):\s*(.*)$")
 
 
@@ -269,6 +276,42 @@ class Checker:
         handler = self._handler_named(name)
         return ResourceProgram(self._rows(handler), handler.param_pots[-2], handler.entry, n_max)
 
+    def turn_program(self, name: str, sizes: Mapping[int, int]) -> ResourceProgram:
+        """A turn's linear program. Each parameter in `sizes` is given an amount per cell, at the most cells it can
+        hold, and every other parameter that holds cells is given nothing, since nothing bounds how many it holds:
+        the pool. So the bound is for the whole turn, whatever its item, and it holds of every turn on its own."""
+        turn = self._handler_named(name)
+        if not turn.turn:
+            raise RTError(f"{name} is not a turn")
+        if turn.too_large:
+            raise Unbounded(f"section 8.2: {name} and what it calls come to more than {MAX_OBLIGATIONS} inequalities")
+        rows = {**turn.obligations, **turn.beyond_end}
+        weights = {}
+        for position, pot in enumerate(turn.param_pots):
+            if pot is None:
+                continue
+            if position in sizes:
+                weights[pot] = sizes[position]
+            else:
+                rows[Budget(((pot, -1),))] = None
+        return ResourceProgram(tuple(rows), None, turn.entry, 0, weights)
+
+    def verify_turn(self, name: str, sizes: Mapping[int, int], steps: Mapping[int, Fraction]) -> Bound:
+        """The certificate for a turn's steps, checked in every inequality: W, with c = 0, since it is for any item."""
+        program = self.turn_program(name, sizes)
+        if any(value < 0 for value in steps.values()):
+            raise RTError(f"the certificate for {name} gives an unknown a negative number of steps")
+        for row in program.rows:
+            total = sum((coefficient * Fraction(steps.get(unknown, 0)) for unknown, coefficient in row.terms),
+                        Fraction(row.steps))
+            if total < 0:
+                raise RTError(f"the certificate for {name} falls {-total} steps short at {self._show_row(row)}")
+        whole = sum((Fraction(weight) * Fraction(steps.get(unknown, 0))
+                     for unknown, weight in program.objective().items()), Fraction(0))
+        bound = Bound(0, 0, 0, math.ceil(whole))
+        self.certified[name] = bound
+        return bound
+
     def verify(self, name: str, cells: Mapping[int, Fraction], steps: Mapping[int, Fraction]) -> Bound:
         """The certificate: proposed numbers for each resource. They are evaluated in every
         inequality this module derived, so nothing is taken from whoever proposed them."""
@@ -315,19 +358,19 @@ class Checker:
     def _pot_for(self, ty: Type) -> Optional[int]:
         return self.unknown() if self._carries(ty) else None
 
-    def obligate(self, row: Budget) -> None:
+    def obligate(self, row: Budget, *, beyond_end: bool = False) -> None:
         fn = self.fn
         assert fn is not None
-        if self.S is not None and self.S.unreachable:
-            return
         if not row.terms and row.cells >= 0 and row.steps >= 0:
             return
         if fn.too_large:
             return
-        fn.obligations[row] = None
-        if len(fn.obligations) > MAX_OBLIGATIONS:
+        held = fn.beyond_end if beyond_end or (self.S is not None and self.S.unreachable) else fn.obligations
+        held[row] = None
+        if len(fn.obligations) + len(fn.beyond_end) > MAX_OBLIGATIONS:
             fn.too_large = True
             fn.obligations = {}
+            fn.beyond_end = {}
 
     def _made(self, ty: Type) -> None:
         """DRAW leaves the End arm out because a reserve of R(n) cells does not reach it, and that
@@ -654,7 +697,7 @@ class Checker:
                 raise self.fail("a declaration inside a function")
             self._declaration(head, rest.split())
             return
-        if head in ("fn", "handler"):
+        if head in ("fn", "handler", "turn"):
             self._header(text)
             return
         if self.fn is None:
@@ -683,7 +726,7 @@ class Checker:
             raise self.fail("a function inside a function")
         kind, ordinal, name, params, ret, at = match.groups()
         parts = _args(params)
-        signature = Signature(ordinal, name, [], ret, int(at) if at else None, kind == "handler")
+        signature = Signature(ordinal, name, [], ret, int(at) if at else None, kind == "handler", turn=kind == "turn")
         signature.entry = self.unknown()
         regs = {}
         for position, part in enumerate(parts):
@@ -857,6 +900,29 @@ class Checker:
             if is_enum(ty):
                 raise self.fail(f"a pack field {operand} is an enum, and a field is an integer")
         self.set(a[0], Tok("i64", self.fresh()))
+
+    def _an_enum(self, text: str, what: str) -> tuple:
+        token = self.scalar(text, what)
+        if not is_enum(token.ty):
+            raise self.fail(f"{what} {text} is {token.ty}, and only an enum holds its tag and fields in a register")
+        return token.ty
+
+    def i_etag(self, a: list[str]) -> None:
+        """etag d, e: the tag of an enum, which is its low byte."""
+        self._an_enum(a[1], "etag's operand")
+        self.set(a[0], Tok("i8", self.fresh()))
+
+    def i_efield(self, a: list[str]) -> None:
+        """efield d, e, c, i: field i of constructor c, out of an enum. It reads bits, so it is defined whatever
+        the tag says, and what it means when the tag is another constructor's is the symbolic check's business."""
+        ty = self._an_enum(a[1], "efield's operand")
+        ctor = self._ctor_of(a[2])
+        if self._resolve(ctor.type) != ty[1]:
+            raise self.fail(f"efield of {ctor.name}, which is not a constructor of {ty[1]}")
+        index = int(a[3])
+        if not 0 <= index < len(ctor.fields):
+            raise self.fail(f"efield: {ctor.name} has no field {index}")
+        self.set(a[0], Tok(ctor.fields[index][2], self.fresh()))
 
     def i_enum(self, a: list[str]) -> None:
         """enum d, c, a...: a value of an enum, in a register, from its constructor and a scalar per field."""
@@ -1249,6 +1315,10 @@ class Checker:
             fn.makes_a_free = fn.makes_a_free or callee.makes_a_free
         for row in callee.obligations:
             self.obligate(Budget(tuple(sorted((copy(u), c) for u, c in row.terms)), row.cells, row.steps))
+        if not (fn.turn and callee.handler):  # a turn hands its handler a reserve of R(n) cells: DRAW holds there
+            for row in callee.beyond_end:
+                self.obligate(Budget(tuple(sorted((copy(u), c) for u, c in row.terms)), row.cells, row.steps),
+                              beyond_end=True)
         return replace(callee, entry=copy(callee.entry),
                        param_pots=[copy_pot(pot) for pot in callee.param_pots],
                        result_pots=[copy_pot(pot) for pot in callee.result_pots])

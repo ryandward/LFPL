@@ -74,6 +74,11 @@ ordinal the callers use, the name, and the types:
 
     fn f3 inc(r0 : t30) : t30 @0
     handler f4 forward(r0 : t32768, r1 : t17, r2 : t30) : t32770
+    turn f9 serve(r0 : t40, r1 : t17, r2 : t45, r3 : i16, r4 : bool) : t32771
+
+A `turn` is the runtime's own entry point on the hardware target, the one function that may call a handler. Its
+bound is certified for any item: each parameter the backend names a size for gets an amount per cell, at that size,
+and every other one that holds cells gets nothing.
 
 ## Operands
 
@@ -102,6 +107,10 @@ Each rule reads: tokens required `-->` tokens left. Tokens not named are untouch
     pack d, <W...>, a...  a_i scalar, free d    -->  d = fresh : Int 64
     enum d, c, a...     c a constructor of an enum E, each a_i : Int W at its field's width, free d
                                                 -->  d = fresh : E
+    etag d, e           e : E an enum, free d   -->  d = fresh : Int 8, its tag
+    efield d, e, c, i   e : E, c a constructor of E with a field i of Int W, free d
+                                                -->  d = fresh : Int W. It reads bits, so it is defined
+                                                     whatever the tag is
 
 `f` is add, sub, mul, and, or, xor, shl or shr, with the meaning LFPL-O section 4.4 gives
 them at width W, so `shl` and `shr` are 0 when the count reaches W. No instruction has a
@@ -323,6 +332,7 @@ partial result is ever special. All the failures Phase 1 reports about registers
                            comes into a register
     enum                   the tag and every literal field, as one immediate; then each other field,
                            which is zero extended already, shifted into place through scratch and or'd in
+    etag, efield           movzx of the low byte; mov, shr by the field's offset, then movzx or mov r32
     idx                    mov d, a; and d, N - 1
     aget                   a sized mov through [a + i * s]
     br                     cmp; jcc, with the fall-through chosen by the next label. On two literals, a
@@ -373,7 +383,8 @@ byte. No state uses both.
     const, copy, op,   one state, one <=. Verilog's << and >> are already 0 past the width, and a
       cmp, trunc,      literal is written at the width it meets. bswap is nothing but wires: a
       pack, idx,       concatenation of the same bytes the other way round, and so is enum: the tag,
-      bswap, enum      each field at its bytes, and zeros between
+      bswap, enum,     each field at its bytes, and zeros between. etag and efield are slices
+      etag, efield
     read, take         one state: a slice of port A's output, latched
     build              one state: one write, whose byte enables cover exactly the sources that are
                        not `=`, `r!` or `*`, and the tag on `write`. RTL-3 is then a property of this

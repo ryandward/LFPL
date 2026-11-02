@@ -4,7 +4,10 @@ Linear variables (diamond, data, records) are used exactly once on every path.
 Scalars are erasable, and reading one does not consume it.
 
 Rule R3 makes every function terminate. For some fixed set of linear argument positions,
-not counting Free, the total number of cells must strictly fall at every recursive call.
+not counting Free, the total number of cells must strictly fall at every recursive call. A
+function declared after the program's handler is the exception: no handler can reach it, since
+a callee comes before its caller, so the Free it walks is one a handler gave back, and the
+runtime's turn has to give that back to its pool. There a Free counts, when nothing else falls.
 That number is mu(C@e(args)) = 1 + the sum of mu over its linear args, and a match
 replaces mu(x) with 1 + the sum of mu over the fields, or with 0 in a null arm. So each
 value's count is a linear form, and comparing two is arithmetic. A count that cannot be
@@ -42,7 +45,8 @@ from .dyck import (CLOSE, ELEMENT_CODES, OP_NAMES, K_AND, K_ARM, K_BINDER, K_BIN
                    K_CTOR, K_CTORDECL, K_DATA, K_DIAMOND, K_ENUM, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER,
                    K_IDX, K_IF, K_INT, K_LET, K_LIVE, K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR,
                    K_PACK, K_PARAM, K_RECORD, K_RESWORD, K_RTDECL, K_RTDECLMORE, K_STATE, K_TARRAY, K_TFIN,
-                   K_TTUPLE, K_TUPLE, K_TYPE, K_VALUE, K_VAR, K_VARAT, K_VARLAST, K_WITH, LEAF, OPEN, SEP, VALUE,
+                   K_TTUPLE, K_TUPLE, K_TURN, K_TYPE, K_VALUE, K_VAR, K_VARAT, K_VARLAST, K_WITH, LEAF, OPEN, SEP, VALUE,
+                   FUNCTIONS,
                    VARAT, ev_class, ev_kind, ev_tag)
 from .ring import FrameStack, Reject, Ring, Stage
 from .tokens import PAYLOAD_BYTES
@@ -90,7 +94,8 @@ P_FIELD = struct.Struct("<BBBB")  # index, off, size, attributes
 P_BINDER = struct.Struct("<BBBB")  # 0 for diamond or 1 for a field, off, size, attributes
 P_PARAM_RT = struct.Struct("<HBBH")      # src index, size, linear, type
 P_DIAMOND_RT = struct.Struct("<HBBBBBBH")  # d src, tag, tagged, nfields, off, size, attributes, the constructor
-P_ARM_RT = struct.Struct("<BBBBBH")      # tag, tagged, is the null constructor, arm index, nctors, the constructor
+P_ARM_RT = struct.Struct("<BBBBBHB")     # tag, tagged, is the null constructor, arm index, nctors, the constructor,
+                                         # and whether it is an enum's, in a register, with no cell
 P_LET_RT = struct.Struct("<BBBB")        # separator 1, linear, size, how many names it binds
 P_CALL_RT = struct.Struct("<HBBBB")      # function ordinal, is self, argument count, result count, @k + 1 or 0
 P_WITH_RT = struct.Struct("<BBBHBB")     # off, size, attributes, the constructor, its position and count
@@ -112,7 +117,7 @@ class Cells(NamedTuple):
 
 
 OPAQUE = Cells(opaque=True)
-RESERVE_TYPE = b"Free"  # the reserve is never a measure: an item's work is paid by the item
+RESERVE_TYPE = b"Free"  # never a measure where a handler can reach: an item's work is paid by the item
 
 
 def is_linear(ty: int) -> bool:
@@ -171,6 +176,7 @@ class CheckStage(Stage):
         self.viable = 0           # R3: subsets of positions that fell at every call so far
         self.pending_name = b""
         self.child_seen = False
+        self.after_handler = False  # a handler has been declared, so nothing declared from here on is one it reaches
 
     def attach(self, ring: Ring) -> None:
         super().attach(ring)
@@ -732,14 +738,16 @@ class CheckStage(Stage):
         if kind == K_TTUPLE:
             self._frame(K_TTUPLE, c1=len(self.TM))
             return None
-        if kind in (K_FN, K_HANDLER):
+        if kind in FUNCTIONS:
             if self._g_find(E_FUNC, payload) is not None:
                 raise self._reject("duplicate function name")
             if payload.rstrip(bytes(1)) in _PRIMITIVES:
                 raise self._reject(f"{payload.rstrip(bytes(1)).decode()} is a primitive")
             self.fn_handler = kind == K_HANDLER
+            self.fn_turn = kind == K_TURN
             self.fn_recursive = False
-            self.fn_self = self._g_push(E_FUNC, payload, b=self.fn_handler, x=self.fn_count)
+            # b says what may call it: 0 any function, 1 a handler, which only a turn may, and 2 a turn, which nothing may
+            self.fn_self = self._g_push(E_FUNC, payload, b=2 if self.fn_turn else int(self.fn_handler), x=self.fn_count)
             self.used = self.lin_held = 0
             self.fn_at = 0
             self.entry = []
@@ -768,8 +776,10 @@ class CheckStage(Stage):
                     f"unknown function {payload.rstrip(bytes(1)).decode()}: a callee "
                     f"is defined before its caller, so the call graph stays acyclic")
             _, nparams, is_handler, at, _d, ordinal, ret, first = self._g(found)
-            if is_handler:
-                raise self._reject("a handler is an entry point, and nothing can call one")
+            if is_handler == 2:
+                raise self._reject("a turn is the runtime's entry point, and nothing can call one")
+            if is_handler and not self.fn_turn:
+                raise self._reject("a handler is an entry point, and only the runtime's turn can call one")
             self._frame(K_CALL, a=nparams, b=found == self.fn_self, t1=ret, c1=first)
             self.child_seen = False
             results = len(self._tuple_of(ret)) if self._is_tuple(ret) else 1
@@ -810,7 +820,8 @@ class CheckStage(Stage):
     def _open_arm(self, payload: bytes):
         frame = self._top()
         found = self._g_find(E_CTOR, payload)
-        type_index = frame[2] - FIRST_NAMED
+        enum = is_enum(frame[2])
+        type_index = frame[2] - (FIRST_ENUM if enum else FIRST_NAMED)
         if found is None or self._g(found)[5] != type_index:
             raise self._reject(f"{payload.rstrip(bytes(1)).decode()} is not a constructor "
                                f"of {self._show(frame[2])}")
@@ -833,18 +844,19 @@ class CheckStage(Stage):
             if position is not None:
                 saved = self.entry[position]
                 self.entry[position] = Cells(saved.constant + (not is_null), saved.unknowns & ~bit)
-        self._frame(K_ARM, a=0 if is_null else count + 1,
+        # An enum's arm binds its fields, and nothing else: there is no cell.
+        self._frame(K_ARM, a=count if enum else 0 if is_null else count + 1,
                     t1=0 if position is None else position + 1,
                     t2=0 if saved is None else saved.constant, c1=len(self.B), c2=found,
-                    m1=0 if saved is None else saved.unknowns)
-        return K_ARM, P_ARM_RT.pack(tag, tagged, is_null, arm_index, nctors, found)
+                    m1=0 if saved is None else saved.unknowns, m2=enum)
+        return K_ARM, P_ARM_RT.pack(tag, tagged, is_null, arm_index, nctors, found, enum)
 
     # --- sep
 
     def _on_sep(self, kind: int, payload: bytes):
         frame = self._top()
         index = payload[0]
-        if kind in (K_FN, K_HANDLER):
+        if kind in FUNCTIONS:
             if index == 0:
                 frame[0] = 1  # parameters finished; the next type is the result
                 self._store(frame)
@@ -899,16 +911,13 @@ class CheckStage(Stage):
                 self.used = frame[6]
             self._store(frame)
         elif kind == K_MATCH:
-            if is_enum(self.ty):
-                raise self._reject(f"{self._show(self.ty)} is an enum, held in a register, and matching one is "
-                                   f"not built yet: section 12")
-            if self.ty < FIRST_NAMED or is_composite(self.ty):
+            if self.ty < FIRST_NAMED or (is_composite(self.ty) and not is_enum(self.ty)):
                 raise self._reject(f"cannot match on {self._show(self.ty)}")
             frame[2] = self.ty
-            # R3: only a value whose count is exactly one unknown can have it expanded
+            # R3: only a value whose count is exactly one unknown can have it expanded. An enum has no cells.
             form = self.form
             single = (form.constant == 0 and not form.opaque and form.unknowns
-                      and not form.unknowns & form.unknowns - 1)
+                      and not form.unknowns & form.unknowns - 1 and not is_enum(self.ty))
             frame[4] = form.unknowns.bit_length() if single else 0
             frame[6] = self.used
             self._store(frame)
@@ -1008,14 +1017,19 @@ class CheckStage(Stage):
         """Every nonempty set of linear positions, as a bit per subset. A set of positions
         is a number below 64, because a function has at most 6 parameters."""
         positions = 0
+        self.reserves = 0  # the positions that are a Free
         for position in range(nparams):
             ty = self._g(first + position)[5]
             if is_composite(ty):
                 continue  # an array has a fixed size: it can never be what shrinks
-            if is_linear(ty) and not (
-                    ty >= FIRST_NAMED and self.G.at(ty - FIRST_NAMED)[1][:PAYLOAD_BYTES].rstrip(b"\0")
-                    == RESERVE_TYPE):
+            if is_linear(ty):
+                reserve = (ty >= FIRST_NAMED
+                           and self.G.at(ty - FIRST_NAMED)[1][:PAYLOAD_BYTES].rstrip(b"\0") == RESERVE_TYPE)
+                if reserve and not self.after_handler:
+                    continue
                 positions |= 1 << position
+                if reserve:
+                    self.reserves |= 1 << position
         sets = 0
         for subset in range(1, 1 << nparams):
             if not subset & ~positions:
@@ -1045,12 +1059,13 @@ class CheckStage(Stage):
                 f"recursive call so far, not counting Free, so nothing shows the recursion ends")
 
     def _decreasing_set(self) -> int:
-        """The set of positions rule R3 settled on, which the RT layer's potential sits on: the
-        smallest, since a smaller set asks less of its callers. 0 if nothing recursed."""
+        """The set of positions rule R3 settled on, which the RT layer's potential sits on: one with no Free if
+        there is one, since a reserve carries nothing, and then the smallest, since a smaller set asks less of
+        its callers. 0 if nothing recursed."""
         if not self.fn_recursive:
             return 0
         sets = [s for s in range(1, 64) if self.viable >> s & 1]
-        return min(sets, key=lambda s: (bin(s).count("1"), s))
+        return min(sets, key=lambda s: (bool(s & self.reserves), bin(s).count("1"), s))
 
     def _falls(self, subset: int, args: list[Cells]) -> bool:
         """before - after must be at least 1 whatever the unknowns are, and they can all be
@@ -1172,6 +1187,10 @@ class CheckStage(Stage):
             raise self._reject(f"pattern has too many binders: expected {frame[0]}")
         frame[1] = position + 1
         self._store(frame)
+        if frame[7]:  # an enum's field, which Lower reads out of the register by its index
+            field = self._g(frame[5] + 1 + position)
+            self._bind(payload, value_of(field[7]))
+            return K_BINDER, P_BINDER.pack(2, position, field[2], 0)
         if position == 0:
             self._bind(payload, T_DIAMOND)
             return K_BINDER, P_BINDER.pack(0, 0, 8, 1)
@@ -1241,10 +1260,11 @@ class CheckStage(Stage):
             self.K.pop()
             self.child_seen = True
             return kind, P_GET_RT.pack(size_of(element))
-        if kind in (K_FN, K_HANDLER):
+        if kind in FUNCTIONS:
             self._unify(self.ret_ty, self.ty, "a function result")
             self._unbind_to(0)
             self.fn_count += 1
+            self.after_handler = self.after_handler or self.fn_handler
             self.K.pop()
             return kind, bytes((self._decreasing_set(),))
         if kind == K_LET:
@@ -1255,7 +1275,7 @@ class CheckStage(Stage):
             if self.used != frame[7]:
                 raise self._reject("the arms of an if consume different linear variables")
         elif kind == K_MATCH:
-            type_index = frame[2] - FIRST_NAMED
+            type_index = frame[2] - (FIRST_ENUM if is_enum(frame[2]) else FIRST_NAMED)
             if frame[0] != len(self._ctors(type_index)):
                 raise self._reject(f"non-exhaustive match on {self._show(frame[2])}")
             self.ty = frame[3]

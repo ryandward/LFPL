@@ -173,7 +173,7 @@ C \;\ge\; K_{\mathsf{in}} N_{\max} \;+\; \big(R(N_{\max}) + N_{\max}\big) \;+\; 
 
 ## 4. The language
 
-LFPL-O is the first specification's LFPL with nine additions:
+LFPL-O is the first specification's LFPL with ten additions:
 
 - recursion restricted to structural recursion, so every function terminates;
 - every primitive total;
@@ -183,7 +183,8 @@ LFPL-O is the first specification's LFPL with nine additions:
 - records that span cells;
 - fields in network byte order;
 - record update, which names only the fields that change;
-- sums held in a register, so that a decision costs no cell.
+- sums held in a register, so that a decision costs no cell;
+- the runtime's turn, the one entry point that may call a handler (section 9.6).
 
 Everything else, including ◇, exactly-once linearity and in-place construction, is unchanged.
 
@@ -197,7 +198,7 @@ e &::=& \cdots \text{(first specification §1)} \mid \langle e_1, e_2 \rangle \m
 &\mid& \mathsf{idx}(e, N) \mid \mathsf{get}(a, i) \mid \mathsf{swap}(a, i, e) \mid e_1 \,/\, e_2 \mid e_1 \,\%\, e_2\\
 &\mid& R@(d_1, \ldots, d_m)(\bar e) \mid \mathsf{let}\ \langle c, r \rangle = \mathsf{peel}(d)\ \mathsf{in}\ e\\
 &\mid& R@d\,\{f_1 = e_1, \ldots, f_k = e_k\} \mid C(\bar e)\\[4pt]
-\mathit{prog} &::=& \overline{\mathit{data}} \;\; \overline{\mathsf{enum}} \;\; \overline{\mathsf{state}\ x : \tau} \;\; \overline{\mathsf{fn}} \;\; \overline{\mathsf{handler}}
+\mathit{prog} &::=& \overline{\mathit{data}} \;\; \overline{\mathsf{enum}} \;\; \overline{\mathsf{state}\ x : \tau} \;\; \overline{\mathsf{fn}} \;\; \overline{\mathsf{handler}} \;\; [\mathsf{turn}]
 \end{array}
 ```
 
@@ -252,7 +253,7 @@ State is declared, fixed in size, and threaded through each handler as a linear 
 - Building gives μ(C@d(ā)) = 1 + Σ μ(a\_i).
 - The result of a call to any other function has unknown μ, so it proves nothing. That holds even for an `@` function, which keeps its root cell but may change its size.
 
-The set is chosen per function. In `rev(l, acc)` only {l} works, because every cell l loses, acc gains. The tree `walk(t, stack, …)` needs {t, stack}: one call shrinks t, another shrinks stack, and every call sends one cell to the free list. Any linear parameter may belong to S, including a free list, since all S has to do is shrink, and a natural number cannot shrink forever. Leaving free lists out of S, as the step 1 implementation does, is conservative but not required for soundness.
+The set is chosen per function. In `rev(l, acc)` only {l} works, because every cell l loses, acc gains. The tree `walk(t, stack, …)` needs {t, stack}: one call shrinks t, another shrinks stack, and every call sends one cell to the free list. Any linear parameter may belong to S, including a free list, since all S has to do is shrink, and a natural number cannot shrink forever. Leaving free lists out of S, as the implementation does, is conservative but not required for soundness. It makes one exception, for functions declared after the program's handler. No handler can reach one of those, since a callee comes before its caller, so the Free it walks is one a handler gave back, and the runtime's turn (section 9.6) has to give that back to its pool. There a free list may belong to S, and is taken only when no set without one shrinks.
 
 For now, recursive calls must be tail calls. Non-tail structural calls, compiled with continuations in the destructured cells (DESCEND and ASCEND in the first specification), are refused until that lowering exists, and section 8.2 lists this as a declared limit. Functions must be defined before use, as in Phase 1, so there is no mutual recursion.
 
@@ -359,7 +360,9 @@ A handler can return one beside a record, `(Verdict, Frame, Free)`, instead of a
 
 At the register-transfer level, `enum d, c, a...` makes one, and nothing else can: `const` cannot, and no instruction compares one or computes with it.
 
-**Limits,** which section 8.2 lists: an enum can be built, bound, passed and returned, and not yet matched, so a handler's verdict is read only by the runtime. It cannot be stored in a cell. Its fields are integers, and each constructor has to fit the register with its tag.
+**Matching one.** An arm binds its constructor's fields, and there is no cell to bind first. The tag is read out of the register once, each arm but the last tests it, and each field is its own bytes of the register: `etag` and `efield` at the register-transfer level, which read bits and so are defined whatever the tag is.
+
+**Limits,** which section 8.2 lists: an enum cannot be stored in a cell. Its fields are integers, and each constructor has to fit the register with its tag.
 
 ## 5. Resource typing
 
@@ -418,7 +421,7 @@ The judgment reads: with context Γ and q units free beforehand, e evaluates to 
 Two things differ from Hofmann and Jost:
 
 - **There is no sharing rule.** Linear data are never duplicated, so potential never has to be split between two uses of one value.
-- **DRAW types only the `More` arm against the budget.** The `End` arm must still type-check, but Theorem 5.1 shows it is unreachable when the reserve is large enough. Its cost therefore never enters the bound. This rests on every Free a program holds being that reserve, and the certificate checks it: linearity keeps there from being two of one, so a handler that makes a Free on a path that can run gets no bound. A compiled program should never reach that refusal, because it could not get rid of a second one: a `More` arm leaves as many as it found, R3 does not count a Free, an output cannot hold one, and a handler returns exactly one.
+- **DRAW types only the `More` arm against the budget.** The `End` arm must still type-check, but Theorem 5.1 shows it is unreachable when the reserve is large enough. Its cost therefore never enters the bound. This rests on every Free a program holds being that reserve, and the certificate checks it: linearity keeps there from being two of one, so a handler that makes a Free on a path that can run gets no bound. A compiled handler should never reach that refusal, because it could not get rid of a second one: a `More` arm leaves as many as it found, R3 does not count a Free anywhere a handler can reach, an output cannot hold one, and a handler returns exactly one. The inequalities of an `End` arm are kept apart, not thrown away. A handler's bound leaves them out by DRAW, and the runtime's turn (section 9.6) counts them for every Free it walks itself, since those are what a handler gave back, and they do run out. The turn leaves them out only for the handler it calls, whose reserve it has filled.
 
 ### 5.4 Soundness
 
@@ -595,7 +598,9 @@ With exact last uses, a scalar is moved out before its location is overwritten, 
 | the fields of one record | 64 | right-to-left pass |
 | the fields an update names | in the order the record declares them, each at most once | right-to-left pass |
 | a constructor of an enum fits one register with its tag | 8 bytes | checker |
-| matching an enum, or storing one in a cell | refused until built | checker |
+| storing an enum in a cell | refused until built | checker |
+| a handler the turn serves: no state slots, R(n) = 0, a record with one chain, and a verdict of `port: Int8` or nothing beside that record | — | src/turn.py |
+| places in the hardware target's output queue, K\_out | declared, 4 by default | src/turn.py |
 | arguments per function | 6 | checker |
 | the members of a tuple, a handler's results among them, so a handler with a verdict has at most 3 state slots | 6 | checker |
 | frame slots per function F\_max | declared | lowerer |
@@ -709,6 +714,19 @@ Two checks follow, and both are available in the current workspace:
 
 - **Differential simulation.** Simulate the generated Verilog with Icarus Verilog, and compare outputs with the x86-64 binaries on the same fuzz corpus.
 - **Synthesis.** Run Yosys to confirm register and block-RAM counts against the image layout.
+
+### 9.6 The runtime's turn
+
+On this target the serving loop's rules of section 3.3 are LFPL, not a runtime written in something else. `src/turn.lfpl` is one turn: it releases what egress has sent, then refuses or admits the frame ingress holds, calls the handler, and puts what it returns in the queue or gives its cells back. `src/turn.py` fills in what depends on the handler and appends it to the handler's program, so the turn goes through every stage the handler does, and its bound is certified with it. A `turn` declaration is the only thing that may call a handler.
+
+- **State.** The turn holds the pool, the ingress slot and the queue, and returns them for the next turn. The machine keeps them in registers between turns, and does nothing else with them.
+- **The pool** is a type of its own, laid out as a Free is. Running out of it is Short, which happens, so its `End` arm is charged, where a reserve's is not.
+- **Ingress** is a value of the item's type, N\_max cells: the record and a chain as long as the slot holds. The hardware writes a frame's bytes into the record's scalar fields and then the chain's chunks, with a used count, the length field, and zeros after the last byte. It never writes a link, so whatever it is given, no cell can come to point at another.
+- **Admission** finds n by walking ingress's chain while it counts the frame's bytes down, since there is no division, and TooLarge compares the length with what N\_max cells hold. It takes the cells it needs out of the pool by matching it, one for each the item takes out of ingress and one for the output's place in the queue, and running dry gives back what was taken, in order: Short. No count is trusted, because none is kept.
+- **The queue** is K\_out places in a record, oldest first, shifted when egress has sent the first. Full is the last place being taken. A list kept in arrival order could not be certified: appending walks entries whose potential has already been spent.
+- **The bound** is for a whole turn: ingress counted at N\_max cells and the queue at its fullest, every other linear parameter given nothing. So it holds of every turn on its own, whatever came before. It is loose, since it charges for releasing the whole queue and a turn releases one output.
+
+The hardware around the turn, `src/machine.py`, is a writer, a reader and a controller that runs turns forever. They take a number of cycles that grows with the frame, outside the turn's bound, and they move no cell between owners: conservation is the turn's.
 
 ## 10. Theorems and proof sketches
 
@@ -851,7 +869,9 @@ The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and 
 | identity-morphism validator | present, but **only in the test suite**: `src/lfplo.py` does not run it, so a build does not yet make the fourth check of section 8.4 | run it on every build |
 | heap-flatness test | present, and it holds when run on its own | nothing |
 | cell conservation in the compiler ring | present, with Theorem 7.2's bound checked at every step | nothing |
-| RTL backend | the handler and everything it calls, for every RT instruction: `src/rtverilog.py`, which needed no change to anything before it. Its bound in cycles is derived by the emitter and held to in simulation, its outputs are compared with the x86 binary's on the same bytes, and yosys maps its cell store to block RAM. | hardware ingress, egress and admission, which are test code on this target so far, and `swap` |
+| RTL backend | the handler and everything it calls, for every RT instruction: `src/rtverilog.py`, which needed no change to anything before it. Its bound in cycles is derived by the emitter and held to in simulation, its outputs are compared with the x86 binary's on the same bytes, and yosys maps its cell store to block RAM. | `swap` |
+| the runtime's turn (section 9.6) | present on the RTL target: admission, ADMIT, DONE and the output queue are LFPL, lowered with `examples/ipv4.lfpl` by `src/machine.py`, with frames in and out as bytes. The emitter states one bound for a whole turn before anything runs, every turn of the corpus is held to it, every frame out is the x86 build's, and every cell is in one place afterwards. x86 keeps its runtime. | the turn on x86; handlers with state slots, draws or outputs built in a cell; several frames in ingress at once |
+| enum matching | present: an arm binds the fields, out of the register | storing an enum in a cell |
 
 The implementation decides some things this text leaves open, or does not mention:
 

@@ -364,6 +364,28 @@ is not on the wire: admission fills it in from how long the datagram was, becaus
 has no other way to find out. `tests/test_ipv4.py` runs every kind of frame through a binary on live sockets, against a model
 that shares nothing with it, and `tests/test_rtverilog.py` holds the hardware target to the binary's bytes on a sample of them.
 
+## The runtime, in LFPL, on the hardware target
+
+On x86 the loop around a handler is assembly the compiler writes out: admission, handing the item over, and
+taking back what the handler returns. On the hardware target that loop is LFPL. `src/turn.lfpl` is one turn of
+it, and `src/turn.py` appends it to the handler's program, so the turn is typed, every cell it moves is accounted
+for by linearity, and its bound is certified, as the handler's is. Admission takes the cells a frame needs out of
+the pool by matching it, and when the pool runs dry it gives back what it took and refuses the frame: there is no
+count of free cells to trust, because there is none at all.
+
+```
+$ python3 -m src.machine examples/ipv4.lfpl -o machine --n-max 217
+turn serve for handler ipv4: W = 8572 steps for any frame of up to 217 cells, with 4 places in the queue; cycles <= 2*W + 46 = 17190 a turn; 1310 cells of 128 bits, 11-bit pointers
+```
+
+That is said before anything runs, and it holds of every turn, whatever the frame and whatever came before. What
+runs is `machine.v`, with `serve_core.v` inside it. A frame comes in as bytes, with valid and ready, and goes into
+the scalar fields of the record ingress holds and then into its chain, and a frame leaves the same way, read out of
+the cells of the record at the head of the queue. The writer never stores a link, so the hardware cannot make one
+cell point at another: every link is the turn's to make. `tests/test_machine.py` sends the whole corpus through it
+and through the x86 build. Every frame comes out the same, to the same port, every turn stays under its bound, and
+afterwards every cell is in exactly one place.
+
 ## How the compiler holds itself to the same rules
 
 Most compilers read a whole file into a syntax tree, which costs memory in proportion
@@ -573,8 +595,9 @@ in which reading a cell is free until a field is named.
 Two limits come from the bound's own arithmetic. A handler's linear program stops at 1,024
 inequalities, and because each call gets its own copy of what it calls, those multiply with the depth
 of the call graph, so a deep program can be refused for that even though a bound exists. And a
-program cannot keep a free list of its own: rule R3 does not count a `Free`, so nothing could ever
-get rid of a second one, which is why the arm for running out cannot be reached.
+program cannot keep a free list of its own: rule R3 does not count a `Free` anywhere a handler can
+reach, so nothing could ever get rid of a second one, which is why the arm for running out cannot be
+reached. Past the handler it does, because the runtime's turn gives a reserve back by walking it.
 
 Two parts deserve less trust than the rest. The runtime in `src/runtime.py` is assembly that no
 check reads, which section 11.3 of the specification accepts on the grounds that it is small and
@@ -595,8 +618,9 @@ moves out, even when all that happens to it is that it is stored back where it w
 
 A record's headers still get copied, by the kernel, into cells. Reading a field in place from the frame would save that, but
 it changes the resource model, so it comes later. Other things show in `examples/ipv4.lfpl`: an update names its fields in
-the order the record declares them, an enum can be built and returned but not yet matched or stored in a cell, so only the
-runtime reads a verdict, and a 48-bit address is two fields.
+the order the record declares them, an enum cannot be stored in a cell, and a 48-bit address is two fields. The
+turn on the hardware target serves only a handler shaped as this one is: no state slots, nothing drawn from its
+reserve, one chain, and a verdict beside the record it was given.
 
 The largest gap in the language itself is non-tail recursion over a structure, the model's DESCEND
 and ASCEND, which is rejected for now. A tree therefore cannot be walked by recursing into both

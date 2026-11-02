@@ -11,7 +11,7 @@ emit open(+) before reading an e1 of unbounded size. Every other construct
 already begins with a keyword or a name, so one token of lookahead decides it.
 
     program ::= decl*
-    decl    ::= ('fn'|'handler') id '(' [id ':' ty {',' id ':' ty}] ')' ':' res ['@' id] '=' e ';'
+    decl    ::= ('fn'|'handler'|'turn') id '(' [id ':' ty {',' id ':' ty}] ')' ':' res ['@' id] '=' e ';'
               | 'data' Name ['=' ctor {'|' ctor}] ';'
               | 'enum' Name '=' ctor {'|' ctor} ';'
               | 'record' Name '{' id ':' ty {',' id ':' ty} '}' ';'
@@ -54,7 +54,7 @@ _TOKENS = tuple((
     "EOF IDENT NAME INT LET IN IF THEN ELSE MATCH WITH END TRUE FALSE FN DATA "
     "RECORD PACK LPAREN RPAREN LBRACE RBRACE COMMA COLON SEMI AT EQ ARROW BAR "
     "PLUS MINUS STAR AMP CARET SHL SHR LT LE GT GE EQEQ NE ANDAND OROR BANG "
-    "HANDLER STATE LBRACKET RBRACKET ENUM "
+    "HANDLER STATE LBRACKET RBRACKET ENUM TURN "
 ).split())
 (
     T_EOF, T_IDENT, T_NAME, T_INT, T_LET, T_IN, T_IF, T_THEN,
@@ -63,14 +63,14 @@ _TOKENS = tuple((
     T_SEMI, T_AT, T_EQ, T_ARROW, T_BAR, T_PLUS, T_MINUS, T_STAR,
     T_AMP, T_CARET, T_SHL, T_SHR, T_LT, T_LE, T_GT, T_GE,
     T_EQEQ, T_NE, T_ANDAND, T_OROR, T_BANG,
-    T_HANDLER, T_STATE, T_LBRACKET, T_RBRACKET, T_ENUM,
+    T_HANDLER, T_STATE, T_LBRACKET, T_RBRACKET, T_ENUM, T_TURN,
 ) = range(len(_TOKENS))
 
 _KEYWORDS = {b"let": T_LET, b"in": T_IN, b"if": T_IF, b"then": T_THEN,
              b"else": T_ELSE, b"match": T_MATCH, b"with": T_WITH, b"end": T_END,
              b"true": T_TRUE, b"false": T_FALSE, b"fn": T_FN, b"data": T_DATA,
              b"record": T_RECORD, b"pack": T_PACK, b"handler": T_HANDLER, b"state": T_STATE,
-             b"enum": T_ENUM}
+             b"enum": T_ENUM, b"turn": T_TURN}
 _ONE = {ord("("): T_LPAREN, ord(")"): T_RPAREN, ord("{"): T_LBRACE,
         ord("}"): T_RBRACE, ord(","): T_COMMA, ord(":"): T_COLON,
         ord(";"): T_SEMI, ord("@"): T_AT, ord("="): T_EQ, ord("|"): T_BAR,
@@ -94,7 +94,7 @@ _KINDS = tuple((
     "FN PARAM TYPE RESWORD DATA CTORDECL FIELD RECORD LET BINDER IF MATCH ARM "
     "WITH BINOP CMP AND OR NOT CALL CTOR DIAMOND PACK VAR INT BOOL NULLCTOR "
     "EOF HANDLER STATE TARRAY TFIN TTUPLE TUPLE IDX GET RTDECL RTDECLMORE LOW "
-    "VARLAST LIVE UPDATE VARAT ENUM VALUE "
+    "VARLAST LIVE UPDATE VARAT ENUM VALUE TURN "
 ).split())
 (
     K_FN, K_PARAM, K_TYPE, K_RESWORD, K_DATA, K_CTORDECL, K_FIELD, K_RECORD,
@@ -108,7 +108,9 @@ _KINDS = tuple((
     K_VARAT,            # and what it leaves in its place: a name by its position in scope, whatever it is called by then
     K_ENUM,             # a declaration of a sum held in a register
     K_VALUE,            # and one of its values: open(VALUE) `C(`, or from Check, leaf(VALUE) for a C with no fields
+    K_TURN,             # the runtime's turn, the one function that may call the program's handler
 ) = range(len(_KINDS))
+FUNCTIONS = (K_FN, K_HANDLER, K_TURN)
 VARAT = struct.Struct("<HB")  # the position, and whether the right-to-left pass found this to be its last use
 VALUE = struct.Struct("<HB")  # the constructor, as Check numbers it, and how many fields it has
 
@@ -440,6 +442,8 @@ class Parser(Stage):
             self._push(K_FN, S_NAME, cell)
         elif tag == T_HANDLER:
             self._push(K_HANDLER, S_NAME, cell)
+        elif tag == T_TURN:
+            self._push(K_TURN, S_NAME, cell)
         elif tag == T_STATE:
             self._push(K_STATE, S_NAME, cell)
         elif tag == T_DATA:
@@ -517,7 +521,7 @@ class Parser(Stage):
             ring.drop(self, cell)
 
         if state == S_NAME:
-            if kind in (K_FN, K_HANDLER):
+            if kind in FUNCTIONS:
                 require(T_IDENT, "a function name")
                 self._set(S_LPAREN)
                 self._emit(cell, OPEN, kind, payload)

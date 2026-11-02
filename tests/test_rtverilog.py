@@ -201,6 +201,18 @@ class TheEmittersOwnArithmetic(unittest.TestCase):
         self.assertEqual(kinds["open"], (0, 0, 0))
         self.assertEqual(kinds["call"], (1, 1, 2), "the first names a field of a cell that has not been read")
 
+    def test_a_tag_and_a_field_of_an_enum_are_slices(self):
+        source = """enum V = Drop | Send(port: Int8);
+record Hd { a: Int8, b: Int8 };
+data Out = Gone | Sent(port: Int8, b: Int8);
+fn way(a: Int8) : V = if ==(a, 0) then Drop else Send(a);
+handler h(m: Hd, free: Free) : (Out, Free) = match m with Hd(d, a, b) =>
+  match way(a) with Drop => (Sent@d(0, b), free) | Send(p) => (Sent@d(p, b), free) end end;
+"""
+        verilog = translate(list(rt_lines(io.BytesIO(source.encode())))).verilog
+        self.assertRegex(verilog, r"<= h_r\d+\[7:0\];")
+        self.assertRegex(verilog, r"<= h_r\d+\[15:8\];")
+
     def test_a_register_compared_with_less_or_equal_is_read_and_so_it_is_kept(self):
         """`(r <= 94)` is Verilog's comparison, and it looks like a write. Taking it for one left a register that
         is only ever compared out of the design, and the design then named a register it never declared."""

@@ -62,7 +62,7 @@ _LOC = re.compile(r"r(\d+)\[(\d+):(\d+)\]$")
 _LIT = re.compile(r"#(\d+)$")
 _INNER = re.compile(r"\[(\d+):(\d+)\]$")
 _FUNC = re.compile(r"(\w+)\(\s*\[(\d+):(\d+)\]\s*,\s*(.+)\)$")
-_HEADER = re.compile(r"(fn|handler) (f\d+) (\w+)\((.*)\) : (\S+)(?: @(\d+))?$")
+_HEADER = re.compile(r"(fn|handler|turn) (f\d+) (\w+)\((.*)\) : (\S+)(?: @(\d+))?$")
 _LABEL = re.compile(r"(L\d+):\s*(.*)$")
 
 
@@ -165,6 +165,7 @@ class Function:
     ret: str
     at: Optional[int]
     handler: bool
+    turn: bool = False                             # the runtime's turn: a port for each parameter and result
     widths: dict = field(default_factory=dict)    # RT register -> bits
     types: dict = field(default_factory=dict)     # RT register -> type text, where it matters
     temporaries: list = field(default_factory=list)
@@ -236,6 +237,7 @@ class Translation:
     pointer_bits: int
     memories: dict  # state slot -> hex text for $readmemh, to go beside the Verilog
     verdict: bool = False  # the handler returns an enum beside its record, on a port of its own
+    image: str = ""        # a turn's: the cell store's first contents, as cells.mem for $readmemh
 
     def report(self) -> str:
         lines = [f"handler {self.module}: R(n) = {_linear(self.bound.a, self.bound.b)} cells, "
@@ -303,7 +305,7 @@ class Emitter:
                 self.current = []
             return
         head, *parts = text.split()
-        if head in ("fn", "handler"):
+        if head in ("fn", "handler", "turn"):
             self.current = [text]
         elif head == "alias":
             self.aliases[parts[0]] = parts[1]
@@ -357,7 +359,7 @@ class Emitter:
         assert match is not None, lines[0]
         kind, ordinal, name, params, ret, at = match.groups()
         types = [part.partition(" : ")[2].strip() for part in _args(params)]
-        fn = Function(ordinal, name, types, ret, int(at) if at else None, kind == "handler")
+        fn = Function(ordinal, name, types, ret, int(at) if at else None, kind == "handler", kind == "turn")
         self.fn = fn
         body = [(_LABEL.match(line).group(1) if _LABEL.match(line) else None,
                  _LABEL.match(line).group(2) if _LABEL.match(line) else line)
@@ -409,6 +411,10 @@ class Emitter:
                 define(a[0], int(a[1]))
             elif head in ("pack", "enum"):
                 define(a[0], 64)
+            elif head == "etag":
+                define(a[0], 8)
+            elif head == "efield":
+                define(a[0], 8 * self.ctors[a[2]].fields[int(a[3])][1])
             elif head == "idx":
                 define(a[0], _bits_for(int(a[1])))
             elif head == "aget":
@@ -715,6 +721,19 @@ class Emitter:
             parts.append(expression)
             top = 8 * off
         self._step("enum", text, clocked=[self._set(a[0], "{" + ", ".join(parts) + "}", ENUM_BITS)])
+
+    def i_etag(self, text: str, a: list[str]) -> None:
+        self._step("etag", text, clocked=[self._set(a[0], self._value(a[1], 8), 8)])
+
+    def i_efield(self, text: str, a: list[str]) -> None:
+        """A slice of the register: the field's bytes, wherever its constructor put them."""
+        fn = self.fn
+        assert fn is not None
+        off, size, _ty = self.ctors[a[2]].fields[int(a[3])]
+        register = int(_REG.match(a[1]).group(1))
+        source = self.pending.get(register, register)
+        expression = f"{fn.flop(source)}[{8 * (off + size) - 1}:{8 * off}]"
+        self._step("efield", text, clocked=[self._set(a[0], expression, 8 * size)])
 
     def i_idx(self, text: str, a: list[str]) -> None:
         size = int(a[1])
@@ -1052,7 +1071,7 @@ class Emitter:
         return (loop[0] or Span(0, 0), leave[0] or Span(0, 0))
 
     def render(self, handler: Function, module: str, bound: Bound, cells: int,
-               initial: dict[str, str]) -> Translation:
+               initial: dict[str, str], image: str = "") -> Translation:
         functions = self._reachable(handler)
         kept = {fn.ordinal for fn in functions}
         for fn in functions:  # a function the handler never reaches is not in the machine
@@ -1060,9 +1079,11 @@ class Emitter:
         site = Site("IDLE", finished=True, caller=handler.ordinal)
         results = self._results(handler.ret)
         names = {len(results) - 2: "out_item", len(results) - 1: "free_out"}
-        self.verdict = len(results) == len(self.slots) + 3
+        self.verdict = len(results) == len(self.slots) + 3 and not handler.turn
         if self.verdict:
             names[len(results) - 3] = "verdict_out"
+        if handler.turn:  # a turn's every result goes out on a port of its own
+            names = {position: f"res{position}" for position in range(len(results))}
         site.results = [(names.get(position, ""), self._width(member) if position in names else 0)
                         for position, member in enumerate(results)]
         handler.sites.append(site)
@@ -1078,11 +1099,11 @@ class Emitter:
                     raise RTError(f"{state.name} ({state.comment}) both reads and writes the cell store")
         memories = {name: _hex_lines(data, self._array_of(ty)) for (name, ty), data in
                     ((slot, initial[slot[0]]) for slot in self.slots if slot[0] in initial)}
-        text = self._text(handler, functions, module, cells, timing, memories, bound)
-        return Translation(text, module, bound, timing, cells, self.pointer_bits, memories, self.verdict)
+        text = self._text(handler, functions, module, cells, timing, memories, bound, bool(image))
+        return Translation(text, module, bound, timing, cells, self.pointer_bits, memories, self.verdict, image)
 
     def _text(self, handler: Function, functions: list[Function], module: str, cells: int,
-              timing: Timing, memories: dict, bound: Bound) -> str:
+              timing: Timing, memories: dict, bound: Bound, loaded: bool = False) -> str:
         p = self.pointer_bits
         states = [state.name for fn in functions for state in fn.states]
         state_bits = _bits_for(len(states) + 1)
@@ -1098,12 +1119,20 @@ class Emitter:
         add("    input  wire clk,")
         add("    input  wire rst,")
         add("    input  wire start,          // the edge that samples this starts the count")
-        add(f"    input  wire [{p - 1}:0] item_in,")
-        add(f"    input  wire [{p - 1}:0] free_in,")
+        if handler.turn:
+            for position, type_text in enumerate(handler.params):
+                add(f"    input  wire {_range(max(1, self._width(type_text)))}arg{position},")
+        else:
+            add(f"    input  wire [{p - 1}:0] item_in,")
+            add(f"    input  wire [{p - 1}:0] free_in,")
         add("    output reg  done,           // and the edge that raises this ends it")
         add("    output wire busy,")
-        add(f"    output reg  [{p - 1}:0] out_item,")
-        add(f"    output reg  [{p - 1}:0] free_out,")
+        if handler.turn:
+            for position, member in enumerate(self._results(handler.ret)):
+                add(f"    output reg  {_range(max(1, self._width(member)))}res{position},")
+        else:
+            add(f"    output reg  [{p - 1}:0] out_item,")
+            add(f"    output reg  [{p - 1}:0] free_out,")
         if self.verdict:
             add(f"    output reg  [{ENUM_BITS - 1}:0] verdict_out,  // which way out_item goes: section 4.11")
         add("    // the cell store from outside, between items: ingress and egress are not built yet")
@@ -1158,6 +1187,8 @@ class Emitter:
         add(f"    reg [{p - 1}:0] b_addr;")
         add(f"    reg [{CELL_BITS - 1}:0] b_din;")
         add("    assign host_dout = a_dout;")
+        if loaded:  # a turn's cells start as src/machine.py laid them out: the pool, ingress and the queue
+            add('    initial $readmemh("cells.mem", cells);')
         add("    integer lane;")
         add("    always @(posedge clk) begin")
         add("        if (a_en) a_dout <= cells[a_addr];")
@@ -1255,6 +1286,8 @@ class Emitter:
                     entry.append(f"{handler.flop(position)} <= {width}'d{position};")
             else:
                 port = "free_in" if position == len(handler.params) - 1 else "item_in"
+                if handler.turn:
+                    port = f"arg{position}"
                 entry.append(f"{handler.flop(position)} <= {port};")
         entry.append(f"state <= {handler.states[0].name};")
         return entry
