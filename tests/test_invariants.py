@@ -1040,7 +1040,7 @@ class MeaningCheck(unittest.TestCase):
         for name in ("inc.lfpl", "sum.lfpl"):
             with open(os.path.join(root, "examples", name), "rb") as handle:
                 source = handle.read()
-            self.assertEqual(check_translation(source, compile_text(source)), [])
+            self.assertEqual(check_translation(source, compile_text(source, inferring=True)), [])
 
     # A broken compiler, one line at a time. Each mutant is a real bug, most of them
     # ones this project actually shipped for a while. The check has to find every one

@@ -28,6 +28,7 @@ from src import rtlower  # noqa: E402
 from src.rtlower import Limit  # noqa: E402
 from src.symcheck import check_translation  # noqa: E402
 from src.validate import validate  # noqa: E402
+from tests.reference.lang import without_annotations  # noqa: E402
 
 COUNT = int(os.environ.get("LFPL_FUZZ", "60"))
 SEED = int(os.environ.get("LFPL_FUZZ_SEED", "0"))
@@ -55,10 +56,11 @@ def compile_rt(source: bytes) -> str:
     """The same programs through the register-transfer path, with its own Theorem 7.2 bound."""
 
     def on_step(ring) -> None:
-        check = ring.stages[2]
+        passed, check = ring.stages[2], ring.stages[3]
         in_use = ring.store.C - len(ring.F)
         depth = max(stage.depth() for stage in ring.stages)
-        g_cells = len(check.G.cells) + len(check.TA.cells) + len(check.TF.cells) + len(check.TT.cells)
+        g_cells = (len(check.G.cells) + len(check.TA.cells) + len(check.TF.cells) + len(check.TT.cells)
+                   + len(passed.T.cells))
         limit = rtlower.occupancy_bound(depth, g_cells)
         if in_use > limit:
             raise AssertionError(f"Theorem 7.2: {in_use} cells at depth {depth}, bound {limit}")
@@ -626,8 +628,9 @@ fn weigh(l: List, n: Int64, acc: Int64, free: Free) : Res = match l with
 
 def diamond_call_program(rng: random.Random) -> tuple[bytes, int]:
     """A matched cell's diamond passed to a call, so the callee writes a cell whose
-    fields this function may still want. Reading a scalar after that without a copy
-    is a declared limit; the rest must give the right answer."""
+    fields this function may still want. Reading a scalar after that without a copy has to
+    give the right answer on the register-transfer path, where the right-to-left pass says the
+    scalar is wanted, and the old Lower, which has no such pass, has to stop."""
     mask = (1 << 64) - 1
     k = rng.randrange(1 << 16)
     templates = [
@@ -647,17 +650,17 @@ def diamond_call_program(rng: random.Random) -> tuple[bytes, int]:
     ]
     items = [rng.randrange(1 << 32) for _ in range(rng.randrange(1, 6))]
     if rng.random() < 0.15:
-        # No copy: h is erased at the call, so this must stop, and never print a guess.
+        # No copy: the old Lower has erased h at the call, so it must stop, and never print a guess.
         text = (f"match mk(d, {k}, t) with "
                 f"| Cons(e, h2, t2) => Cons@e(+(h, h2), t2) | Nil => Nil end")
-        action = None
+        action = lambda h, tail: [(h + k) & mask] + tail
     else:
         text, action = rng.choice(templates)
     chain = "Nil"
     cells = [f"c{i}" for i in range(len(items))]
     for cell, item in zip(reversed(cells), reversed(items)):
         chain = f"Cons@{cell}({item}, {chain})"
-    state = action(items[0], items[1:]) if action is not None else []
+    state = action(items[0], items[1:])
     expected = sum(x * (i + 1) for i, x in enumerate(state)) & mask
     source = (DIAMONDS + f"fn f(l: List) : List = match l with "
               f"| Cons(d, h, t) => {text} | Nil => Nil end;\n"
@@ -746,6 +749,8 @@ class Differential(unittest.TestCase):
                                  f"#{index}\n{source.decode()}\n{asm}")
                 got = build_and_run(asm, workdir)
                 self.assertEqual(got, expected, f"#{index}\n{source.decode()}\n{asm}")
+                if self.compiler is compile_rt:  # the pass has to find every `@` that was written
+                    self.assertEqual(compile_rt(without_annotations(source)), asm, f"#{index}\n{source.decode()}")
                 compiled += 1
         print(f"{generator.__name__}: {compiled} ran, stopped at limits {dict(limits)}",
               file=sys.stderr)

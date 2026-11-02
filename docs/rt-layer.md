@@ -19,9 +19,10 @@ the first specification's token rules. x86 and RTL each lower from the result.
 - **One atomic constructor.** A constructor is a single instruction that reads all its
   sources and then writes: a parallel move, plus the tag, plus the seal. Lower cannot get
   the order of those steps wrong, because at this level they have no order.
-- **Not a fix for reading only forward.** Last-use knowledge still comes from the
-  right-to-left pass of LFPL-O section 8.1. Until then a scalar read after its cell is gone
-  is refused here just as it is today.
+- **Not a fix for reading only forward.** Last-use knowledge comes from the right-to-left pass
+  of LFPL-O section 8.1, `src/righttoleft.py`, which runs in the front end. By this level, a scalar
+  read after its cell is gone is a `read` ahead of the `build`, and `@k` is in the function's header
+  whether the source wrote it or the pass found it.
 
 ## Tokens
 

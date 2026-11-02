@@ -1,6 +1,6 @@
 # Section 5.6: in-place increment, tail recursion modulo cons.
 data List = Nil | Cons(h: Int64, t: List);
-fn inc(l: List) : List @l =
+fn inc(l: List) : List =
   match l with
   | Cons(d, h, t) => Cons@d(+(h, 1), inc(t))
   | Nil => Nil

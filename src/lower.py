@@ -2553,22 +2553,27 @@ def compile_source(source, *, cells: Optional[int] = None, d_max: int = 64,
                    target_cells: int = 1024,
                    on_line: Optional[Callable[[str], None]] = None,
                    on_step: Optional[Callable[[Ring], None]] = None,
-                   checks: bool = False) -> tuple[Ring, "Lower"]:
+                   checks: bool = False, inferring: bool = False) -> tuple[Ring, "Lower"]:
     """The whole ring: Ingest, Lex, Parse, Check, Lower, Egress. Lines go to
-    `on_line` as Egress drains them, and no stage keeps a copy."""
+    `on_line` as Egress drains them, and no stage keeps a copy. With `inferring`, the right-to-left
+    pass runs too, and writes `@` where a program did not: this Lower uses nothing else it finds."""
     from .check import CheckStage
     from .dyck import Lexer, Parser
+    from .righttoleft import CELLS_PER_DEPTH, RightToLeft
 
     lower = Lower()
     lower.home_checks = checks
     if cells is None:
         cells = required_cells(d_max)
+        if inferring:  # its frames, and one cell per function for what it returns
+            cells += CELLS_PER_DEPTH * d_max + DEFAULT_G_MAX
     emit = on_line if on_line is not None else lambda line: None
 
     def sink(tag: int, payload: bytes) -> None:
         emit(render(tag, payload, target_cells=target_cells))
 
-    ring = Ring(cells, iter(source), [Lexer(), Parser(d_max), CheckStage(), lower], sink, on_step)
+    front = [Lexer(), Parser(d_max)] + ([RightToLeft()] if inferring else [])
+    ring = Ring(cells, iter(source), front + [CheckStage(), lower], sink, on_step)
     ring.run()
     return ring, lower
 
@@ -2601,13 +2606,13 @@ def main(argv: list[str]) -> int:
     try:
         with open(argv[0], "rb") as handle:
             if "-r" not in argv:
-                compile_source(file_bytes(handle), on_line=print)
+                compile_source(file_bytes(handle), on_line=print, inferring=True)
                 return 0
             with tempfile.TemporaryDirectory() as workdir:
                 source = os.path.join(workdir, "prog.asm")
                 with open(source, "w") as out:
-                    compile_source(file_bytes(handle),
-                                   on_line=lambda line: out.write(line + "\n"))
+                    compile_source(file_bytes(handle), on_line=lambda line: out.write(line + "\n"),
+                                   inferring=True)
                 print(assemble_and_run(source, workdir))
     except (Reject, FailFast) as failure:
         print(failure, file=sys.stderr)

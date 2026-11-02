@@ -4,7 +4,7 @@ data Free = End | More(next: Free);
 data Res = Fail | Done(value: Int64, rest: Free);
 data List = Nil | Cons(h: Int64, t: List);
 
-fn inc(l: List) : List @l =
+fn inc(l: List) : List =
   match l with
   | Cons(d, h, t) => Cons@d(+(h, 1), inc(t))
   | Nil => Nil

@@ -35,7 +35,7 @@ Here is a function that adds one to every element of a list, in place:
 ```
 data List = Nil | Cons(h: Int64, t: List);
 
-fn inc(l: List) : List @l =
+fn inc(l: List) : List =
   match l with
   | Cons(d, h, t) => Cons@d(+(h, 1), inc(t))
   | Nil => Nil
@@ -45,9 +45,11 @@ fn inc(l: List) : List @l =
 Matching on a `Cons` takes the cell apart and gives you what was in it, `h` and `t`,
 along with `d`, the emptied cell itself. `Cons@d(...)` is the only way to build a
 `Cons`, and it has to spend a cell like `d` to do it, so a cell can never be conjured
-out of nothing. The `@l` in the signature promises that the result is `l`'s own cell,
-and the compiler checks that promise at every exit from the function. Operators are
-written prefix, as in `+(h, 1)`, for a reason that will come up shortly.
+out of nothing. The compiler works out that the result is `l`'s own cell, because every
+exit from the function returns that cell, or the null that `l` was, and it holds every exit
+to that. You can also say so yourself, as `: List @l`, and then it is a promise, which is
+checked the same way. Operators are written prefix, as in `+(h, 1)`, for a reason that will
+come up shortly.
 
 That source compiles to this:
 
@@ -330,6 +332,15 @@ its memory follows how deeply the source nests rather than how long it is. Only 
 table of global names grows with the program, and nesting past a declared limit is a
 syntax error, which is what lets the ring be sized in advance.
 
+Reading only forward leaves two things that depend on what comes later: whether a scalar is wanted
+after its cell is rebuilt, and which parameter's cell every exit returns. So `src/righttoleft.py` sits
+between the parser and the checker, and goes through each function first, in source order. Going forward it
+writes the function's events to a file, working out what each name refers to and which parameter's cell each
+value is. Then it reads the file backward, holding the set of names with a use still to come, plus two sets
+for each open branch, and it writes that set into the file at the start of each arm and scope. Then it sends the
+events on as if the parser had just written them, with those facts among them. The file is the only thing
+that grows with the length of a function, and it is on disk.
+
 `src/check.py` does the linear typing as a fold over those events, and Lower turns them into
 instructions. Lower is built on one idea: every expression is compiled knowing where its value
 is wanted, whether that is a particular register, a field of a cell, or a pair of jump targets.
@@ -457,14 +468,15 @@ and several rules assume it can see what comes later.
 Section 4.1 wants the operand that needs the most registers evaluated first, but that
 requires knowing the second operand's needs before writing the first one's code, so
 operands run in source order. It also wants to spill the value used furthest in the
-future, which nothing here can know, so the oldest value spills instead. Scalars raise
-the same problem from another side. A read cannot tell whether it was the last, so
-writing to a location erases the scalar living there, and using it afterwards is a
-compile error, unless an enclosing construct is already waiting on it, in which case it
-moves out first. Handing a cell to a callee counts as writing to it, because the callee now
-owns it, so a field you still want has to be copied first, with `+(x, 0)`. Section 5.6 needs to know that a recursive call returns its argument's
-own cell, which depends on exits the compiler has not reached yet, and that is why the
-`@l` annotation exists: the signature declares it, and each exit is checked against it.
+future, which nothing here can know, so the oldest value spills instead. Both of those are
+for the backend to settle, and have not been. Scalars raised the same problem from another
+side, because a read cannot tell whether it was the last, and so did section 5.6, which needs
+to know that a recursive call returns its argument's own cell, depending on exits the compiler
+has not reached yet. Those two are answered ahead of time now, by the pass described above: a scalar moves out of
+its cell just before the cell is rebuilt or handed to a callee, exactly when something reads it
+later. The first Lower, `src/lower.py`, takes the inferred `@l` and nothing else, so there writing to
+a location still erases the scalar living there, and a field you still want has to be copied first,
+with `+(x, 0)`.
 
 Two rules from the later LFPL-O specification are already in force, because a running program
 must not hang or depend on hardware accidents. Every function has to terminate: for some fixed
@@ -528,12 +540,10 @@ output and has not moved, and `python3 -m src.lower` still runs the first exampl
 passes every generator, but it does not yet match the old one's output everywhere: a constructor
 bound by `let` and then matched is built before it is taken apart, a `match` on a known null still
 tests it, `pack` does not fold constants, and every function adjusts its frame even when the frame
-is empty, because the frame's size is not known until the right-to-left pass exists.
+is empty, because the backend writes its prologue before it knows the frame's size.
 
-A scalar read after its cell was rebuilt or handed over is refused, with the rule and a way around
-it, because reading forward nothing says at that point that it is wanted later. A good share of
-generated programs stop there, so it is not a corner case: the right-to-left pass in the
-specification is what removes it. A diamond that passes through a join counts as handed over.
+A diamond that passes through a join counts as handed over, so a scalar of that cell that is read later
+moves out, even when all that happens to it is that it is stored back where it was.
 
 The largest gap in the language itself is non-tail recursion over a structure, the model's DESCEND
 and ASCEND, which is rejected for now. A tree therefore cannot be walked by recursing into both

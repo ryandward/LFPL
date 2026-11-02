@@ -4,6 +4,8 @@ from this tree, so each one comes with the answer the interpreter gives, and the
 against that. An independent reviewer wrote these to find what tests/test_fuzz.py does not generate,
 and they did: see tests/test_generated.py.
 """
+import re
+
 
 MASK = {8: 0xFF, 16: 0xFFFF, 32: 0xFFFFFFFF, 64: (1 << 64) - 1}
 
@@ -152,3 +154,9 @@ class Interp:
             arr = self.ev(e[1], env)
             return [arr, arr[self.ev(e[2], env)]]
         raise ValueError(k)
+
+
+def without_annotations(source: bytes) -> bytes:
+    """The same program with every written `@k` taken out of its signatures: the right-to-left pass has to
+    find each of them, so what this compiles to has to be what the original compiles to."""
+    return re.sub(rb"(\) : [^=;]*?) @\w+ =", rb"\1 =", source)

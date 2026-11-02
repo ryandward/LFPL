@@ -89,6 +89,7 @@ _KINDS = tuple((
     "FN PARAM TYPE RESWORD DATA CTORDECL FIELD RECORD LET BINDER IF MATCH ARM "
     "WITH BINOP CMP AND OR NOT CALL CTOR DIAMOND PACK VAR INT BOOL NULLCTOR "
     "EOF HANDLER STATE TARRAY TFIN TTUPLE TUPLE IDX GET RTDECL RTDECLMORE LOW "
+    "VARLAST LIVE "
 ).split())
 (
     K_FN, K_PARAM, K_TYPE, K_RESWORD, K_DATA, K_CTORDECL, K_FIELD, K_RECORD,
@@ -97,6 +98,7 @@ _KINDS = tuple((
     K_INT, K_BOOL, K_NULLCTOR, K_EOF,
     K_HANDLER, K_STATE, K_TARRAY, K_TFIN, K_TTUPLE, K_TUPLE, K_IDX, K_GET, K_RTDECL, K_RTDECLMORE,
     K_LOW,
+    K_VARLAST, K_LIVE,  # what src/righttoleft.py adds, which no parser ever writes
 ) = range(len(_KINDS))
 
 # What an array's element can be, as Check and the payload of leaf(TARRAY) name it.

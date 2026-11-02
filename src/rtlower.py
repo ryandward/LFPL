@@ -10,9 +10,9 @@ language it writes, and rtcheck types every line of it before anything is done w
 Frames, values and binders live in real cells, on the ring, so this stage keeps the first
 specification's O(D) bound the same way every other stage does. The text it writes leaves on c5.
 
-Reading only forward still has one cost, which LFPL-O's right-to-left pass will remove: a scalar
-read after its cell has been rebuilt is refused here, with a rule a program can act on, because
-nothing said at the rebuild that the scalar would be wanted later.
+Reading only forward leaves one thing it cannot know, which is whether a scalar is wanted after its cell is
+rebuilt. src/righttoleft.py works that out ahead of it, and says so as this stage reads: `live_now` is the set of
+names with a use still to come on this path, so that a scalar moves out exactly when something reads it later.
 """
 from __future__ import annotations
 
@@ -23,10 +23,11 @@ from typing import BinaryIO, Callable, Generic, Iterable, Iterator, NamedTuple, 
 from .check import (P_ARM_RT, P_BINDER, P_CALL_RT, P_DIAMOND_RT, P_FIELD, P_GET_RT, P_IDX_RT,
                     P_LET_RT, P_PARAM_RT, P_TYPE_RT, P_VAR, P_WITH_RT, CheckStage)
 from .dyck import (CC_NAMES, CLOSE, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP, K_CTOR,
-                   K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER, K_IDX, K_IF, K_INT, K_LET,
+                   K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER, K_IDX, K_IF, K_INT, K_LET, K_LIVE,
                    K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
-                   K_RTDECLMORE, K_TUPLE, K_TYPE, K_VAR, K_WITH, LEAF, OP_NAMES, OPEN, SEP, Lexer,
+                   K_RTDECLMORE, K_TUPLE, K_TYPE, K_VAR, K_VARLAST, K_WITH, LEAF, OP_NAMES, OPEN, SEP, Lexer,
                    Parser, ev_class, ev_kind)
+from .righttoleft import CELLS_PER_DEPTH, MASK_BITS, RightToLeft
 from .ring import FrameStack, Reject, Ring, Stage
 from .tokens import PAYLOAD_BYTES
 
@@ -36,6 +37,7 @@ _RMW = frozenset(("add", "sub", "and", "or", "xor"))
 UNKNOWN_TAG = 255
 MAX_BINDERS = 128  # LFPL-O section 8.2: names in scope in one function
 MAX_REGISTERS = 65535  # registers one function may write, which a value's two bytes can name
+NO_REFUGE = MAX_REGISTERS  # a scalar's refuge is chosen the first time it has to move
 E_MAX = 4096       # the most cells of text one event may write: a settle of a whole value stack
 
 
@@ -178,9 +180,10 @@ class Records(Generic[R]):
 
 @dataclass(frozen=True)
 class Binder:
-    """A value with a name. `refuge` is the register a linear field moves to if its cell is rebuilt
-    while it is still there. It is chosen when the name is bound, so that every arm that has to
-    move it moves it to the same register, and the arms still agree at the join."""
+    """A value with a name. `refuge` is the register a field moves to if its cell is rebuilt while it
+    is still there. A linear field's is chosen when the name is bound, and a scalar's when it first
+    has to move, which most never do. Going back to the start of a branch does not forget it, so that
+    every arm that has to move it moves it to the same register, and the arms still agree at the join."""
     value: Value
     refuge: int = 0
 
@@ -285,6 +288,7 @@ class RTLower(Stage):
         self.fn_handler = False
         self.ret_ty = 0
         self.at: Optional[int] = None
+        self.live_now = 0          # the names with a use still to come on this path: a set, as an integer
         self.param_types: list[int] = []  # at most 6
         self.last_into: list[Delivered] = [Delivered()]  # what was last delivered, per member
 
@@ -607,6 +611,8 @@ class RTLower(Stage):
             self._ctor_cell(payload)
         elif kind == K_FIELD:
             self._with_field(payload)
+        elif kind == K_LIVE:
+            self.live_now = int.from_bytes(payload, "little")
         elif kind == K_EOF:
             pass
         else:
@@ -619,9 +625,12 @@ class RTLower(Stage):
             return Value(V_LIT, flags=BOOL, n=payload[0])
         if kind == K_NULLCTOR:
             return Value(V_NULL, P_TYPE_RT.unpack_from(payload)[0], flags=LINEAR)
-        assert kind == K_VAR, kind
+        assert kind in (K_VAR, K_VARLAST), kind
         src, linear, _size = P_VAR.unpack_from(payload)
-        return self._use(src, bool(linear))
+        value = self._use(src, bool(linear))
+        if kind == K_VARLAST:
+            self.live_now &= ~(1 << src)
+        return value
 
     def _set_binder(self, index: int, binder: Binder) -> None:
         """A change a later arm must not see goes in the undo log. Only a name older than the
@@ -645,11 +654,9 @@ class RTLower(Stage):
         if linear:
             self._set_binder(index, replace(binder, value=replace(value, flags=value.flags | CONSUMED)))
         if value.kind == V_LOC:
-            if self._gone(value.cell):
-                raise Limit(f"section 8.1: fn {self.fn_name.decode()} reads a scalar field after "
-                            f"its cell was rebuilt or handed over. Until the right-to-left pass "
-                            f"exists, nothing says at that point that it is wanted later, so copy "
-                            f"it first: let y = +(x, 0) in ...")
+            assert not self._gone(value.cell), (
+                f"fn {self.fn_name.decode()} reads name {index} after its cell closed, and the "
+                f"right-to-left pass said nothing would")
             return value
         if value.kind == V_REG:
             return replace(value, flags=(value.flags & (LINEAR | OWNED)) if linear
@@ -678,14 +685,14 @@ class RTLower(Stage):
                 return
             match = self.F.at(len(self.F) - 2)
             value = self.V.at(match.vmark + position - 1)
-            self._push_binder(Binder(value, self.fresh() if linear else 0))
+            self._push_binder(Binder(value, self.fresh() if linear else NO_REFUGE))
             return
         if kind == 0:
             self._push_binder(Binder(Value(V_CAP, top.reg, off=top.l1, word=top.word, cell=top.cell,
                                            flags=LINEAR)))
             return
         self._push_binder(Binder(Value(V_LOC, top.reg, off, size, self.new_word(), top.cell,
-                                       LINEAR if linear else 0), self.fresh() if linear else 0))
+                                       LINEAR if linear else 0), self.fresh() if linear else NO_REFUGE))
 
     def _sep_let(self, top: Frame, payload: bytes) -> None:
         _one, _linear, _size, count = P_LET_RT.unpack_from(payload)
@@ -702,7 +709,8 @@ class RTLower(Stage):
         self.F.set_top(top)
 
     def _bind_value(self, value: Value) -> None:
-        self._push_binder(Binder(value, self.fresh() if value.kind == V_LOC and value.flags & LINEAR else 0))
+        self._push_binder(Binder(value, self.fresh() if value.kind == V_LOC and value.flags & LINEAR
+                                 else NO_REFUGE))
 
     def _push_binder(self, binder: Binder) -> None:
         if len(self.B) >= MAX_BINDERS:
@@ -756,8 +764,27 @@ class RTLower(Stage):
         while len(self.U) > frame.umark:
             undo = self.U.pop()
             if undo.index < len(self.B):  # a name bound inside the arm is out of scope already
-                self.B.set(undo.index, undo.binder)
+                self.B.set(undo.index, replace(undo.binder, refuge=self.B.at(undo.index).refuge))
         self.G.truncate(frame.gmark)
+
+    def _wanted_later(self, index: int) -> bool:
+        """A name too far along for the annotation is taken to be wanted, which costs a read and is right."""
+        return index >= MASK_BITS or bool(self.live_now >> index & 1)
+
+    def _finish_moves_of_arm(self, frame: Frame) -> None:
+        """A scalar this arm moved out of a cell, for a read that has now happened. Another arm may not
+        have moved it at all, so it cannot be left in a register that the name still claims after the
+        join. If something after the join reads it, every arm had to move it, and it stays."""
+        for position in range(len(self.U) - 1, frame.umark - 1, -1):
+            undo = self.U.at(position)
+            if undo.index >= len(self.B):
+                continue
+            before, now = undo.binder.value, self.B.at(undo.index).value
+            if (before.kind == V_LOC and not before.flags & LINEAR and now.kind == V_REG
+                    and now.flags & OWNED and not self._wanted_later(undo.index)):
+                if self.live:
+                    self.i(f"drop r{now.reg}")
+                self.B.set(undo.index, replace(undo.binder, refuge=now.reg))
 
     def _close_join(self, frame: Frame) -> None:
         if frame.dest != D_REG:
@@ -852,6 +879,7 @@ class RTLower(Stage):
         if top.state != 1:
             self._forget_cells_from(top.cell)
         match = self.F.top()
+        self._finish_moves_of_arm(match)
         self._note_arm(match)
         self.F.set_top(match)
         self.jump(match.l3)
@@ -868,6 +896,7 @@ class RTLower(Stage):
             self.label(top.l1)
             top.state = 1
         else:
+            self._finish_moves_of_arm(top)
             self._note_arm(top)
             self.jump(top.l3)
             self._rollback(top)
@@ -877,6 +906,7 @@ class RTLower(Stage):
 
     def _close_if(self) -> None:
         top = self.F.pop()
+        self._finish_moves_of_arm(top)
         self._note_arm(top)
         if top.dest == D_REG:
             self.jump(top.l3)
@@ -1191,8 +1221,8 @@ class RTLower(Stage):
 
     def _close_cell(self, cell: int, named: frozenset, values_to: int, arguments: Iterable = ()) -> None:
         """A cell is about to be rebuilt or handed over, so nothing can be left in it. A linear
-        field not named by the new constructor moves to its name's refuge. A location waiting on
-        the value stack is read while it can be."""
+        field not named by the new constructor moves to its name's refuge, and so does a scalar that
+        something still reads. A location waiting on the value stack is read while it can be."""
         for index in range(values_to):
             value = self.V.at(index)
             if value.kind == V_LOC and value.cell == cell:
@@ -1203,12 +1233,19 @@ class RTLower(Stage):
         for index in range(len(self.B)):
             binder = self.B.at(index)
             value = binder.value
-            if (value.kind == V_LOC and value.cell == cell and value.flags & LINEAR
-                    and not value.flags & CONSUMED and (value.off, value.size) not in named):
-                self.i(f"take r{binder.refuge}, r{value.reg}[{value.off}:{value.size}]")
-                self._set_binder(index, Binder(Value(V_REG, binder.refuge, off=value.off,
-                                                     size=value.size, word=value.word, cell=cell,
-                                                     flags=OWNED | LINEAR)))
+            if value.kind != V_LOC or value.cell != cell:
+                continue
+            if value.flags & LINEAR:
+                if not value.flags & CONSUMED and (value.off, value.size) not in named:
+                    self.i(f"take r{binder.refuge}, r{value.reg}[{value.off}:{value.size}]")
+                    self._set_binder(index, Binder(Value(V_REG, binder.refuge, off=value.off,
+                                                         size=value.size, word=value.word, cell=cell,
+                                                         flags=OWNED | LINEAR), binder.refuge))
+            elif self._wanted_later(index):
+                refuge = self.fresh() if binder.refuge == NO_REFUGE else binder.refuge
+                self.i(f"read r{refuge}, r{value.reg}[{value.off}:{value.size}]")
+                self._set_binder(index, Binder(Value(V_REG, refuge, off=value.off, size=value.size,
+                                                     word=value.word, cell=cell, flags=OWNED), refuge))
         if cell:
             self._mark_gone(cell)
 
@@ -1244,7 +1281,7 @@ class RTLower(Stage):
         top.l3 = off | size << 8 | linear << 16
         self.F.set_top(top)
         self.B.push(Binder(Value(V_LOC, top.reg, off, size, self.new_word(), top.cell,
-                                 LINEAR if linear else 0), self.fresh() if linear else 0))
+                                 LINEAR if linear else 0), self.fresh() if linear else NO_REFUGE))
 
     def _close_with(self) -> None:
         top = self.F.pop()
@@ -1369,12 +1406,14 @@ DEFAULT_G_MAX = 2048
 
 
 def occupancy_bound(depth: int, g_cells: int, l_max: int = PAYLOAD_BYTES, w: int = 1) -> int:
-    """Theorem 7.2, for this ring: W + 4 + (E - 1) + L_max + (per-stage cells) * D + s * G."""
-    return w + 4 + (E_MAX - 1) + l_max + (S_PARSE + S_CHECK + S_LOWER) * depth + g_cells
+    """Theorem 7.2, for this ring: W + 5 + (E - 1) + L_max + (per-stage cells) * D + s * G. Five channels and
+    held cells now, with the right-to-left pass among the stages."""
+    return w + 5 + (E_MAX - 1) + l_max + (S_PARSE + CELLS_PER_DEPTH + S_CHECK + S_LOWER) * depth + g_cells
 
 
 def required_cells(d_max: int, g_max: int = DEFAULT_G_MAX) -> int:
-    return occupancy_bound(d_max, 2 * G_CELLS_PER_ENTRY * g_max) + 1
+    # G, the type tables, and one cell per function for what it returns.
+    return occupancy_bound(d_max, 2 * G_CELLS_PER_ENTRY * g_max + g_max) + 1
 
 
 def file_bytes(handle: BinaryIO, chunk: int = 4096) -> Iterator[int]:
@@ -1398,7 +1437,7 @@ def rt_lines(handle: BinaryIO, on_step: Optional[Callable[[Ring], None]] = None,
             pending.append(text.decode())
             text.clear()
 
-    stages = [Lexer(), Parser(), CheckStage(lfplo=True, phase1=phase1), RTLower()]
+    stages = [Lexer(), Parser(), RightToLeft(), CheckStage(lfplo=True, phase1=phase1), RTLower()]
     ring = Ring(required_cells(64), file_bytes(handle), stages, sink, on_step)
     for _ in _steps(ring):
         while pending:

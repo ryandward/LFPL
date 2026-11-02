@@ -24,12 +24,13 @@ from src.ring import Reject  # noqa: E402
 from src.rtlower import Limit  # noqa: E402
 from src.symcheck import check_translation  # noqa: E402
 from tests.reference import gen, hgen  # noqa: E402
+from tests.reference.lang import without_annotations  # noqa: E402
 from tests.test_forward import Forwarder  # noqa: E402
 
 COUNT = int(os.environ.get("LFPL_FUZZ", "60"))
 SEED = int(os.environ.get("LFPL_FUZZ_SEED", "0"))
 DATAGRAMS = 30
-DECLARED = ("nesting too deep", "section 8.1", "section 8.2", "name longer than")
+DECLARED = ("nesting too deep", "section 8.2", "name longer than")
 
 
 class GeneratedPrograms(unittest.TestCase):
@@ -50,6 +51,9 @@ class GeneratedPrograms(unittest.TestCase):
                 self.assertEqual([str(p) for p in check_translation(source, asm)], [],
                                  f"seed {seed}\n{source.decode()}")
                 self.assertEqual(build_and_run(asm, workdir), expected,
+                                 f"seed {seed}\n{source.decode()}")
+                # The right-to-left pass has to find every `@` that was written.
+                self.assertEqual(compile_program(without_annotations(source)), asm,
                                  f"seed {seed}\n{source.decode()}")
                 ran += 1
         print(f"generated programs: {ran} of {COUNT} ran", file=sys.stderr)

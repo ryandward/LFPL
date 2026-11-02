@@ -149,8 +149,14 @@ class Ring:
         self.peak_queue = 0
         self.ingest_finished = False
         self.current: Optional[Stage] = None
+        self.replay_line: Optional[int] = None  # set while a stage replays events it held back
         for stage in stages:
             stage.attach(self)
+
+    def line(self) -> int:
+        """The source line of what a stage downstream of Lex is looking at. Without events held back,
+        Lex is only a few tokens ahead of it."""
+        return self.stages[0].line if self.replay_line is None else self.replay_line
 
     # --- primitive location transfers: every rule below is built from these
 

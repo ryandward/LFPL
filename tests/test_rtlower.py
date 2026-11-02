@@ -8,6 +8,7 @@ from outside, in case something hid O(N) in an ordinary object.
 import gc
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import tracemalloc
@@ -16,18 +17,19 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src import rtlower  # noqa: E402
+from src import rtlower, symcheck  # noqa: E402
 from src.check import CheckStage  # noqa: E402
 from src.dyck import Lexer, Parser  # noqa: E402
 from src.lfplo import compile_program  # noqa: E402
 from src.lower import build_and_run  # noqa: E402
 from src.ring import Reject, Ring  # noqa: E402
-from src.rtcheck import Checker, RTError  # noqa: E402
+from src.rtcheck import Checker, RTError, check_stream  # noqa: E402
 from src.rtlower import Limit, RTLower, required_cells, rt_lines  # noqa: E402
 from src.symcheck import check_translation  # noqa: E402
 from src.validate import validate  # noqa: E402
 from src.x86 import Backend  # noqa: E402
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PRELUDE = "data List = Nil | Cons(h: Int64, t: List);\n"
 
 
@@ -227,15 +229,15 @@ fn f(l: List, p: Bool) : List = match l with
                             "f(Cons@c0(10, Cons@c1(20, Nil)), false)")
         self.assertEqual(self.answer(program), 720)
 
-    def test_a_joined_diamond_cannot_read_a_scalar_back_yet(self):
-        """Moving a diamond counts as handing it over. This is section 8.1's limit, with a reason a
-        program can act on, until the right-to-left pass says the scalar is wanted later."""
+    def test_a_joined_diamond_reads_a_scalar_back(self):
+        """Moving a diamond counts as handing it over, and the right-to-left pass says the scalar is
+        wanted later, so it moves out first."""
         program = two_cells("""
 fn f(l: List, p: Bool) : List = match l with
   | Nil => Nil
-  | Cons(d, h, t) => let e = if p then d else d in Cons@e(h, t) end;""", "f(Cons@c0(1, Nil), true)")
-        with self.assertRaisesRegex(Limit, "section 8.1"):
-            compile_program(program)
+  | Cons(d, h, t) => let e = if p then d else d in Cons@e(h, t) end;""",
+                            "f(Cons@c0(10, Cons@c1(20, Nil)), true)")
+        self.assertEqual(self.answer(program), 1020)
 
     def test_a_rebuilt_cell_can_be_matched_again(self):
         program = one_cell(TAGGED + """
@@ -351,6 +353,333 @@ class TheDecreasingSet(unittest.TestCase):
   | Cons(d, h, t) => f(y, t, Cons@d(h, acc))
   end;
 """), ["end decreasing 0,1"])
+
+
+class TheRightToLeftPass(unittest.TestCase):
+    """Section 8.1: a scalar moves out of its cell exactly when something reads it later, and `@k` can be left
+    out. Each program runs where it can, so a wrong annotation shows as a wrong answer or a refusal."""
+
+    NODE = """
+fn head(c: List, x: Int64) : List = match c with
+  | Nil => Nil
+  | Cons(e, y, u) => Cons@e(+(x, y), u) end;
+"""
+
+    @staticmethod
+    def stream(source: bytes) -> list:
+        return list(rt_lines(io.BytesIO(source)))
+
+    def body_of(self, source: bytes, name: str) -> list:
+        lines = self.stream(source)
+        first = next(i for i, line in enumerate(lines) if f" {name}(" in line and line.startswith(("fn ", "handler ")))
+        last = next(i for i in range(first, len(lines)) if lines[i].startswith("end"))
+        return lines[first:last + 1]
+
+    def answer(self, source: bytes) -> int:
+        asm = compile_program(source)
+        self.assertEqual([str(p) for p in check_translation(source, asm)], [], asm)
+        self.assertEqual(validate(asm), [], asm)
+        with tempfile.TemporaryDirectory() as workdir:
+            return build_and_run(asm, workdir)
+
+    def reads(self, source: bytes, name: str) -> list:
+        return [line.strip() for line in self.body_of(source, name) if line.strip().startswith("read")]
+
+    def test_read_after_its_cell_is_rebuilt_it_moves_out_first(self):
+        program = two_cells(self.NODE + """
+fn f(l: List) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let c = Cons@d(1, t) in head(c, h) end;""", "f(Cons@c0(10, Cons@c1(20, Nil)))")
+        self.assertEqual(self.answer(program), 1120)
+        body = self.body_of(program, "f")
+        read = next(i for i, line in enumerate(body) if line.strip().startswith("read"))
+        build = next(i for i, line in enumerate(body) if line.strip().startswith("build"))
+        self.assertLess(read, build)
+
+    def test_read_after_its_cell_goes_to_a_callee_it_moves_out_first(self):
+        program = two_cells(self.NODE + """
+fn mk(c: Diamond, x: Int64, t: List) : List = Cons@c(x, t);
+fn f(l: List) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let r = mk(d, 5, t) in head(r, h) end;""", "f(Cons@c0(10, Cons@c1(20, Nil)))")
+        self.assertEqual(self.answer(program), 1520)
+        self.assertEqual(len(self.reads(program, "f")), 1)
+
+    def test_read_before_and_after_it_is_the_later_read_that_counts(self):
+        program = two_cells(self.NODE + """
+fn f(l: List) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let k = +(h, 1) in let c = Cons@d(k, t) in head(c, h) end;""",
+                            "f(Cons@c0(10, Cons@c1(20, Nil)))")
+        self.assertEqual(self.answer(program), 2120)
+        self.assertEqual(len(self.reads(program, "f")), 1)
+
+    def test_read_only_in_one_arm_of_what_comes_after_it_still_moves(self):
+        for arms in ("| Nil => c | Cons(e, x, u) => Cons@e(+(x, h), u)", "| Cons(e, x, u) => Cons@e(+(x, h), u) | Nil => Nil"):
+            with self.subTest(arms=arms):
+                arms = arms.replace("| Nil => c", "| Nil => Nil")
+                program = two_cells(f"""
+fn f(l: List) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let c = Cons@d(1, t) in match c with {arms} end end;""", "f(Cons@c0(10, Cons@c1(20, Nil)))")
+                self.assertEqual(self.answer(program), 1120)
+
+    def test_read_only_in_the_else_of_what_comes_after_it_still_moves(self):
+        program = two_cells(self.NODE + """
+fn f(l: List, q: Bool) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let c = Cons@d(1, t) in if q then c else head(c, h) end;""",
+                            "f(Cons@c0(10, Cons@c1(20, Nil)), false)")
+        self.assertEqual(self.answer(program), 1120)
+
+    def test_it_moves_in_the_arm_of_a_match_that_reads_it_and_no_other(self):
+        """The last arm is the first the backward step meets, and what it saw must not reach the one before."""
+        source = (PRELUDE + TheRightToLeftPass.APPEND + """
+fn f(l: List, m: List) : List = match l with
+  | Nil => m
+  | Cons(d, h, t) => match m with
+      | Nil => Cons@d(2, t)
+      | Cons(e, x, u) => let c = Cons@d(1, app(t, u)) in Cons@e(h, c) end end;
+""").encode()
+        check_stream(rt_lines(io.BytesIO(source)))
+        self.assertEqual(len(self.reads(source, "f")), 1)
+
+    def test_a_later_name_in_the_same_position_is_a_different_name(self):
+        """Positions in scope are reused, so going backward a name has to stop being wanted where it is bound."""
+        for body in ("""let a = match l with | Nil => Nil | Cons(d, h, t) => Cons@d(1, t) end in
+                        let w = 7 in match a with | Nil => Nil | Cons(e, x, u) => Cons@e(w, u) end""",
+                     """match match l with | Nil => Nil | Cons(d, h, t) => Cons@d(1, t) end with
+                        | Nil => Nil | Cons(e, x, u) => Cons@e(+(x, 1), u) end"""):
+            with self.subTest(body=body):
+                source = (PRELUDE + f"fn f(l: List) : List = {body};\n").encode()
+                check_stream(rt_lines(io.BytesIO(source)))
+                self.assertEqual(self.reads(source, "f"), [], "h has nothing to do with what comes later")
+
+    def test_two_calls_that_return_the_same_cell(self):
+        """The location still holds that word, and it holds both updates: src/symcheck.py has to follow that."""
+        program = two_cells("""
+fn same(l: List) : List = match l with | Nil => Nil | Cons(d, h, t) => Cons@d(+(h, 1), t) end;
+fn f(l: List) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let a = same(t) in let b = same(a) in Cons@d(h, b) end;""",
+                            "f(Cons@c0(10, Cons@c1(20, Nil)))")
+        self.assertEqual(self.answer(program), 1022)
+
+    def test_with_nothing_reading_it_later_it_stays_where_it_is(self):
+        for body in ("Cons@d(1, t)", "let k = +(h, 1) in Cons@d(k, t)", "Cons@d(+(h, 1), t)", "Cons@d(h, t)"):
+            with self.subTest(body=body):
+                source = (PRELUDE + f"fn f(l: List) : List = match l with | Nil => Nil | Cons(d, h, t) => {body} end;\n"
+                          ).encode()
+                self.assertEqual(self.reads(source, "f"), [])
+
+    def test_it_moves_in_the_arm_that_reads_it_and_no_other(self):
+        for then, other, first, second in (("let c = Cons@d(1, t) in head(c, h)", "Cons@d(2, t)", 1, 0),
+                                           ("Cons@d(2, t)", "let c = Cons@d(1, t) in head(c, h)", 0, 1)):
+            with self.subTest(then=then):
+                definitions = self.NODE + f"""
+fn f(l: List, p: Bool) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => if p then {then} else {other} end;"""
+                for p, expected in ((True, 1120 if first else 220), (False, 1120 if second else 220)):
+                    program = two_cells(definitions, f"f(Cons@c0(10, Cons@c1(20, Nil)), {str(p).lower()})")
+                    self.assertEqual(self.answer(program), expected)
+                self.assertEqual(len(self.reads(program, "f")), 1)
+
+    def test_read_after_a_join_it_moves_in_every_arm_to_one_register(self):
+        program = two_cells(self.NODE + """
+fn f(l: List, p: Bool) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let c = if p then Cons@d(1, t) else Cons@d(2, t) in head(c, h) end;""",
+                            "f(Cons@c0(10, Cons@c1(20, Nil)), false)")
+        self.assertEqual(self.answer(program), 1220)
+        reads = self.reads(program, "f")
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(reads[0], reads[1])
+
+    def test_read_in_nested_arms_each_path_is_its_own(self):
+        definitions = self.NODE + """
+fn f(l: List, p: Bool, q: Bool) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => if p then
+      if q then let c = Cons@d(1, t) in head(c, h) else Cons@d(2, t)
+    else let c = Cons@d(3, t) in if q then head(c, h) else c end;"""
+        for p, q, expected in ((True, True, 1120), (True, False, 220), (False, True, 1320), (False, False, 320)):
+            with self.subTest(p=p, q=q):
+                program = two_cells(definitions, f"f(Cons@c0(10, Cons@c1(20, Nil)), {str(p).lower()}, {str(q).lower()})")
+                self.assertEqual(self.answer(program), expected)
+    def test_a_name_that_shadows_is_a_different_name(self):
+        program = two_cells(self.NODE + """
+fn f(l: List) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let h = +(h, 1) in let c = Cons@d(1, t) in head(c, h) end;""",
+                            "f(Cons@c0(10, Cons@c1(20, Nil)))")
+        self.assertEqual(self.answer(program), 1220)
+        self.assertEqual(self.reads(program, "f"), [], "the field's own last use came before the rebuild")
+
+    def test_a_let_can_name_the_field_and_then_it_is_that_name_that_moves(self):
+        program = two_cells(self.NODE + """
+fn f(l: List) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let y = h in let c = Cons@d(1, t) in head(c, y) end;""",
+                            "f(Cons@c0(10, Cons@c1(20, Nil)))")
+        self.assertEqual(self.answer(program), 1120)
+        self.assertEqual(len(self.reads(program, "f")), 1)
+
+    def test_both_names_of_one_field_move(self):
+        program = two_cells(self.NODE + """
+fn f(l: List) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let y = h in let c = Cons@d(1, t) in head(head(c, y), h) end;""",
+                            "f(Cons@c0(10, Cons@c1(20, Nil)))")
+        self.assertEqual(self.answer(program), 2120)
+
+    def test_stored_back_and_still_read_later(self):
+        program = two_cells(self.NODE + """
+fn f(l: List) : List = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let c = Cons@d(h, t) in head(c, h) end;""", "f(Cons@c0(10, Cons@c1(20, Nil)))")
+        self.assertEqual(self.answer(program), 2020)
+
+    def test_in_a_handler_too(self):
+        source = b"""data Bytes;
+record P { port: Int8, body: Bytes };
+handler h(p: P, free: Free) : (P, Free) = match p with P(d, port, body) =>
+  let q = P@d(1, body) in match q with P(e, one, rest) => (P@e(+(port, one), rest), free) end end;
+"""
+        checker = Checker()
+        for line in rt_lines(io.BytesIO(source)):
+            checker.feed(line)
+        checker.finish()
+        self.assertEqual(len(self.reads(source, "h")), 1)
+
+    def test_more_names_than_the_annotation_can_hold_are_taken_as_wanted(self):
+        """A chain of cells, one match inside another, each binding 9 names. The last match binds names 118 to
+        126, and the annotation stops at 120. Past that nothing says what is unused, so each moves, which costs
+        a read each, and the one at 119 is still known to be unused."""
+        fields = ", ".join(f"a{i}: Int8" for i in range(7))
+        levels = 14
+        names = lambda level: [f"x{level}_{i}" for i in range(7)]  # noqa: E731
+
+        def around(level: int, inner: str, first: str = "") -> str:
+            for k in reversed(range(level)):
+                scalars = names(k)
+                if k == level - 1 and first:
+                    scalars[0] = first
+                inner = f"N@d{k}({', '.join(scalars)}, {inner})"
+            return inner
+
+        body = around(levels - 1, "c", "x13_3")
+        body = f"let c = N@d13(1, 2, 3, 4, 5, 6, 7, l14) in {body}"
+        for level in reversed(range(levels)):
+            body = (f"match l{level} with | E => {around(level, 'E')} "
+                    f"| N(d{level}, {', '.join(names(level))}, l{level + 1}) => {body} end")
+        source = f"data L = E | N({fields}, next: L);\nfn f(l0: L) : L = {body};\n".encode()
+        check_stream(rt_lines(io.BytesIO(source)))
+        reads = self.reads(source, "f")
+        self.assertEqual(len(reads), 6, reads)
+        self.assertTrue(any("[3:1]" in read for read in reads), "one of them is the one that is wanted")
+    def cell(self, definitions: str, name: str = "f"):
+        """What the compiler finds, after checking that src/symcheck.py finds the same on its own."""
+        source = (PRELUDE + definitions).encode()
+        header = self.body_of(source, name)[0]
+        written = int(header.rsplit("@", 1)[1]) if "@" in header else None
+        parser = symcheck.SourceParser(source.decode())
+        parser.parse()
+        parser.infer_cells()
+        self.assertEqual(parser.fns[name].at, written, "the two inferences disagree")
+        return written
+
+    APPEND = ("fn app(x: List, y: List) : List = match x with | Nil => y "
+              "| Cons(d, h, t) => app(t, Cons@d(h, y)) end;\n")
+
+    def test_the_cell_every_exit_returns(self):
+        for definitions, expected in (
+                # one parameter's cell, through a match
+                ("fn f(l: List) : List = match l with | Nil => Nil | Cons(d, h, t) => Cons@d(h, t) end;", 0),
+                # the second parameter: an argument that is not a cell does not get in the way
+                ("fn f(k: Int64, l: List) : List = match l with | Nil => Nil | Cons(d, h, t) => Cons@d(k, t) end;", 1),
+                # itself
+                ("fn f(l: List) : List = l;", 0),
+                # through an alias of the diamond, and a join
+                ("fn f(l: List, p: Bool) : List = match l with | Nil => Nil | Cons(d, h, t) => "
+                 "let e = if p then d else d in Cons@e(7, t) end;", 0),
+                # through a let
+                ("fn f(l: List) : List = match l with | Nil => Nil | Cons(d, h, t) => let c = Cons@d(1, t) in c end;", 0),
+                # tail recursion modulo cons
+                ("fn f(l: List) : List = match l with | Nil => Nil | Cons(d, h, t) => Cons@d(+(h, 1), f(t)) end;", 0),
+                # a null, known through another name for the same word
+                ("fn f(l: List, p: Bool) : List = if p then l else match l with "
+                 "| Nil => Nil | Cons(d, h, t) => let c = Cons@d(h, t) in match c with "
+                 "| Nil => Nil | Cons(e, x, u) => Cons@e(x, u) end end;", 0),
+                # one parameter on one path and another on the other
+                (self.APPEND + "fn f(a: List, b: List) : List = match a with | Nil => b "
+                 "| Cons(d, h, t) => Cons@d(h, app(t, b)) end;", None),
+                # the second cell comes back, through a field of the parameter
+                ("fn f(l: List) : List = match l with | Nil => Nil | Cons(d, h, t) => match t with "
+                 "| Nil => Cons@d(h, Nil) | Cons(e, x, u) => Cons@e(x, Cons@d(h, u)) end end;", None),
+                # the arms of a join do not agree, so what it gives is nothing known
+                (self.APPEND + "record Box { v: Int64, rest: List };\n"
+                 "fn f(a: Box, b: Box, p: Bool) : Box = match a with Box(d, x, r) => match b with Box(e, y, s) => "
+                 "let z = if p then Box@d(x, Cons@e(y, app(r, s))) else Box@e(y, Cons@d(x, app(r, s))) "
+                 "in z end end;", None),
+                (self.APPEND + "record Box { v: Int64, rest: List };\n"
+                 "fn f(a: Box, b: Box, c: List) : Box = match a with Box(d, x, r) => match b with Box(e, y, s) => "
+                 "let z = match c with | Nil => Box@d(x, Cons@e(y, app(r, s))) "
+                 "| Cons(g, w, q) => Box@e(y, Cons@d(x, app(r, Cons@g(w, app(q, s))))) end "
+                 "in z end end;", None),
+                # a field of the parameter, and not the parameter
+                ("fn keep(c: Diamond, x: List) : List = Cons@c(1, x);\n"
+                 "fn f(l: List) : List = match l with | Nil => Nil | Cons(d, h, t) => keep(d, t) end;", None),
+                # the parameter's cell is not of the result type
+                ("fn f(k: Int64) : Int64 = k;", None),
+                ("fn f(d: Diamond) : Diamond = d;", None),
+                # an accumulator: neither parameter comes back
+                ("fn f(l: List, acc: List) : List = match l with | Nil => acc "
+                 "| Cons(d, h, t) => f(t, Cons@d(h, acc)) end;", None),
+                # a field with the same name as the parameter is not the parameter
+                ("fn f(l: List) : List = match l with | Nil => Nil | Cons(d, h, l) => Cons@d(h, l) end;", 0),
+                # a record update
+                ("record R { a: Int64, b: Int64 };\nfn f(r: R) : R = { r with a = 1 };", 0),
+                # several things come back, so which one would it be
+                ("fn f(l: List, k: Int64) : (List, Int64) = (l, k);", None)):
+            with self.subTest(definitions=definitions):
+                self.assertEqual(self.cell(definitions), expected)
+
+    def test_a_callees_cell_counts(self):
+        self.assertEqual(self.cell("""
+fn same(l: List) : List = match l with | Nil => Nil | Cons(d, h, t) => Cons@d(h, t) end;
+fn f(a: Int8, l: List) : List = same(l);"""), 1)
+        self.assertEqual(self.cell("""
+fn same(l: List) : List = l;
+fn f(l: List) : List = let r = same(l) in match r with | Nil => Nil | Cons(d, h, t) => Cons@d(h, t) end;"""), 0)
+        self.assertEqual(self.cell("""
+fn other(l: List, acc: List) : List = match l with | Nil => acc | Cons(d, h, t) => other(t, Cons@d(h, acc)) end;
+fn f(l: List) : List = other(l, Nil);"""), None)
+
+    def test_a_written_annotation_naming_nothing_is_checks_to_refuse(self):
+        with self.assertRaisesRegex(Reject, "unbound variable b"):
+            self.stream((PRELUDE + "fn f(a: List) : List @b = a;\n").encode())
+
+    def test_a_written_annotation_is_still_held_to_every_exit(self):
+        source = (PRELUDE + self.APPEND + "fn bad(a: List, b: List) : List @a = match a with "
+                  "| Nil => b | Cons(d, h, t) => Cons@d(h, app(t, b)) end;\n").encode()
+        with self.assertRaisesRegex(RTError, "declared @0"):
+            check_stream(rt_lines(io.BytesIO(source)))
+    def test_an_error_says_where_it_is_and_not_where_the_function_ends(self):
+        """The function is read to its end before Check sees any of it, so this has to be kept track of."""
+        source = PRELUDE + "fn f(x: Int64) : Int64 =\n  +(x,\n    y)\n" + "# filler\n" * 40 + ";\n"
+        with self.assertRaisesRegex(Reject, r"near line [45]: unbound variable y"):
+            self.stream(source.encode())
+    def test_the_examples_need_no_annotation(self):
+        for name in ("inc", "sum", "forward", "checksum"):
+            with open(os.path.join(ROOT, "examples", f"{name}.lfpl"), "rb") as handle:
+                self.assertNotRegex(handle.read(), rb"\) : [^=;]*? @\w+ =")
+        with open(os.path.join(ROOT, "examples", "sum.lfpl"), "rb") as handle:
+            source = handle.read()
+        self.assertEqual(self.answer(source), 9)
+        lower = subprocess.run([sys.executable, "-m", "src.lower", "examples/sum.lfpl", "-r"], cwd=ROOT,
+                               capture_output=True, text=True, check=True)
+        self.assertEqual(lower.stdout.strip(), "9", "and the old Lower gets what it needs from the pass")
 
 
 class RefusedWithAReason(unittest.TestCase):

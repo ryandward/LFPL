@@ -427,6 +427,14 @@ class SourceParser:
         self.fns: dict[str, Fn] = {}
         self.states: list[tuple[str, str]] = []
 
+    def infer_cells(self) -> None:
+        """`@` is optional, and a function that does not write it may still return a parameter's own cell.
+        This works out which, by section 8.1's rule as src/righttoleft.py states it, sharing no code
+        with it: if the two disagree, what the compiler wrote will not check against this."""
+        for fn in self.fns.values():
+            if fn.at is None:
+                fn.at = _returned_cell(fn, self.fns)
+
     def builtin_reserve(self) -> None:
         """LFPL-O's Free, if the program did not declare its own."""
         self.types.setdefault("Free", TypeInfo("Free", [
@@ -667,6 +675,84 @@ class SourceParser:
             arms.append((ctor, binders, self.expr()))
         self.next()
         return ("match", scrutinee, arms)
+
+
+# ------------------------------------------- which parameter's cell a function returns
+
+_NOTHING_KNOWN, _NULL = "nothing known", "null"
+_NOT_A_CELL = {"Int8", "Int16", "Int32", "Int64", "Bool", "Diamond"}
+
+
+def _word_of(e: tuple, names: dict, fn: "Fn", fns: dict):
+    """The word of a value: a parameter's position, null, or nothing known."""
+    kind = e[0]
+    if kind == "var":
+        return names.get(e[1], _NOTHING_KNOWN)
+    if kind == "null":
+        return _NULL
+    if kind == "ctor":
+        return names.get(e[2], _NOTHING_KNOWN)
+    if kind == "with":
+        return _word_of(e[1], names, fn, fns)
+    if kind == "let":
+        return _word_of(e[3], {**names, e[1]: _word_of(e[2], names, fn, fns)}, fn, fns)
+    if kind == "lettuple":
+        return _word_of(e[3], {**names, **{name: _NOTHING_KNOWN for name in e[1]}}, fn, fns)
+    if kind == "if":
+        then, other = _word_of(e[2], names, fn, fns), _word_of(e[3], names, fn, fns)
+        return then if then == other else _NOTHING_KNOWN
+    if kind == "match":
+        scrutinee = _word_of(e[1], names, fn, fns)
+        words = {_word_of(body, _arm_names(binders, scrutinee, names), fn, fns) for _ctor, binders, body in e[2]}
+        return words.pop() if len(words) == 1 else _NOTHING_KNOWN
+    if kind == "call" and e[1] != fn.name and e[1] in fns:
+        at = fns[e[1]].at
+        if at is not None and at < len(e[2]):
+            word = _word_of(e[2][at], names, fn, fns)
+            return word if isinstance(word, int) else _NOTHING_KNOWN
+    return _NOTHING_KNOWN
+
+
+def _arm_names(binders: list, scrutinee, names: dict) -> dict:
+    inner = dict(names)
+    for position, name in enumerate(binders):
+        inner[name] = scrutinee if position == 0 else _NOTHING_KNOWN
+    return inner
+
+
+def _allowed_by_exits(e: tuple, names: dict, nulls: frozenset, fn: "Fn", fns: dict) -> set:
+    """The parameters whose cell every exit of this expression returns."""
+    kind = e[0]
+    if kind == "let":
+        inner = {**names, e[1]: _word_of(e[2], names, fn, fns)}
+        return _allowed_by_exits(e[3], inner, nulls, fn, fns)
+    if kind == "lettuple":
+        inner = {**names, **{name: _NOTHING_KNOWN for name in e[1]}}
+        return _allowed_by_exits(e[3], inner, nulls, fn, fns)
+    if kind == "if":
+        return (_allowed_by_exits(e[2], names, nulls, fn, fns) & _allowed_by_exits(e[3], names, nulls, fn, fns))
+    if kind == "match":
+        scrutinee = _word_of(e[1], names, fn, fns)
+        allowed = set(range(len(fn.params)))
+        for _ctor, binders, body in e[2]:
+            known = nulls | {scrutinee} if not binders and isinstance(scrutinee, int) else nulls
+            allowed &= _allowed_by_exits(body, _arm_names(binders, scrutinee, names), known, fn, fns)
+        return allowed
+    if kind == "call" and e[1] == fn.name:
+        return {k for k, argument in enumerate(e[2]) if _word_of(argument, names, fn, fns) == k}
+    word = _word_of(e, names, fn, fns)
+    if isinstance(word, int):
+        return {word}
+    return set(nulls) if word == _NULL else set()
+
+
+def _returned_cell(fn: "Fn", fns: dict) -> Optional[int]:
+    if not isinstance(fn.ret, str) or fn.ret in _NOT_A_CELL or fn.ret.startswith(("Array[", "Fin ")):
+        return None
+    names = {name: position for position, (name, _ty) in enumerate(fn.params)}
+    allowed = _allowed_by_exits(fn.body, names, frozenset(), fn, fns)
+    candidates = [k for k in sorted(allowed) if fn.params[k][1] == fn.ret]
+    return candidates[0] if candidates else None
 
 
 # ------------------------------------------------------- the source's meaning
@@ -1382,20 +1468,24 @@ class FunctionCheck:
                 return self._pointer_of(node[2][at])
         return leaf
 
-    def _rewrite(self, S: State, pointer: int, new: int) -> None:
-        """After `f @k`, that word denotes the updated value, wherever it is held.
+    def _rewrite(self, S: State, pointer: int, cond: int, result: int) -> None:
+        """After `f @k`, if cond holds, that word denotes the updated value, wherever it is held.
         This is why RESTORE compares equal: the skipped store's location already holds
-        the word, and it holds the updated value only because the call really ran."""
+        the word, and it holds the updated value only because the call really ran. What it denoted
+        before can itself be the result of an earlier call on that word, which this one then updates."""
         T = self.T
-        swap = lambda term: T.lift(lambda x: new if x == pointer else x, term)  # noqa: E731
+        swap = lambda term: T.lift(  # noqa: E731
+            lambda x: T.select(cond, result, x) if self._pointer_of(x) == pointer else x, term)
         node = T.nodes[pointer]
         implicit = None
-        if node[0] == "load" and self._read(S, node[1], node[2], node[3]) == pointer:
-            implicit = (node[1], node[2], node[3])
+        if node[0] == "load":
+            held = self._read(S, node[1], node[2], node[3])
+            if any(self._pointer_of(leaf) == pointer for _cond, leaf in T.paths(held)):
+                implicit = (node[1], node[2], node[3]), swap(held)
         S.regs = {r: swap(t) for r, t in S.regs.items()}
         S.mem = {k: swap(t) for k, t in S.mem.items()}
         if implicit is not None:
-            S.mem[implicit] = new
+            S.mem[implicit[0]] = implicit[1]
 
     def _invoke(self, S: State, callee: Fn) -> int:
         """The value of calling `callee` with the parameter registers as they stand."""
@@ -1417,8 +1507,7 @@ class FunctionCheck:
                         self._hand_over(S, leaf, cond)
         if callee.at is not None:
             for cond, leaf in T.paths(args[callee.at]):
-                word = self._pointer_of(leaf)
-                self._rewrite(S, word, T.select(cond, result, word))
+                self._rewrite(S, self._pointer_of(leaf), cond, result)
         return result
 
     def _hand_over(self, S: State, leaf: int, cond: int) -> None:
@@ -1721,6 +1810,7 @@ def check_translation(source: bytes, asm: str) -> list[Problem]:
     limit = sys.getrecursionlimit()
     sys.setrecursionlimit(max(limit, 100_000))
     try:
+        program.infer_cells()
         for name, fn in program.fns.items():
             body = bodies.get(name)
             if body is None:

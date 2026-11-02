@@ -1,9 +1,7 @@
 """Check: first-order linear typing as a fold over the Dyck word.
 
 Linear variables (diamond, data, records) are used exactly once on every path.
-Scalars are erasable, and reading one does not consume it. Lower enforces the
-one further rule a forward fold requires: overwriting a location erases the
-scalar homed there.
+Scalars are erasable, and reading one does not consume it.
 
 Rule R3 makes every function terminate. For some fixed set of linear argument positions,
 not counting Free, the total number of cells must strictly fall at every recursive call.
@@ -40,9 +38,9 @@ from typing import NamedTuple, Optional
 
 from .dyck import (CLOSE, ELEMENT_CODES, OP_NAMES, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP,
                    K_CTOR, K_CTORDECL, K_DATA, K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER,
-                   K_IDX, K_IF, K_INT, K_LET, K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM,
-                   K_RECORD, K_RESWORD, K_RTDECL, K_RTDECLMORE, K_STATE, K_TARRAY, K_TFIN,
-                   K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_WITH, LEAF, OPEN, SEP,
+                   K_IDX, K_IF, K_INT, K_LET, K_LIVE, K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR,
+                   K_PACK, K_PARAM, K_RECORD, K_RESWORD, K_RTDECL, K_RTDECLMORE, K_STATE, K_TARRAY, K_TFIN,
+                   K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_VARLAST, K_WITH, LEAF, OPEN, SEP,
                    ev_class, ev_kind, ev_tag)
 from .ring import FrameStack, Reject, Ring, Stage
 from .tokens import PAYLOAD_BYTES
@@ -236,7 +234,7 @@ class CheckStage(Stage):
     def _reject(self, message: str) -> Reject:
         # "Near": the ring holds a few tokens between Lex and here, so the lexer's
         # line can be slightly ahead of the construct this stage is looking at.
-        return Reject(f"near line {self.ring.stages[0].line}: {message}")
+        return Reject(f"near line {self.ring.line()}: {message}")
 
     def _g_push(self, kind: int, name: bytes, a=0, b=0, c=0, d=0, x=0, y=0, z=0) -> int:
         if len(self.G) >= self.g_max:
@@ -994,6 +992,8 @@ class CheckStage(Stage):
     # --- leaf
 
     def _on_leaf(self, kind: int, payload: bytes):
+        if kind == K_LIVE:  # the right-to-left pass, on its way to Lower: not a value
+            return (kind, payload) if self.lfplo else None
         if kind == K_EOF:
             self._check_forwards_resolved()
             return kind, payload
@@ -1057,11 +1057,11 @@ class CheckStage(Stage):
             return None
         self.child_seen = True
         self.form = Cells()  # literals, Bool and null constructors own no cells
-        if kind == K_VAR:
+        if kind in (K_VAR, K_VARLAST):
             src, ty, linear = self._use(payload)
             self.ty = ty
             self.form = self._form_of(src)
-            return kind, P_VAR.pack(src, linear != 255, size_of(ty))
+            return (kind if self.lfplo else K_VAR), P_VAR.pack(src, linear != 255, size_of(ty))
         if kind == K_INT:
             self.ty = T_LIT
             if self.lfplo:
