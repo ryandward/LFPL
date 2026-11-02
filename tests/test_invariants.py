@@ -1,32 +1,37 @@
-"""Executable verification of the Phase 1 invariants, on real x86-64.
+"""Executable verification of the first specification's invariants, on real x86-64.
 
 Each kind of claim is marked: resource safety, or translation correctness. A
 theorem test that cannot fail proves nothing, so every class holds a control
 that must trip the same detector on code that really does violate the claim.
 """
 import gc
+import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import tracemalloc
 import unittest
-from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.check import CheckStage  # noqa: E402
 from src.dyck import (CLOSE, K_ARM, K_FN, OPEN, DyckError, DyckValidator, Lexer,  # noqa: E402
                       Parser, ev_tag, parse_events, show_event)
-from src.lower import (DECLARED_LIMITS, FailFast, Lower, build_and_run, compile_source,  # noqa: E402
-                       compile_text, file_bytes, occupancy_bound, required_cells)
+from src.lfplo import build_and_run, compile_program  # noqa: E402
+from src.righttoleft import RightToLeft  # noqa: E402
 from src.ring import FStarved, Reject, Ring, Stage  # noqa: E402
-from src.tokens import (CellStore, ConservationError, Flags, Hole,  # noqa: E402
-                        HomeUniquenessError, LMem, LReg, PayloadOverflow, Silicon, check_homes)
+from src.rtcheck import RTError, check_stream  # noqa: E402
+from src.rtlower import (E_MAX, Limit, RTLower, compiler_ring, file_bytes, occupancy_bound,  # noqa: E402
+                         required_cells, rt_lines)
+from src.tokens import CellStore, ConservationError, PayloadOverflow  # noqa: E402
 from src.symcheck import check_translation  # noqa: E402
 from src.validate import function_body, validate  # noqa: E402
+from src.x86 import Backend  # noqa: E402
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PRE = b"""data Free = End | More(next: Free);
 data Res = Fail | Done(value: Int64, rest: Free);
 data List = Nil | Cons(h: Int64, t: List);
@@ -35,14 +40,27 @@ record Q { a: Int64, b: Int64 };
 """
 
 
+compile_text = compile_program
+
+
+def compile_source(source, *, cells=None, d_max: int = 64, on_step=None) -> Ring:
+    """The whole ring, down to the RT stream, with the text thrown away. What is left to look at is the ring."""
+    ring = compiler_ring(source, lambda tag, payload: None, on_step, phase1=True, cells=cells, d_max=d_max)
+    ring.run()
+    return ring
+
+
 def run(source: bytes) -> int:
     with tempfile.TemporaryDirectory() as workdir:
-        return build_and_run(compile_text(source, checks=True), workdir)
+        return build_and_run(compile_text(source), workdir)
 
 
 def body(source: bytes, name: str) -> list[str]:
-    asm = compile_text(source, checks=True)
-    return [f"{op} {', '.join(args)}".strip() for op, args in function_body(asm, name)]
+    """What the function does. The two instructions that adjust its frame are left out, because the backend
+    writes them before it knows the frame's size, so a frame with nothing in it still has them: the README's gap."""
+    asm = compile_text(source)
+    lines = [f"{op} {', '.join(args)}".strip() for op, args in function_body(asm, name)]
+    return [line for line in lines if line not in (f"sub rsp, F_{name}", f"add rsp, F_{name}")]
 
 
 def normalized(lines: list[str]) -> list[str]:
@@ -52,7 +70,7 @@ def normalized(lines: list[str]) -> list[str]:
     def rename(match: re.Match) -> str:
         return seen.setdefault(match.group(0), f"L#{len(seen)}")
 
-    return [re.sub(r"\bL\d+\b", rename, line) for line in lines]
+    return [re.sub(r"\b[LX]\d+(?:_f\d+)?\b", rename, line) for line in lines]
 
 
 class ZeroBooleanTrampolines(unittest.TestCase):
@@ -123,10 +141,10 @@ class ZeroBooleanTrampolines(unittest.TestCase):
 
 
 def trampolines(asm: str) -> list[str]:
-    lines = [line.strip() for line in asm.splitlines() if line.strip()]
+    lines = [line.strip() for line in asm.splitlines() if line.strip() and " equ " not in line]
     found = []
     for at, line in enumerate(lines[:-1]):
-        if line.endswith(":") and not line.endswith("_body:"):
+        if line.endswith(":") and not line.endswith("$body:"):
             following = lines[at + 1]
             if following.startswith("jmp ") and not lines[at - 1].startswith(("fn_",)):
                 found.append(f"{line} {following}")
@@ -136,13 +154,13 @@ def trampolines(asm: str) -> list[str]:
 class ZeroUnchangedFieldCopies(unittest.TestCase):
     """Theorem 6.1 and Corollary 6.3 (translation correctness)."""
 
-    FN = PRE + b"fn get(p: P, free: Free) : Res = match p with P(d, x, y, z) => " \
+    FN = PRE + b"fn rd(p: P, free: Free) : Res = match p with P(d, x, y, z) => " \
                b"Done@d(+(z, +(pack<32>(x), pack<32>(y))), free) end;\n"
 
     def _program(self, update: bytes, x=2, y=3, z=100) -> bytes:
         return self.FN + b"fn u(p: P, v: Int32) : P @p = " + update + b";\n" + (
             b"fn main(free: Free) : Res = match free with End => Fail | More(c, rest) => "
-            b"get(u(P@c(%d, %d, %d), 7), rest) end;" % (x, y, z))
+            b"rd(u(P@c(%d, %d, %d), 7), rest) end;" % (x, y, z))
 
     def test_form_one_store_of_an_operand(self):
         source = self._program(b"{ p with y = v }")
@@ -150,11 +168,14 @@ class ZeroUnchangedFieldCopies(unittest.TestCase):
                          ["mov rax, rdi", "mov dword [rdi+4], esi", "ret"])
         self.assertEqual(run(source), 2 + 7 + 100)
 
-    def test_form_two_computation_lands_in_the_field(self):
+    def test_form_two_computation_reaches_the_field_in_one_store(self):
+        """`build` is one atomic instruction, so a computation with arms joins in a register, and on
+        every path there is one store to the field and none to any other."""
         source = self._program(b"{ p with y = if <(v, 9) then 1 else 2 }")
         lines = body(source, "u")
-        self.assertEqual([l for l in lines if "[rdi" in l and l.startswith("mov")],
-                         ["mov dword [rdi+4], 1", "mov dword [rdi+4], 2"])
+        stores = [l for l in lines if "[rdi" in l and l.startswith("mov")]
+        self.assertEqual(len(stores), 1, lines)
+        self.assertRegex(stores[0], r"^mov dword \[rdi\+4\], \w+$")
         self.assertEqual(run(source), 2 + 1 + 100)
 
     def test_form_three_single_read_modify_write(self):
@@ -196,7 +217,7 @@ class ZeroUnchangedFieldCopies(unittest.TestCase):
         self.assertEqual(normalized(body(source, "inc")),
                          normalized(["mov rax, rdi", "test rdi, rdi", "je L2",
                                      "add qword [rdi], 1", "mov rdi, qword [rdi+8]",
-                                     "jmp L1", "ret"]))
+                                     "jmp X1", "ret"]))
 
     def test_a_literal_is_never_taken_for_a_provenance_word(self):
         """An imm home keeps its value where a word would be. If the value happened
@@ -252,6 +273,9 @@ class ZeroUnchangedFieldCopies(unittest.TestCase):
                         b"take(f(Box@a(100, 0), Box@b(10, 20)), r2) end end;")
         self.assertEqual(run(source), 110 + 1 + 20)
         self.assertEqual(validate(compile_text(source)), [])
+        # What really waits on this path: a location on the value stack, with the same cell rebuilt ahead of it.
+        waiting = source.replace(b"B@e(+(u, v), Box@d(1, x))", b"B@e(v, Box@d(1, x))")
+        self.assertEqual(run(waiting), 10 + 1 + 20)
 
     def test_evacuation_in_a_returning_arm_is_invisible_to_the_next_arm(self):
         """An evacuation is undone for the next arm: its field is still in the cell."""
@@ -269,15 +293,19 @@ class ZeroUnchangedFieldCopies(unittest.TestCase):
                         b"take(f(Box@a(100, 0), Box@b(10, 20), false), r2) end end;")
         self.assertEqual(run(source), 101 + 10 + 20)
 
-    def test_a_value_evacuated_in_one_arm_and_live_at_the_join_fails_fast(self):
+    def test_a_value_moved_out_in_both_arms_and_live_at_the_join(self):
+        """The first Lower had to stop at this. A linear field gets its one register when it is bound, so
+        both arms move it to the same place, and the join has nothing to reconcile."""
         source = PRE + (b"data Box;\nrecord B { p: Int64, c: Box };\n"
                         b"record Box { n: Int64, m: Int64 };\n"
-                        b"fn k(y: B, s: Bool) : Box = match y with B(d, p, c) => "
+                        b"fn k(y: B, s: Bool, free: Free) : Res = match y with B(d, p, c) => "
                         b"let r = if s then Box@d(1, 2) else Box@d(3, 4) in "
                         b"match r with Box(e, n, m) => match c with Box(f, a, b) => "
-                        b"Box@e(a, n) end end end;\n")
-        with self.assertRaisesRegex(FailFast, "5.3"):
-            compile_text(source)
+                        b"Done@e(+(*(n, 100), +(*(a, 10), b)), More@f(free)) end end end;\n"
+                        b"fn main(r0: Free) : Res = match r0 with End => Fail | More(a, r1) => "
+                        b"match r1 with End => Done@a(0, End) | More(b, r2) => "
+                        b"k(B@a(9, Box@b(5, 6)), false, r2) end end;")
+        self.assertEqual(run(source), 3 * 100 + 5 * 10 + 6)
 
     def test_an_unread_scalar_is_erased_without_a_load(self):
         """The control for the rule above: nobody waits for b, so no load appears."""
@@ -315,14 +343,20 @@ class ZeroUnchangedFieldCopies(unittest.TestCase):
                                   "    mov rbx, qword [rdi]\n"), [])
         self.assertEqual(validate("    mov rdi, qword [rdi+8]\n    mov qword [rdi+8], rdi\n"), [])
 
-    def test_control_broken_lowerer_is_caught(self):
-        """Disable STAY and RESTORE in the lowerer: the copies must appear, and the
-        independent validator must see them. This is what the theorem rules out."""
-        source = self._program(b"match p with P(d, x, y, z) => P@d(x, +(y, v), z) end")
-        with mock.patch.object(Lower, "_restores", lambda self, dest, value: False), \
-                mock.patch.object(Lower, "_key", lambda self, index: None):
-            broken = compile_text(source)
-        self.assertTrue([v for v in validate(broken) if v.kind == "I2"], broken)
+    def test_control_writing_a_value_back_is_refused_and_seen(self):
+        """What the theorem rules out, written by hand, since Lower has no way left to say it: a field read
+        and stored back where it came from. rtcheck refuses it as a type error, and if something got past
+        that, the independent validator sees the copy in the assembly."""
+        stream = ["type t16 record R", "ctor c0 t16 - R", "field c0 0 8 i64 a", "field c0 8 8 i64 b",
+                  "fn f0 u(r0 : t16) : t16 @0", "    open r0, c0", "    read r1, r0[0:8]",
+                  "    build r0, c0, none, r1, =", "    drop r1", "    ret r0", "end"]
+        with self.assertRaisesRegex(RTError, "back where it came from"):
+            check_stream(stream)
+        lines = []
+        backend = Backend(lines.append)
+        for line in stream:
+            backend.feed(line)
+        self.assertTrue([v for v in validate("\n".join(lines) + "\n") if v.kind == "I2"], lines)
 
 
 class PhantomConstruction(unittest.TestCase):
@@ -338,11 +372,17 @@ class PhantomConstruction(unittest.TestCase):
     def test_direct_match_emits_nothing_for_the_constructor(self):
         self.assertEqual(normalized(body(self.DIRECT, "f")), normalized(body(self.NONE, "f")))
 
-    def test_let_bound_match_emits_nothing_for_the_constructor(self):
+    def test_a_constructor_bound_by_let_is_built_first_and_means_the_same(self):
+        """This one did not move. Theorem 7.4 covers a constructor a match takes apart at once, and through
+        a `let` the first Lower kept it unbuilt too, which is the part of it that took a table of pending
+        fields. Here it is built and then read, so what holds is the answer, and the README says so."""
         source = PRE + (b"fn f(x: Int64, c: Diamond, y: Int64, free: Free) : Res = "
                         b"let v = Q@c(x, y) in match v with Q(e, p, q) => "
-                        b"Done@e(+(p, q), free) end;\nfn main() : Int64 = 0;")
-        self.assertEqual(normalized(body(source, "f")), normalized(body(self.NONE, "f")))
+                        b"Done@e(+(p, q), free) end;\n"
+                        b"fn main(free: Free) : Res = match free with End => Fail | "
+                        b"More(c, rest) => f(30, c, 12, rest) end;")
+        self.assertEqual(run(source), 42)
+        self.assertEqual(len([l for l in body(source, "f") if l.startswith("mov qword [")]), 4)
 
     def test_literal_fields_write_no_bytes(self):
         source = PRE + (
@@ -412,18 +452,18 @@ class CellConservation(unittest.TestCase):
             ring.check_conservation()
             steps.append(1)
 
-        ring, _lower = compile_source(self.SOURCE, cells=512, checks=True, on_step=on_step)
+        ring = compile_source(self.SOURCE, on_step=on_step)
         self.assertGreater(len(steps), 1000)
         ring.check_conservation()
 
     def test_only_the_global_tables_stay_out_of_f_at_the_end(self):
-        ring, lower = compile_source(self.SOURCE, cells=512)
-        check = ring.stages[2]
-        self.assertEqual(ring.store.C - len(ring.F), len(check.G.cells) + len(lower.table.cells))
-        self.assertEqual(len(check.K) + len(check.B) + len(lower.K) + len(lower.B), 0)
+        ring = compile_source(self.SOURCE)
+        passed, check = ring.stages[2], ring.stages[3]
+        tables = (check.G, check.TA, check.TF, check.TT, passed.T)
+        self.assertEqual(ring.store.C - len(ring.F), sum(len(table.cells) for table in tables))
 
     def test_every_ring_rule_fired(self):
-        ring, _ = compile_source(self.SOURCE, cells=512)
+        ring = compile_source(self.SOURCE)
         for rule in ("ingest", "pass", "push", "drop", "expand", "egress", "frame"):
             self.assertGreater(ring.counts[rule], 0, rule)
 
@@ -439,27 +479,6 @@ class CellConservation(unittest.TestCase):
                   b"fn main(free: Cells) : Res = match free with None => Fail | "
                   b"Cell(out, rest) => count(rest, 0, out, None) end;")
         self.assertEqual(run(source), 1023)
-
-    def test_register_partition_is_checked_each_step(self):
-        with mock.patch.object(Silicon, "check_partition", autospec=True) as check:
-            compile_source(self.SOURCE, cells=512, checks=True)
-        self.assertGreater(check.call_count, 50)
-
-    def test_home_uniqueness_control(self):
-        with self.assertRaises(HomeUniquenessError):
-            check_homes({"x": LReg(0), "y": LReg(0)})
-        with self.assertRaises(HomeUniquenessError):
-            check_homes({"x": LMem(1, 8, 8), "y": LMem(1, 8, 8)})
-        check_homes({"x": LReg(0), "y": LReg(1), "z": LMem(1, 8, 8)})
-
-    def test_register_partition_control(self):
-        silicon = Silicon()
-        silicon.take(0)
-        with self.assertRaises(ConservationError):
-            silicon.check_partition([])  # rax taken, and nobody holds it
-        silicon.check_partition([0])
-        with self.assertRaises(HomeUniquenessError):
-            silicon.check_partition([0, 0])
 
     def test_control_a_leak_is_caught(self):
         class Leaky(Stage):
@@ -495,6 +514,58 @@ class CellConservation(unittest.TestCase):
             store.put(0, 7, bytes(16))
 
 
+def homes_conflict(backend: Backend) -> list[str]:
+    """Invariant H, as the x86 backend holds it: no two live values share a home, and the table and
+    its inverse agree. Registers exist only down here now, so this is where the partition is."""
+    found = []
+    homes = list(backend.home.values())
+    if len(set(homes)) != len(homes):
+        found.append(f"two values share a home: {backend.home}")
+    held = {home: r for r, home in backend.home.items() if isinstance(home, str)}
+    if held != backend.owner:
+        found.append(f"the table and its inverse differ: {backend.home} and {backend.owner}")
+    return found
+
+
+class RegisterHomes(unittest.TestCase):
+    """Theorem 7.1's register half (resource safety), at every line of the stream."""
+
+    def _lines_checked(self, source: bytes) -> int:
+        backend = Backend(lambda line: None)
+        checked = 0
+        for line in rt_lines(io.BytesIO(source), phase1=True):
+            backend.feed(line)
+            self.assertEqual(homes_conflict(backend), [], line)
+            checked += 1
+        return checked
+
+    def test_every_program_here_keeps_one_value_in_one_home(self):
+        self.assertGreater(self._lines_checked(CellConservation.SOURCE), 50)
+
+    def test_under_more_live_values_than_registers(self):
+        lets = "".join(f"let t{i} = +(a, {i}) in " for i in range(30))
+        total = "".join(f"+(t{i}, " for i in range(29)) + "t29" + ")" * 29
+        source = (f"fn h(x: Int64, y: Int64) : Int64 = +(*(x, 3), y);\n"
+                  f"fn f(a: Int64) : Int64 = {lets}+(h(t0, t1), {total});\n"
+                  f"fn main() : Int64 = f(1);").encode()
+        self.assertGreater(self._lines_checked(source), 50)
+
+    def test_control_the_check_sees_two_values_in_one_home(self):
+        backend = Backend(lambda line: None)
+        backend.home = {0: "rax", 1: "rax"}
+        backend.owner = {"rax": 1}
+        self.assertEqual(len(homes_conflict(backend)), 1)
+        backend.home = {0: 3, 1: 3}
+        backend.owner = {}
+        self.assertEqual(len(homes_conflict(backend)), 1)
+        backend.home = {0: "rax"}
+        backend.owner = {"rax": 1}
+        self.assertEqual(len(homes_conflict(backend)), 1)
+        backend.home = {0: "rax", 1: "rbx", 2: 3}
+        backend.owner = {"rax": 0, "rbx": 1}
+        self.assertEqual(homes_conflict(backend), [])
+
+
 class DepthBound(unittest.TestCase):
     """Theorem 7.2 (resource safety): cells scale with depth, not source length."""
 
@@ -514,8 +585,7 @@ class DepthBound(unittest.TestCase):
         return text
 
     def _peak(self, source: bytes) -> int:
-        ring, _ = compile_source(source, cells=4096)
-        return ring.peak_cells
+        return compile_source(source).peak_cells
 
     def test_source_length_does_not_move_the_peak(self):
         full, _ = self._balanced(10)
@@ -536,8 +606,8 @@ class DepthBound(unittest.TestCase):
         tracing starts, so only what the stages keep counts against them. gc.collect()
         also empties CPython's free lists, so memory that earlier tests left there
         cannot absorb a cost: without it, the result depended on test order."""
-        lower = Lower()
-        ring = Ring(required_cells(16), iter(text), [lexer(), Parser(16), CheckStage(), lower],
+        ring = Ring(required_cells(16), iter(text),
+                    [lexer(), Parser(16), RightToLeft(), CheckStage(phase1=True), RTLower()],
                     lambda tag, payload: None)
         gc.collect()
         tracemalloc.start()
@@ -603,9 +673,9 @@ class DepthBound(unittest.TestCase):
     def test_depth_limit_is_a_syntax_rejection_at_exactly_d_max(self):
         ok = self._thin(5)
         source = f"fn f(a: Int64) : Int64 = {ok};".encode()
-        compile_source(source, cells=512, d_max=6)
+        compile_source(source, d_max=6)
         with self.assertRaisesRegex(Reject, "nesting too deep"):
-            compile_source(source, cells=512, d_max=5)
+            compile_source(source, d_max=5)
 
     def test_rejection_depends_only_on_text_not_on_memory(self):
         source = f"fn f(a: Int64) : Int64 = {self._thin(50)};".encode()
@@ -614,19 +684,20 @@ class DepthBound(unittest.TestCase):
                 compile_source(source, cells=cells, d_max=10)
 
     def test_the_bound_holds_at_every_step(self):
-        """Theorem 7.2 as a formula: W + 4 + (E-1) + L_max + s*D + s*G, measured."""
+        """Theorem 7.2 as a formula: W + 5 + (E-1) + L_max + s*D + s*G, measured."""
         full, _ = self._balanced(9)
         source = (PRE + f"fn f(a: Int64) : Int64 = {full};\n".encode()
                   + CellConservation.SOURCE[len(PRE):])
 
         def on_step(ring: Ring) -> None:
-            check, lower = ring.stages[2], ring.stages[3]
+            passed, check = ring.stages[2], ring.stages[3]
             depth = max(stage.depth() for stage in ring.stages)
-            limit = occupancy_bound(depth, len(check.G.cells) + len(lower.table.cells))
+            tables = (check.G, check.TA, check.TF, check.TT, passed.T)
+            limit = occupancy_bound(depth, sum(len(table.cells) for table in tables))
             self.assertLessEqual(ring.store.C - len(ring.F), limit)
 
-        _ring, lower = compile_source(source, on_step=on_step)
-        self.assertLessEqual(lower.max_expansion, 128)
+        ring = compile_source(source, on_step=on_step)
+        self.assertLessEqual(ring.peak_queue, E_MAX)
 
     def test_required_cells_compiles_the_deepest_legal_program(self):
         """C = B(D_max) + 1 is enough at the deepest depth the grammar accepts."""
@@ -696,18 +767,19 @@ class DyckStream(unittest.TestCase):
             parse_events(b"fn f(a: Int64) : Int64 = a + 1;", on_event=lambda t, p: None)
 
 
-class LinearityAndFailFast(unittest.TestCase):
-    """Rejections carry the conflicting rule (resource safety)."""
+class LinearityAndRefusals(unittest.TestCase):
+    """Refusals carry the conflicting rule (resource safety). The stream is checked as it is written, so a
+    path Check has not finished with can reach rtcheck first, and either one may be what says so."""
 
     def _rejects(self, source: bytes, pattern: str) -> None:
-        with self.assertRaisesRegex(Reject, pattern):
+        with self.assertRaisesRegex((Reject, RTError), pattern):
             compile_text(PRE + source)
 
     def test_linear_rules(self):
         self._rejects(b"fn f(l: List) : Int64 = 1;", "never used")
         self._rejects(b"fn f(l: List) : List = match l with Nil => Nil | "
                       b"Cons(d, h, t) => Cons@d(h, l) end;", "used twice|never used")
-        self._rejects(b"fn f(l: List, m: List) : List = if true then l else m;", "different")
+        self._rejects(b"fn f(l: List, m: List) : List = if true then l else m;", "different|still in")
         self._rejects(b"fn f(l: List) : List = match l with Cons(d, h, t) => t end;",
                       "never used|non-exhaustive")
 
@@ -721,29 +793,28 @@ class LinearityAndFailFast(unittest.TestCase):
     def test_a_constructor_must_fit_a_cell(self):
         self._rejects(b"record Big { a: Int64, b: Int64, c: Int8 };", "does not fit")
 
-    def test_starvation_reports_the_exact_context(self):
+    def test_more_pending_values_than_registers_is_not_a_refusal(self):
+        """The first Lower stopped here, with the state of every register. T8: nothing in this path has to."""
         deep = "a"
         for i in range(20):
             deep = f"+(+(a, {i}), {deep})"
-        with self.assertRaises(FailFast) as caught:
-            compile_text(f"fn f(a: Int64) : Int64 = {deep};".encode())
-        message = str(caught.exception)
-        self.assertIn("register starvation", message)
-        for part in ("Delta =", "H     =", "delta ="):
-            self.assertIn(part, message)
+        self.assertEqual(run(f"fn f(a: Int64) : Int64 = {deep};\nfn main() : Int64 = f(1);".encode()),
+                         sum(1 + i for i in range(20)) + 1)
 
-    def test_a_let_rewrite_of_that_program_compiles_and_runs(self):
+    def test_the_same_program_with_every_value_named(self):
         text = "fn f(a: Int64) : Int64 = " + "".join(
             f"let v{i} = +(a, {i}) in " for i in range(20)) + (
             "+(v0, +(v1, +(v2, v19)));\nfn main() : Int64 = f(1);")
         self.assertEqual(run(text.encode()), 1 + 2 + 3 + 20)
 
-    def test_an_overwritten_scalar_cannot_be_read(self):
+    def test_a_scalar_read_after_its_location_is_overwritten_moved_out_first(self):
+        """The first Lower refused this as erased. Section 8.1's last uses say it is wanted, so it moves."""
         source = PRE + (b"fn h(q: Q) : Q @q = q;\n"
                         b"fn g(p: Q, free: Free) : Res = match p with Q(d, a, b) => "
-                        b"let r = h(Q@d(1, 2)) in match r with Q(e, x, y) => Done@e(+(a, x), free) end end;\n")
-        with self.assertRaisesRegex(FailFast, "erased"):
-            compile_text(source)
+                        b"let r = h(Q@d(1, 2)) in match r with Q(e, x, y) => Done@e(+(a, x), free) end end;\n"
+                        b"fn main(free: Free) : Res = match free with End => Fail | "
+                        b"More(c, rest) => g(Q@c(40, 9), rest) end;")
+        self.assertEqual(run(source), 41)
 
     def test_arithmetic_width_comes_from_the_type_not_the_operands(self):
         """A literal in the last arm must not widen an Int8 operation to 64 bits."""
@@ -763,13 +834,13 @@ class LinearityAndFailFast(unittest.TestCase):
     def test_non_tail_recursion_is_rejected_until_descent_exists(self):
         source = PRE + (b"fn f(l: List) : List = match l with | Nil => Nil "
                         b"| Cons(d, h, t) => let r = f(t) in Cons@d(h, r) end;")
-        with self.assertRaisesRegex(FailFast, "section 4.4"):
+        with self.assertRaisesRegex(Limit, "section 8.2"):
             compile_text(source)
 
     def test_at_annotation_is_checked_at_every_exit(self):
         source = PRE + (b"fn bad(a: List, b: List) : List @a = match a with "
                         b"Nil => b | Cons(d, h, t) => Cons@d(h, bad(t, b)) end;")
-        with self.assertRaisesRegex(Reject, "word declared"):
+        with self.assertRaisesRegex(RTError, "declared @0"):
             compile_text(source)
 
 
@@ -846,42 +917,12 @@ class NoIdentityMorphisms(unittest.TestCase):
                         b"More(c, rest) => rd(s2(Q@c(1923856, 2544214)), rest) end;")
         self.assertEqual(run(source), 36 * 2544214)  # a' = 4b and b' = 16b
 
-    def test_stack_frame_reaches_the_slots_through_a_thunk(self):
+    def test_a_frame_is_one_adjustment_with_no_thunk(self):
+        """`F_f` is an `equ` at the end of the function, so its size is known at the prologue."""
         asm = compile_text(self._pressure(18, "+(t0, t17)"))
-        self.assertIn("sub rsp,", asm)
-        self.assertRegex(asm, r"call fn_f_body")
-
-
-class LinearTokens(unittest.TestCase):
-    """The token forms of section 1, as Lower really holds them (resource safety)."""
-
-    SOURCE = PRE + (b"fn u(q: Q) : Q @q = match q with Q(d, a, b) => "
-                    b"let s = +(a, b) in Q@d(s, b) end;\nfn main() : Int64 = 0;")
-
-    def _collect(self):
-        seen = []
-
-        def on_step(ring: Ring) -> None:
-            seen.extend(ring.stages[3].tokens())
-
-        compile_source(self.SOURCE, cells=512, on_step=on_step)
-        return seen
-
-    def test_a_hole_is_seen_only_after_its_location_is_written(self):
-        holes = [t for t in self._collect() if isinstance(t, Hole)]
-        self.assertTrue(holes)
-        self.assertTrue(all(isinstance(t.a, LMem) for t in holes))
-
-    def test_flags_are_a_linear_token_between_cmp_and_jcc(self):
-        source = b"fn f(a: Int64, b: Int64) : Int64 = if <(a, b) then 1 else 2;\nfn main() : Int64 = 0;"
-        states = []
-
-        def on_step(ring: Ring) -> None:
-            states.append(ring.stages[3].sil.flags)
-
-        compile_source(source, cells=512, on_step=on_step)
-        self.assertIn(Flags("b"), states)
-        self.assertEqual(states[-1], Flags())
+        self.assertIn("sub rsp, F_f\n", asm)
+        self.assertGreater(int(re.search(r"^F_f equ (\d+)$", asm, re.M).group(1)), 0)
+        self.assertNotRegex(asm, r"call fn_f\$body")
 
 
 class CellsGivenToCallees(unittest.TestCase):
@@ -903,13 +944,12 @@ class CellsGivenToCallees(unittest.TestCase):
         return self.FILL + b"fn f(l: List) : List = match l with | Cons(d, h, t) => " + body + (
             b" | Nil => Nil end;\n") + self.MAIN
 
-    def test_a_scalar_read_after_the_call_stops_instead_of_reading_the_callees_write(self):
-        """The field's location now holds the callee's 7. This used to print 14."""
+    def test_a_scalar_read_after_the_call_moves_out_before_the_callee_writes(self):
+        """The field's location now holds the callee's 7. This once printed 14, and then the first Lower
+        refused it. The right-to-left pass says the scalar is wanted, so it leaves first."""
         source = self._program(b"match fill(d, t) with "
                                b"| Cons(e, h2, t2) => Cons@e(+(h, h2), t2) | Nil => Nil end")
-        with self.assertRaisesRegex(FailFast, "erased") as caught:
-            compile_text(source)
-        self.assertEqual(caught.exception.limit, "section 1:")
+        self.assertEqual(run(source), 5 + 7 + 6)
 
     def test_a_copy_made_before_the_call_survives_it(self):
         source = self._program(b"let k = +(h, 0) in match fill(d, t) with "
@@ -1022,8 +1062,7 @@ class MeaningCheck(unittest.TestCase):
 
     def test_it_imports_nothing_from_the_compiler(self):
         import ast
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "src", "symcheck.py")
+        path = os.path.join(ROOT, "src", "symcheck.py")
         with open(path) as handle:
             tree = ast.parse(handle.read())
         imported = set()
@@ -1036,15 +1075,17 @@ class MeaningCheck(unittest.TestCase):
         self.assertLessEqual(imported, {"__future__", "dataclasses", "re", "sys", "typing"})
 
     def test_it_stays_clean_on_the_examples(self):
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for name in ("inc.lfpl", "sum.lfpl"):
-            with open(os.path.join(root, "examples", name), "rb") as handle:
+            with open(os.path.join(ROOT, "examples", name), "rb") as handle:
                 source = handle.read()
-            self.assertEqual(check_translation(source, compile_text(source, inferring=True)), [])
+            self.assertEqual(check_translation(source, compile_text(source)), [])
 
-    # A broken compiler, one line at a time. Each mutant is a real bug, most of them
-    # ones this project actually shipped for a while. The check has to find every one
-    # without running the binary.
+    # A broken compiler, one line at a time. Each mutant is a real bug, most of them ones this project
+    # actually shipped for a while. rtcheck would refuse a good many of Lower's before they got this far, so
+    # these go around it: the point here is that the symbolic check finds every one, by itself, without
+    # running the binary. Two bugs the first Lower had are gone from this list, because the RT layer has no
+    # way to say them: a literal is a `#n` source with no word to mistake, and a tag is part of the one
+    # atomic `build`, so all that is left to get wrong is the order of the moves it lowers to.
     Q_READ = (b"fn hi(q: Q, free: Free) : Res = match q with Q(d, a, b) => "
               b"Done@d(+(a, b), free) end;\n")
     TAGS = (b"data Free = End | More(next: Free);\n"
@@ -1053,149 +1094,184 @@ class MeaningCheck(unittest.TestCase):
             b"fn flip(v: S, c: Bool) : S @v = match v with "
             b"| A(d, x) => if c then B@d(x, 1) else B@d(x, 2) | B(d, x, y) => B@d(x, y) end;\n")
     H = b"fn h(x: Int64, y: Int64) : Int64 = +(*(x, 3), y);\n"
+    LOWER, BACKEND = "src/rtlower.py", "src/x86.py"
     MUTANTS = [
-        ("a join trusts its last arm's word",
-         "return first if first == second else 0", "return second",
+        ("a join trusts its last arm's word", LOWER,
+         "            if held.word != came.word:\n                held = replace(held, word=self.new_word())\n",
+         "            held = replace(held, word=came.word)\n",
          PRE + b"fn u(p: P) : P @p = match p with P(d, x, y, z) => "
                b"P@d(x, y, if <(z, 0) then 7 else z) end;\n", True),
-        ("a literal is taken for a provenance word",
-         "return 0 if b.loc == L_IMM else b.word", "return b.word",
-         PRE + b"fn u(q: Q) : Q @q = match q with Q(d, a, b) => let k = 3 in Q@d(k, b) end;\n",
-         True),
-        ("every store is elided",
-         "return word != 0 and word == self._word_at(dest[1], dest[2], dest[3])", "return True",
+        ("every store is elided", LOWER,
+         "same = value.off == field.off and value.size == field.size", "same = True",
          PRE + b"fn u(q: Q) : Q @q = match q with Q(d, a, b) => Q@d(b, a) end;\n", True),
-        ("a deferred read is not evacuated",
-         "if index not in deferred:\n                    continue", "continue",
+        ("a waiting read is not moved out", LOWER,
+         "            if value.kind == V_LOC and value.cell == cell:\n                register = self.fresh()",
+         "            if False:\n                register = self.fresh()",
          PRE + b"data Box;\nrecord B { p: Int64, c: Box };\n"
                b"record Box { n: Int64, m: Int64 };\n"
                b"fn f(z: Box, y: Box) : B = match z with Box(e, u, w) => "
-               b"match y with Box(d, v, x) => B@e(+(u, v), Box@d(1, x)) end end;\n", False),
-        ("the back-edge forgets the root",
-         'if fr.b1 and self.root >= 0:\n            moves = moves + [[("r", RAX), E_BIND, 0, self.root]]',
-         "if False:\n            pass",
+               b"match y with Box(d, v, x) => B@e(v, Box@d(1, x)) end end;\n", True),
+        ("the back-edge forgets the root", BACKEND,
+         'if ROOT in self.home and self.home[ROOT] != "rax":\n                moves.append(Move(Reg("rax"), _as_place(self.home[ROOT])))',
+         "pass",
          PRE + H.replace(b"h(", b"g(") + b"fn dbl(l: List) : List @l = match l with | Nil => Nil "
-               b"| Cons(d, x, t) => Cons@d(g(x, 1), dbl(t)) end;\n", False),
-        ("an operand is not locked across its partner's spill",
-         "            self.locked |= 1 << b.r\n            return (O_REG, b.r, 8)",
-         "            return (O_REG, b.r, 8)",
-         PRE + H + b"fn s2(q: Q) : Q @q = match q with Q(d, a, b) => "
-               b"let t0 = h(b, b) in let t1 = h(b, b) in let t2 = +(a, t0) in "
-               b"let t3 = h(t1, t2) in let t4 = h(t1, t0) in let t5 = h(a, t0) in "
-               b"let t6 = h(t1, t1) in let t7 = +(t5, t5) in let t8 = h(t3, t6) in "
-               b"let t9 = +(t5, t8) in let t10 = +(t4, b) in let t11 = +(t2, t2) in "
-               b"let t12 = +(t11, t2) in let t13 = +(t6, t7) in let t14 = +(t3, t1) in "
-               b"Q@d(t0, t6) end;\n", False),
-        ("the first arm's tag write is trusted by the second",
-         "            self.i(\"mov\", (O_MEM, self._base(cell), 0, 1), (O_IMM, tag))\n",
-         "            self.i(\"mov\", (O_MEM, self._base(cell), 0, 1), (O_IMM, tag))\n"
-         "            b = self._b(cell)\n            b.aux = tag + 1\n            self._set_b(cell, b)\n",
+               b"| Cons(d, x, t) => Cons@d(g(x, 1), dbl(t)) end;\n", True),
+        ("an operand is not pinned across its partner's spill", BACKEND,
+         "        register = self._phys(self.reg(text), pins)\n        return Reg(register), pins | {register}\n",
+         "        register = self._phys(self.reg(text), pins)\n        return Reg(register), pins\n",
+         PRE + H + b"fn f(a: Int64, b: Int64) : Int64 = "
+               + b"".join(b"let t%d = h(a, %d) in " % (i, i) for i in range(16))
+               + b"+(+(t0, t1), +(+(t2, t3), +(+(t4, t5), +(+(t6, t7), +(+(t8, t9), "
+                 b"+(+(t10, t11), +(+(t12, t13), +(t14, t15))))))));\n", False),
+        ("the first arm's tag write is trusted by the second", LOWER,
+         'tag = "keep" if top.l2 == info.tag else "write"',
+         'tag = "keep" if top.l2 == info.tag or getattr(self, "wrote", None) == top.cell else "write"\n'
+         "            self.wrote = top.cell",
          TAGS, True),
-        ("a tag is never written",
-         "if tagged and self._b(cell).aux != tag + 1:", "if False:", TAGS, True),
-        ("the tag lands before the field under it has left",
-         "        self._close_stale_window(cell, keep)\n        self._write_tag(cell, fr.b1, fr.b2)\n",
-         "        self._write_tag(cell, fr.b1, fr.b2)\n        self._close_stale_window(cell, keep)\n",
+        ("a tag is never written", LOWER,
+         'tag = "keep" if top.l2 == info.tag else "write"', 'tag = "keep"', TAGS, True),
+        ("the tag lands before the field under it has left", BACKEND,
+         "moves.append(Move(Mem(base, 0, 1), Imm(int(tag_text))))",
+         "self._store(Mem(base, 0, 1), Imm(int(tag_text)))",
          b"data Free = End | More(next: Free);\n"
-         b"data Res = Fail | Done(value: Int64, rest: Free);\ndata S = D | E(k: Int8) | G;\n"
-         b"fn take(s: S, f: Free) : Res = match s with D(c) => Done@c(1, f) "
-         b"| E(c, k) => Done@c(2, f) | G(c) => Done@c(3, f) end;\n"
-         b"fn u(f: Free) : Res = match f with End => Fail | More(c, r) => take(D@c(), r) end;\n",
-         False),
-        ("a cell given to a callee keeps its stale window open",
-         "        for index in passed:\n            self._close_stale_window(index, passed)\n", "",
-         PRE + b"fn one(c: Diamond) : List = Cons@c(7, Nil);\n"
-               b"fn rev(l: List, acc: List) : List = match l with "
-               b"| Nil => acc | Cons(d, h, t) => rev(t, Cons@d(h, acc)) end;\n"
-               b"fn f(l: List) : List = match l with "
-               b"| Cons(d, h, t) => let m = one(d) in rev(m, t) | Nil => Nil end;\n", True),
-        ("registers a call clobbers are not evacuated",
-         "moved = self._evacuation_moves(mask, leaving)", "moved = []",
+         b"record Q { a: Int64, b: Int64 };\ndata S = X(k: Int64) | Y(j: Int8) | Z;\n"
+         b"fn u(q: Q) : S = match q with Q(d, a, b) => X@d(a) end;\n", True),
+        ("a store lands before a read of what it overwrites", BACKEND,
+         "        return isinstance(src, Mem) and _overlap(src, dest)\n", "        return False\n",
+         PRE + b"fn u(q: Q) : Q @q = match q with Q(d, a, b) => Q@d(b, a) end;\n", True),
+        ("registers a call clobbers are not saved", BACKEND,
+         "if isinstance(home, str) and (home in clobbered or home in wanted):", "if False:",
          # The callee has to really write rdi, or leaving a value there would be correct.
          b"fn g(x: Int64) : Int64 = +(x, 1);\n"
          b"fn dec(x: Int64, y: Int64) : Int64 = g(y);\n"
-         b"fn f(a: Int64, b: Int64) : Int64 = let t = dec(a, b) in +(t, a);\n", False),
-        ("a comparison branches the wrong way",
-         "self._hold_flags(cc, dest.x, dest.y)", "self._hold_flags(CC.index(NEGATED[CC[cc]]), dest.x, dest.y)",
-         b"fn f(a: Int64, b: Int64) : Int64 = if <(a, b) then 1 else 2;\n", False),
-        ("subtraction becomes addition",
-         "        op = OP_NAMES[fr.b1]\n        second = self._second_value(fr)",
-         "        op = OP_NAMES[fr.b1].replace(\"sub\", \"add\")\n        second = self._second_value(fr)",
-         b"fn f(a: Int64, b: Int64) : Int64 = let c = -(a, b) in c;\n", False),
-        ("a call is silently dropped",
-         "        self._raw_name(\"call_name\", name)\n        self._forget_registers()\n",
-         "        self._forget_registers()\n",
-         H + b"fn f(a: Int64) : Int64 = let t = h(a, 1) in t;\n", False),
-        ("an oversized literal count reaches the hardware",
-         "vanishes = literal is not None and literal >= width * 8", "vanishes = False",
-         b"fn f(a: Int64) : Int64 = <<(a, 70);\n", False),
-        ("a register count is not compared with the width",
-         "        self.i(\"cmp\", (O_REG, RCX, 8), (O_IMM, bits))\n"
-         "        self.i(\"jcc\", (O_LABEL, too_far), (O_IMM, CC_NAMES.index(\"ae\")))\n", "",
-         b"fn f(a: Int64, b: Int64) : Int64 = <<(a, b);\n", False),
-        ("a register count is compared with 64 whatever the type",
-         "self.i(\"cmp\", (O_REG, RCX, 8), (O_IMM, bits))", "self.i(\"cmp\", (O_REG, RCX, 8), (O_IMM, 64))",
-         b"fn f(a: Int32, b: Int32) : Int32 = >>(a, b);\n", False),
-        ("a count past the width leaves the value instead of 0",
-         "        self.i(\"xor\", (O_REG, target, 4), (O_REG, target, 4))\n", "",
-         b"fn f(a: Int64, b: Int64) : Int64 = <<(a, b);\n", False),
-        ("the count overwrites a live value in rcx",
-         "elif not holds_count and not self.sil.free >> RCX & 1:", "elif False:",
-         b"fn f(a: Int64, b: Int64, c: Int64, d: Int64) : Int64 = +(<<(a, b), d);\n", False),
-        ("a join leaves values where the arm put them",
-         "        if fr.dk != D_COND and not self.dead:\n            self._normalize(bytes(fr.tail))\n"
-         "            self._goto(fr.l3)\n",
-         "        if fr.dk != D_COND and not self.dead:\n            self._goto(fr.l3)\n",
+         b"fn f(a: Int64, b: Int64) : Int64 = let t = dec(a, b) in +(t, a);\n", True),
+        ("a comparison branches the wrong way", LOWER,
+         'f"L{top.t}, L{top.f}")\n            self.live = False\n            return\n        register = self._result(top)\n'
+         '        self.i(f"cmp',
+         'f"L{top.f}, L{top.t}")\n            self.live = False\n            return\n        register = self._result(top)\n'
+         '        self.i(f"cmp',
+         b"fn f(a: Int64, b: Int64) : Int64 = if <(a, b) then 1 else 2;\n", True),
+        ("subtraction becomes addition", LOWER,
+         "name = OP_NAMES[top.aux]\n", 'name = OP_NAMES[top.aux].replace("sub", "add")\n',
+         b"fn f(a: Int64, b: Int64) : Int64 = let c = -(a, b) in c;\n", True),
+        ("a call is silently dropped", BACKEND,
+         '        self.ins("call", f"fn_{callee.name}")\n', "",
+         H + b"fn f(a: Int64) : Int64 = let t = h(a, 1) in t;\n", True),
+        ("an oversized literal count reaches the hardware", BACKEND,
+         "if count.value >= bits:", "if False:",
+         b"fn f(a: Int64) : Int64 = <<(a, 70);\n", True),
+        ("a register count is not compared with the width", BACKEND,
+         '        self.ins("cmp", "rcx", str(bits))\n        self.ins("jae", zero)\n', "",
+         b"fn f(a: Int64, b: Int64) : Int64 = <<(a, b);\n", True),
+        ("a register count is compared with 64 whatever the type", BACKEND,
+         'self.ins("cmp", "rcx", str(bits))', 'self.ins("cmp", "rcx", "64")',
+         b"fn f(a: Int32, b: Int32) : Int32 = >>(a, b);\n", True),
+        ("a count past the width leaves the value instead of 0", BACKEND,
+         '        self.place(zero)\n        self.ins("xor", self.sub(register, 4), self.sub(register, 4))\n',
+         "        self.place(zero)\n",
+         b"fn f(a: Int64, b: Int64) : Int64 = <<(a, b);\n", True),
+        ("the count overwrites a live value in rcx", BACKEND,
+         'saved = "rcx" in self.owner and count != Reg("rcx")', "saved = False",
+         b"fn f(a: Int64, b: Int64, c: Int64, d: Int64) : Int64 = +(<<(a, b), d);\n", True),
+        ("a join leaves values where the arm put them", BACKEND,
+         "        self._pmove(moves)\n        self._table(target)\n", "        self._table(target)\n",
          H + b"fn f(a: Int64, b: Int64) : Int64 = let x = +(a, 1) in "
-             b"let y = if <(a, b) then h(x, b) else +(x, 2) in +(+(x, y), b);\n", False),
+             b"let y = if <(a, b) then h(x, b) else +(x, 2) in +(+(x, y), b);\n", True),
     ]
+    # The stream and the backend, with nothing in between to refuse what the broken Lower wrote.
+    WITHOUT_RTCHECK = """
+import io, sys
+from src.rtlower import rt_lines
+from src.x86 import Backend
+out = []
+backend = Backend(out.append)
+with open(sys.argv[1], "rb") as handle:
+    for line in rt_lines(io.BytesIO(handle.read()), phase1=True):
+        backend.feed(line)
+print("\\n".join(out))
+"""
 
-    def _mutant_asm(self, old: str, new: str, source: bytes) -> str:
-        """Compile with one line of the lowerer changed, in a separate process."""
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(root, "src", "lower.py")) as handle:
+    def _mutant_asm(self, path: str, old: str, new: str, source: bytes) -> str:
+        """Compile with one line of the compiler changed, in a separate process."""
+        with open(os.path.join(ROOT, path)) as handle:
             text = handle.read()
-        self.assertIn(old, text, "this mutant no longer applies to the lowerer")
+        self.assertIn(old, text, "this mutant no longer applies")
         with tempfile.TemporaryDirectory() as workdir:
-            import shutil
-            shutil.copytree(os.path.join(root, "src"), os.path.join(workdir, "src"))
-            with open(os.path.join(workdir, "src", "lower.py"), "w") as handle:
-                handle.write(text.replace(old, new))
+            shutil.copytree(os.path.join(ROOT, "src"), os.path.join(workdir, "src"))
+            with open(os.path.join(workdir, path), "w") as handle:
+                handle.write(text.replace(old, new, 1))
             program = os.path.join(workdir, "p.lfpl")
             with open(program, "wb") as handle:
                 handle.write(source)
-            done = subprocess.run([sys.executable, "-m", "src.lower", program], cwd=workdir,
+            done = subprocess.run([sys.executable, "-c", self.WITHOUT_RTCHECK, program], cwd=workdir,
                                   capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         return done.stdout
 
+    def test_a_cell_given_to_a_callee_with_its_fields_still_in_it_is_a_type_error(self):
+        """A bug this project shipped, which cannot reach the symbolic check any more: the stream reads the
+        field through a register the call took, so rtcheck says so, and the backend could not lower it."""
+        old = ("            if value.kind == V_CAP:  # a location of this cell among the arguments is read first\n"
+               "                self._close_cell(value.cell, frozenset(), len(self.V))\n")
+        source = PRE + (b"fn one(c: Diamond) : List = Cons@c(7, Nil);\n"
+                        b"fn rev(l: List, acc: List) : List = match l with "
+                        b"| Nil => acc | Cons(d, h, t) => rev(t, Cons@d(h, acc)) end;\n"
+                        b"fn f(l: List) : List = match l with "
+                        b"| Cons(d, h, t) => rev(one(d), t) | Nil => Nil end;\n")
+        with open(os.path.join(ROOT, self.LOWER)) as handle:
+            text = handle.read()
+        self.assertIn(old, text, "this mutant no longer applies")
+        with tempfile.TemporaryDirectory() as workdir:
+            shutil.copytree(os.path.join(ROOT, "src"), os.path.join(workdir, "src"))
+            with open(os.path.join(workdir, self.LOWER), "w") as handle:
+                handle.write(text.replace(old, "", 1))
+            program = os.path.join(workdir, "p.lfpl")
+            with open(program, "wb") as handle:
+                handle.write(source)
+            done = subprocess.run([sys.executable, "-m", "src.lfplo", program, "--nasm"], cwd=workdir,
+                                  capture_output=True, text=True)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("leaves with a linear value still at [8:8]", done.stderr)
+
     def test_every_mutant_is_found_without_running_it(self):
-        for name, old, new, source, blind in self.MUTANTS:
+        for name, path, old, new, source, _blind in self.MUTANTS:
             with self.subTest(mutant=name):
                 self.assertEqual(check_translation(source, compile_text(source)), [],
                                  "the unbroken compiler must pass, or this proves nothing")
-                asm = self._mutant_asm(old, new, source)
+                asm = self._mutant_asm(path, old, new, source)
                 self.assertTrue(check_translation(source, asm), asm)
 
     def test_the_redundancy_validator_is_blind_to_lost_stores(self):
         """Why this check exists: these mutants lose or misplace a store, and validate.py
         has nothing to say about any of them."""
-        for name, old, new, source, blind in self.MUTANTS:
+        for name, path, old, new, source, blind in self.MUTANTS:
             if blind:
                 with self.subTest(mutant=name):
-                    self.assertEqual(validate(self._mutant_asm(old, new, source)), [])
+                    self.assertEqual(validate(self._mutant_asm(path, old, new, source)), [])
 
 
 class DeclaredLimits(unittest.TestCase):
-    def test_each_limit_is_recognized_and_an_internal_state_is_not(self):
-        deep = "a"
-        for i in range(20):
-            deep = f"+(+(a, {i}), {deep})"
-        with self.assertRaises(FailFast) as caught:
-            compile_text(f"fn f(a: Int64) : Int64 = {deep};".encode())
-        self.assertEqual(caught.exception.limit, "register starvation")
-        self.assertIsNone(FailFast("a variable has no rule for this destination", "", "", "").limit)
-        self.assertTrue(all(isinstance(key, str) and key for key in DECLARED_LIMITS))
+    """What a program can run into and fix says which section declares it. Any other failure is a bug, and
+    tests/test_fuzz.py fails on one."""
+
+    def test_each_limit_names_its_section(self):
+        fields = ", ".join(f"f{i}: Int8" for i in range(16))
+        record = f"record R {{ {fields} }};\n"
+        opened = ""
+        for level in range(6):
+            names = ", ".join(f"x{level}y{i}" for i in range(16))
+            opened += f"match r{level} with R(d{level}, {names}) => "
+        lets = "".join(f"let n{i} = 1 in " for i in range(30))
+        parameters = ", ".join(f"r{level}: R" for level in range(6))
+        for source in ((record + f"fn f({parameters}) : Int64 = {opened}{lets}1{' end' * 6};").encode(),
+                       PRE + b"fn f(l: List) : List = match l with | Nil => Nil "
+                             b"| Cons(d, h, t) => let r = f(t) in Cons@d(h, r) end;"):
+            with self.subTest(source=source[:40]):
+                with self.assertRaisesRegex(Limit, r"^section 8\.2:"):
+                    compile_text(source)
+
+    def test_a_program_past_no_limit_is_not_refused_as_one(self):
+        self.assertEqual(run(b"fn main() : Int64 = 0;"), 0)
 
 
 class StructuralRecursion(unittest.TestCase):
@@ -1479,7 +1555,8 @@ class TotalShifts(unittest.TestCase):
 
     def test_an_oversized_literal_emits_no_shift_at_all(self):
         lines = body(b"fn f(a: Int64) : Int64 = <<(a, 70);\nfn main() : Int64 = 0;", "f")
-        self.assertEqual(lines, ["xor eax, eax", "ret"])
+        self.assertFalse([l for l in lines if l.startswith(("shl", "shr"))], lines)
+        self.assertIn("xor ebx, ebx", lines)
 
     def test_a_register_count_is_compared_with_the_width_first(self):
         top = 1 << 63
@@ -1585,14 +1662,17 @@ class TotalShifts(unittest.TestCase):
 
 
 class Horner(unittest.TestCase):
-    """Section 4.5's worked example, exactly (translation correctness)."""
+    """Section 4.5's worked example (translation correctness)."""
 
     def test_on_a_register_destination(self):
+        """The example, with two more moves. The value is computed in a register of its own and moved to
+        where `ret` wants it, and the 32-bit field is narrowed through scratch, because RT does not tell
+        the backend the operand is already that narrow. A 32-bit `or` would clear the upper half."""
         source = (b"fn w(k: Int8, x: Int16, y: Int32) : Int64 = "
                   b"pack<8,8,16,32>(3, k, x, y);\nfn main() : Int64 = w(7, 513, 9);")
         lines = body(source, "w")
-        self.assertEqual(lines, ["mov eax, 768", "or al, dil", "shl rax, 16", "or ax, si",
-                                 "shl rax, 32", "or rax, rdx", "ret"])
+        self.assertEqual(lines, ["mov ebx, 768", "or bl, dil", "shl rbx, 16", "or bx, si",
+                                 "shl rbx, 32", "mov r11d, edx", "or rbx, r11", "mov rax, rbx", "ret"])
         self.assertEqual(run(source), 3 << 56 | 7 << 48 | 513 << 32 | 9)
 
     def test_memory_field_is_read_directly_exactly_once(self):
@@ -1614,7 +1694,32 @@ class Horner(unittest.TestCase):
 
     def test_leading_constants_fold_at_compile_time(self):
         lines = body(b"fn w() : Int64 = pack<8,8>(1, 2);\nfn main() : Int64 = 0;", "w")
-        self.assertEqual(lines, ["mov eax, 258", "ret"])
+        self.assertEqual(lines, ["mov ebx, 258", "mov rax, rbx", "ret"])
+
+    def test_a_literal_after_a_field(self):
+        """No constant ahead of it to fold into, a zero to skip, and one too wide for an `or` immediate."""
+        for widths, literal, expected in ((b"8,8", 3, 7 << 8 | 3), (b"8,8", 0, 7 << 8),
+                                          (b"8,32", 0x80000000, 7 << 32 | 0x80000000)):
+            source = (b"fn w(k: Int8) : Int64 = pack<%s>(k, %d);\nfn main() : Int64 = w(7);" % (widths, literal))
+            with self.subTest(widths=widths, literal=literal):
+                self.assertEqual(run(source), expected)
+
+    def test_a_wider_operand_keeps_only_the_fields_width(self):
+        """The first field, a later field in a subregister, and a later field through scratch."""
+        for widths, expected in ((b"8,8", 0xBB << 8 | 0xBB), (b"16,16", 0xABBB << 16 | 0xABBB),
+                                 (b"32,32", 0xAAAAABBB << 32 | 0xAAAAABBB)):
+            source = (b"fn w(k: Int64) : Int64 = pack<%s>(k, k);\nfn main() : Int64 = w(%d);"
+                      % (widths, 0xAAAAAAAAAAAAABBB))
+            with self.subTest(widths=widths):
+                self.assertEqual(run(source), expected)
+
+    def test_a_field_read_at_a_width_other_than_its_own(self):
+        source = PRE + (b"record S { a: Int8, b: Int16, c: Int32, e: Int64 };\n"
+                        b"fn w(s: S, free: Free) : Res = match s with S(d, a, b, c, e) => "
+                        b"Done@d(pack<16,8,16,32>(a, b, e, e), free) end;\n"
+                        b"fn main(free: Free) : Res = match free with End => Fail | "
+                        b"More(c, rest) => w(S@c(1, 515, 3, 72057594037927941), rest) end;")
+        self.assertEqual(run(source), 1 << 56 | 3 << 48 | 5 << 32 | 5)
 
     def test_a_32_bit_memory_field_takes_the_section_8_extra_load(self):
         source = PRE + (b"fn w(p: P, free: Free) : Res = match p with P(d, x, y, z) => "
@@ -1625,21 +1730,24 @@ class Horner(unittest.TestCase):
 
 
 class CommandLine(unittest.TestCase):
-    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
     def _cli(self, *args: str) -> subprocess.CompletedProcess:
-        return subprocess.run([sys.executable, "-m", "src.lower", *args], cwd=self.ROOT,
+        return subprocess.run([sys.executable, "-m", "src.lfplo", *args], cwd=ROOT,
                               capture_output=True, text=True)
 
     def test_it_runs_a_program_and_prints_the_result(self):
-        done = self._cli("examples/sum.lfpl", "-r")
+        done = self._cli("examples/sum.lfpl", "--run")
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "9"), done.stderr)
+
+    def test_it_prints_the_assembly(self):
+        done = self._cli("examples/inc.lfpl", "--nasm")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("fn_inc$body:", done.stdout)
 
     def test_a_rejected_program_exits_nonzero_with_the_rule(self):
         with tempfile.NamedTemporaryFile(suffix=".lfpl") as bad:
             bad.write(PRE + b"fn forget(l: List) : Int64 = 1;\n")
             bad.flush()
-            done = self._cli(bad.name)
+            done = self._cli(bad.name, "--nasm")
         self.assertEqual(done.returncode, 1)
         self.assertIn("linear variable l is never used", done.stderr)
 
@@ -1656,7 +1764,7 @@ class CommandLine(unittest.TestCase):
 
         text = b"# padding\n" * 5000 + b"fn main() : Int64 = 1;"
         handle = Counting(text)
-        ring, _ = compile_source(file_bytes(handle))
+        ring = compile_source(file_bytes(handle))
         self.assertEqual(handle.at, len(text))
         self.assertLessEqual(handle.largest, 4096)
         self.assertLess(ring.peak_cells, 64)

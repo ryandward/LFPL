@@ -1,14 +1,13 @@
 # The RT layer
 
-Lower currently writes x86 directly. That forces every value onto 15 fixed registers
-through a `mov` that copies, so the output cannot say who owns what, and ownership has to
-be tracked beside the code and rebuilt afterwards from text. This layer puts one typed
-language between Check and every backend. Lower writes register transfers with unbounded
-registers and moves that consume their source. A small checker types each instruction with
-the first specification's token rules. x86 and RTL each lower from the result.
+Writing x86 directly forces every value onto 15 fixed registers through a `mov` that copies,
+so the output cannot say who owns what, and ownership has to be tracked beside the code and rebuilt
+afterwards from text. This layer puts one typed language between Check and every backend. Lower
+writes register transfers with unbounded registers and moves that consume their source. A small
+checker types each instruction with the first specification's token rules. x86 and RTL each lower
+from the result.
 
-`src/rtcheck.py` and `src/x86.py` implement this, and `src/rtlower.py` writes it. The old
-`src/lower.py` stays only until the new path carries everything it does.
+`src/rtcheck.py` and `src/x86.py` implement this, and `src/rtlower.py` writes it.
 
 ## What it is, and is not
 
@@ -182,7 +181,8 @@ edge still needs them; see `label` in the x86 lowering.
         All other tokens survive, because registers here are not clobbered.
 
     tail f, o_1 ... o_n      the same consumption, then control leaves
-    ret s                    s = w : t  -->  control leaves
+    ret s                    s = w : t  -->  control leaves. s may be #0 for a tagless type's null, which
+                             needs no register, and in an `@k` function nothing would read
     ret s_1, ..., s_m        the same for a function whose result is a tuple. A tuple is never
                              stored: it exists only as these registers. Such a function cannot
                              be declared `@k`, because `@k` says which one cell comes back.
@@ -295,7 +295,9 @@ partial result is ever special. All the failures Phase 1 reports about registers
                            borrow rcx, and give 0 past the width. By a literal past W, xor.
     cmp                    cmp a, b; setcc; movzx
     trunc                  mov r32 or movzx
-    pack                   Horner: shl, then or into the subregister
+    pack                   Horner: shl, then or into the subregister, which keeps only the field's bits
+                           of a wider operand. Leading literals are folded into one. A 32-bit field goes
+                           through scratch, since `or r32` would clear the upper half
     read, take             a sized mov
     build                  parallel move over the fields that are not `=` or `r!`, with cycles
                            broken through the scratch registers. f([l], b) with l = l_i is one
@@ -303,11 +305,15 @@ partial result is ever special. All the failures Phase 1 reports about registers
                            `write` is mov byte [p], tag, after every source has been read.
     idx                    mov d, a; and d, N - 1
     aget                   a sized mov through [a + i * s]
-    br                     cmp; jcc, with the fall-through chosen by the next label
+    br                     cmp; jcc, with the fall-through chosen by the next label. On two literals, a
+                           jump, and the other label's arm is code nothing reaches
     br.null                test p, p; jcc
     br.tag                 cmp byte [p], k; jne
     open                   nothing
-    label                  the label, after every incoming edge's homes are made equal. The
+    label                  nothing if only a jump follows, or a `br` on two literals, with no move on the
+                           way: `L equ M`, and whatever jumped to L jumps to M. That is what makes
+                           `if (if c then true else false)` the same code as `if c`.
+                           Otherwise the label, after every incoming edge's homes are made equal. The
                            label's home table is the one at the branch point the arms start
                            from, and each arm that spilled or moved a value ends with one
                            parallel move back to it, before its jump or fall-through. This is
@@ -455,6 +461,6 @@ stream says, and that the stream means what the source says.
 
 `src/rtcheck.py` shares no code with Lower, and a failure means no output. `src/rtlower.py`
 writes the stream, and `src/x86.py` and `src/rtverilog.py` lower it. Every Phase 1 generator passes
-through this path and the section 4.7 handler is built by it. What is left: moving
-`tests/test_invariants.py` over so `src/lower.py` can go. Division and `swap` are new instructions with total
-meanings, and DESCEND and ASCEND are a pair that saves live registers into the destructured cell.
+through this path and the section 4.7 handler is built by it. What is left: division and `swap` are new
+instructions with total meanings, and DESCEND and ASCEND are a pair that saves live registers into the
+destructured cell.

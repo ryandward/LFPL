@@ -88,12 +88,9 @@ You need Python 3, `nasm` and `ld`, and no C compiler is involved at any point. 
 also uses `iverilog`, `yosys` and `verilator`, and its tests skip themselves without them.
 
 ```
-python3 -m src.lower examples/inc.lfpl      # print the assembly
-python3 -m src.lower examples/sum.lfpl -r   # assemble, link and run it: prints 9
+python3 -m src.lfplo examples/inc.lfpl --nasm  # print the assembly
+python3 -m src.lfplo examples/sum.lfpl --run   # assemble, link and run it: prints 9
 ```
-
-The compiler streams its output as it goes, so a program it rejects may already have
-printed some assembly. The exit status is what tells you whether it succeeded.
 
 `examples/sum.lfpl` is a complete program and a good one to read next. A program that
 needs cells declares `fn main(free: Free)`, and `_start` hands it every cell in the
@@ -318,9 +315,9 @@ to the file. This one never builds that tree. Its stages sit in a closed ring an
 ```
     +------------------- empty cells ------------------+
     v                                                  |
-  Ingest --> Lex --> Parse --> Check --> Lower --> Egress
-   bytes    tokens   events    types     RT        written
-                                         lines     out
+  Ingest --> Lex --> Parse --> Right-to-left --> Check --> Lower --> Egress
+   bytes    tokens   events    the future        types     RT        written
+                               written in                  lines     out
 ```
 
 In place of a tree, `src/dyck.py` emits a stream of bracketed events: open a construct,
@@ -349,13 +346,12 @@ optimizer for never happens at all. A comparison under an `if` becomes a compare
 with no boolean ever materialized, and a constructor taken apart immediately by a `match`
 produces no code. `src/ring.py` is the machine that moves cells between stages.
 
-There are two Lowers at the moment, and the difference between them is the most important
-thing that has happened to this code. The first, `src/lower.py`, wrote x86 directly, so a single
-pass over the program had to decide ownership, register allocation and instruction selection
-all at once, and it kept miscompiling in ways that were hard to see. The second,
-`src/rtlower.py`, knows nothing about x86. It writes [a small typed language of register
-transfers](docs/rt-layer.md), with as many registers as it likes and moves that consume their
-source, and you can read what it wrote:
+The most important thing that has happened to this code is that Lower stopped knowing about x86. It
+used to write assembly directly, so a single pass over the program had to decide ownership, register
+allocation and instruction selection all at once, and it kept miscompiling in ways that were hard
+to see. `src/rtlower.py` writes [a small typed language of register transfers](docs/rt-layer.md)
+instead, with as many registers as it likes and moves that consume their source, and you can read
+what it wrote:
 
 ```
 $ python3 -m src.lfplo examples/forward.lfpl --rt
@@ -383,7 +379,7 @@ end
 the writer, using token rules like the ones for cells above. Saying a field stays when it was
 overwritten is a type error, and so is storing a value back where it came from, reading a cell
 after it has been rebuilt, or losing a pointer the new constructor does not name. Most of the bugs
-that hand-written tests and fuzzing found in the first Lower are local type errors at this
+that hand-written tests and fuzzing found while Lower wrote x86 are local type errors at this
 level. Then `src/x86.py`, which is the only code that knows about fifteen registers, spills
 and frames, turns the stream into assembly.
 
@@ -401,8 +397,8 @@ assembled, linked and executed. `tests/test_invariants.py` checks the model's na
 claims directly, such as cell conservation at every step of the pipeline and the absence
 of any copy of an unchanged field. A test that cannot fail proves nothing, so these come
 with controls that must trip the same detector on code that really is wrong. One of them
-deliberately breaks the lowerer so that it writes the forbidden copies, and the test has
-to notice.
+writes the forbidden copy by hand, and both the RT checker and the check of the assembly
+have to notice.
 
 Running a program only tells you about the answer it printed, and a bug can damage
 something the answer never looks at. So `src/symcheck.py` compares meaning without running
@@ -434,8 +430,8 @@ is rejected for any reason other than a limit the language declares.
 redundant moves the model says cannot occur. That is a check for waste rather than for
 correctness, since a lost store leaves nothing redundant behind and passes it.
 
-Every generator runs through both Lowers, and running them through the new one found six bugs
-in it the moment it was tried on anything but the handler. Then an independent review, told only
+Running every generator through Lower when it was new found six bugs in it the moment it was
+tried on anything but the handler. Then an independent review, told only
 to report failures it could reproduce, found much worse, because it did not share the author's idea
 of what a program looks like. A single datagram could crash a running binary through a program's
 own definition of `Free`. An `Int8` literal of 300 gave a wrong answer past every check, because it
@@ -474,9 +470,7 @@ side, because a read cannot tell whether it was the last, and so did section 5.6
 to know that a recursive call returns its argument's own cell, depending on exits the compiler
 has not reached yet. Those two are answered ahead of time now, by the pass described above: a scalar moves out of
 its cell just before the cell is rebuilt or handed to a callee, exactly when something reads it
-later. The first Lower, `src/lower.py`, takes the inferred `@l` and nothing else, so there writing to
-a location still erases the scalar living there, and a field you still want has to be copied first,
-with `+(x, 0)`.
+later.
 
 Two rules from the later LFPL-O specification are already in force, because a running program
 must not hang or depend on hardware accidents. Every function has to terminate: for some fixed
@@ -491,20 +485,15 @@ it while its register still holds it, the very round trip Theorem 7.5 says canno
 happen. So both now happen as one parallel move, and a register freed by a spill
 remembers what it held. Section 2.5 budgets one cell per frame for Lower, which join
 points overflow, so the budget is a larger constant, computed as `S_LOWER`. Section 4.2's
-`sub rsp` needs a frame size that is not known until the function ends, so a function
-that spills is entered through a small thunk, costing it one extra call's worth of stack.
-The model's trees need a value and two children, which do not fit in 16 bytes, so a tree
+`sub rsp` needs a frame size that is not known until the function ends, so it names a constant
+that an `equ` defines there. The model's trees need a value and two children, which do not fit in 16 bytes, so a tree
 takes two cell types that refer to each other, and `data Pair;` declares one ahead of its
 definition.
 
-When a program runs into one of these limits, the compiler does not work around it. It
-stops and reports the rule along with the exact state of the registers, the homes of
-live values and the destination it was trying to fill. A deeply right-nested sum that
-pins all fifteen registers fails this way, and naming its intermediate values with `let`
-is usually all it takes to fix it. The other limits work the same way: a partial result
-that would have to survive a call clobbering its register, a home that would change after
-a jump under a condition has already been written, and a value moved out of a cell in one
-arm of a conditional while it is still needed after the join.
+When a program runs into a limit, the compiler does not work around it. It stops and says which
+limit, from the list in section 8.2 of the specification. None of them is about registers any
+more: a deeply right-nested sum compiles, because everything can spill, and a value moved out of
+a cell in one arm of a conditional and read after the join is in one register whichever arm ran.
 
 ## What is not here yet
 
@@ -535,12 +524,12 @@ fixed, and the tests judge it only by what it does. And the symbolic check build
 trees: it runs after the compiler has finished, so the memory bound is the compiler's and not
 its own.
 
-`src/lower.py` is still there because `tests/test_invariants.py` was written against its exact
-output and has not moved, and `python3 -m src.lower` still runs the first examples. The new path
-passes every generator, but it does not yet match the old one's output everywhere: a constructor
-bound by `let` and then matched is built before it is taken apart, a `match` on a known null still
-tests it, `pack` does not fold constants, and every function adjusts its frame even when the frame
-is empty, because the backend writes its prologue before it knows the frame's size.
+The code has lost a few things to the simpler Lower, none of them about what a program means. A
+constructor bound by `let` and then matched is built before it is taken apart, a `match` on a known
+null still tests it, a value with arms joins in a register and is stored from there, where it used to be
+stored in each arm, and a value computed for a `ret` is computed elsewhere and moved. Every function also
+adjusts its frame even when the frame is empty, because the backend writes its prologue before it knows
+the frame's size.
 
 A diamond that passes through a join counts as handed over, so a scalar of that cell that is read later
 moves out, even when all that happens to it is that it is stored back where it was.

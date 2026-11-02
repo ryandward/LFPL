@@ -63,11 +63,11 @@ def instructions(asm: str) -> list[tuple[int, str, list[str]]]:
 
 
 def function_body(asm: str, name: str) -> list[tuple[str, list[str]]]:
-    """The instructions of `fn_<name>_body`, labels removed, in emitted order."""
+    """The instructions of `fn_<name>$body`, labels removed, in emitted order."""
     body, inside = [], False
     for _number, op, operands in instructions(asm):
-        if op == "label" and operands[0].endswith("_body"):
-            inside = operands[0] == f"fn_{name}_body"
+        if op == "label" and operands[0].endswith("$body"):
+            inside = operands[0] == f"fn_{name}$body"
             continue
         if op == "label" and operands[0] in ("_start",):
             inside = False

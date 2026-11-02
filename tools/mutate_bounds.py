@@ -30,8 +30,8 @@ TESTS = ["tests.test_walks.RandomWalks", "tests.test_walks.TheDearestWayThrough"
 
 # The pass's own tests first, then what runs the generators with their annotations taken out.
 PASS_TESTS = ["tests.test_rtlower.TheRightToLeftPass", "tests.test_rtlower.ValidPrograms",
-              "tests.test_generated.GeneratedPrograms", "tests.test_fuzz.DifferentialRT.test_diamonds_passed_to_calls",
-              "tests.test_fuzz.DifferentialRT.test_lists", "tests.test_fuzz.DifferentialRT.test_tagged_cells"]
+              "tests.test_generated.GeneratedPrograms", "tests.test_fuzz.Differential.test_diamonds_passed_to_calls",
+              "tests.test_fuzz.Differential.test_lists", "tests.test_fuzz.Differential.test_tagged_cells"]
 
 MUTANTS = {
     # --- the rules that derive the inequalities

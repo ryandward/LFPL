@@ -20,8 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src import rtlower, symcheck  # noqa: E402
 from src.check import CheckStage  # noqa: E402
 from src.dyck import Lexer, Parser  # noqa: E402
-from src.lfplo import compile_program  # noqa: E402
-from src.lower import build_and_run  # noqa: E402
+from src.lfplo import build_and_run, compile_program  # noqa: E402
 from src.ring import Reject, Ring  # noqa: E402
 from src.rtcheck import Checker, RTError, check_stream  # noqa: E402
 from src.rtlower import Limit, RTLower, required_cells, rt_lines  # noqa: E402
@@ -114,7 +113,7 @@ class Memory(unittest.TestCase):
         for _ in range(28):
             expression = f"let z = +(1, {expression}) in +(z, 1)"
         source = f"fn f(a: Int64) : Int64 = {expression};\n"
-        stages = [Lexer(), Parser(64), CheckStage(lfplo=True), RTLower()]
+        stages = [Lexer(), Parser(64), CheckStage(), RTLower()]
         ring = Ring(required_cells(64), iter(source.encode()), stages, lambda tag, payload: None)
         ring.run()
         self.assertGreater(ring.peak_depth, 20)
@@ -696,9 +695,9 @@ fn f(l: List) : List = other(l, Nil);"""), None)
         with open(os.path.join(ROOT, "examples", "sum.lfpl"), "rb") as handle:
             source = handle.read()
         self.assertEqual(self.answer(source), 9)
-        lower = subprocess.run([sys.executable, "-m", "src.lower", "examples/sum.lfpl", "-r"], cwd=ROOT,
+        lower = subprocess.run([sys.executable, "-m", "src.lfplo", "examples/sum.lfpl", "--run"], cwd=ROOT,
                                capture_output=True, text=True, check=True)
-        self.assertEqual(lower.stdout.strip(), "9", "and the old Lower gets what it needs from the pass")
+        self.assertEqual(lower.stdout.strip(), "9")
 
 
 class RefusedWithAReason(unittest.TestCase):

@@ -1243,6 +1243,10 @@ class Checker:
         if len(a) != len(wanted):
             raise self.fail(f"ret of {len(a)} values from a function returning {len(wanted)}")
         for position, (operand, ty) in enumerate(zip(a, wanted)):
+            if _LIT.match(operand):
+                if results is None:
+                    self._word_leaving(self._null_result(operand, self.norm(ty)), "ret")
+                continue
             r, token = self.full(operand)
             self.unify(token.ty, self.norm(ty), "a result")
             self.fits(token, self.norm(ty), "a result")
@@ -1258,6 +1262,14 @@ class Checker:
         assert self.S is not None
         self.obligate(self.S.budget)
         self.S = None
+
+    def _null_result(self, operand: str, ty: Type) -> Word:
+        """`ret #0`: the null of a tagless type, which needs no register."""
+        decl = self._decl(ty)
+        if decl is None or decl.kind != "tagless" or operand != "#0":
+            raise self.fail(f"only a tagless type has a literal, and only 0: ret {operand} of {ty}")
+        self._made(ty)
+        return ("null",)
 
     def i_tail(self, a: list[str]) -> None:
         signature = self._callee(a[0])

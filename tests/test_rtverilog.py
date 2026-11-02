@@ -107,7 +107,7 @@ class TargetIndependence(unittest.TestCase):
     def test_it_loads_nothing_of_the_x86_backend_or_runtime(self):
         """Through anything it imports, too: this is why `certify` has a module of its own."""
         check = ("import sys, src.rtverilog; print(sorted(m for m in sys.modules "
-                 "if m in ('src.x86', 'src.runtime', 'src.lfplo', 'src.lower', 'src.validate', 'src.symcheck')))")
+                 "if m in ('src.x86', 'src.runtime', 'src.lfplo', 'src.validate', 'src.symcheck')))")
         done = subprocess.run([sys.executable, "-c", check], cwd=ROOT, check=True, capture_output=True, text=True)
         self.assertEqual(done.stdout.strip(), "[]")
 

@@ -2,14 +2,13 @@
 
 Each generator builds a program text and, alongside it, computes the answer from
 the language's meaning, without any part of the compiler. Translation correctness
-is judged by running the binary. Every program also runs with the register and
-cell partition checks on, through the redundancy validator, and through the symbolic
+is judged by running the binary. Every program also runs with the cell partition and
+Theorem 7.2's bound checked, through the redundancy validator, and through the symbolic
 check of meaning, which has to agree with the binary without running it.
 
 A declared limit is a legal outcome for a program that really hits it, so each is
 counted by rule and bounded: a generator whose programs mostly get rejected would
-prove nothing. Any other rejection means the lowerer reached a state it has no rule
-for, and that fails the campaign.
+prove nothing. Anything else that stops the compiler fails the campaign.
 
 Set LFPL_FUZZ to raise the number of programs per generator.
 """
@@ -22,8 +21,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.lfplo import compile_program  # noqa: E402
-from src.lower import FailFast, build_and_run, compile_source, occupancy_bound  # noqa: E402
+from src.lfplo import build_and_run, compile_program  # noqa: E402
 from src import rtlower  # noqa: E402
 from src.rtlower import Limit  # noqa: E402
 from src.symcheck import check_translation  # noqa: E402
@@ -35,26 +33,7 @@ SEED = int(os.environ.get("LFPL_FUZZ_SEED", "0"))
 WIDTHS = {8: "Int8", 16: "Int16", 32: "Int32", 64: "Int64"}
 
 
-def compile_checked(source: bytes) -> str:
-    lines: list[str] = []
-
-    def on_step(ring) -> None:
-        check, lower = ring.stages[2], ring.stages[3]
-        in_use = ring.store.C - len(ring.F)
-        depth = max(stage.depth() for stage in ring.stages)
-        limit = occupancy_bound(depth, len(check.G.cells) + len(lower.table.cells))
-        if in_use > limit:
-            raise AssertionError(f"Theorem 7.2: {in_use} cells at depth {depth}, bound {limit}")
-        if ring.counts["egress"] % 97 == 0:
-            ring.check_conservation()
-
-    compile_source(source, on_line=lines.append, checks=True, on_step=on_step)
-    return "\n".join(lines) + "\n"
-
-
 def compile_rt(source: bytes) -> str:
-    """The same programs through the register-transfer path, with its own Theorem 7.2 bound."""
-
     def on_step(ring) -> None:
         passed, check = ring.stages[2], ring.stages[3]
         in_use = ring.store.C - len(ring.F)
@@ -629,8 +608,7 @@ fn weigh(l: List, n: Int64, acc: Int64, free: Free) : Res = match l with
 def diamond_call_program(rng: random.Random) -> tuple[bytes, int]:
     """A matched cell's diamond passed to a call, so the callee writes a cell whose
     fields this function may still want. Reading a scalar after that without a copy has to
-    give the right answer on the register-transfer path, where the right-to-left pass says the
-    scalar is wanted, and the old Lower, which has no such pass, has to stop."""
+    give the right answer, because the right-to-left pass says the scalar is wanted."""
     mask = (1 << 64) - 1
     k = rng.randrange(1 << 16)
     templates = [
@@ -650,7 +628,7 @@ def diamond_call_program(rng: random.Random) -> tuple[bytes, int]:
     ]
     items = [rng.randrange(1 << 32) for _ in range(rng.randrange(1, 6))]
     if rng.random() < 0.15:
-        # No copy: the old Lower has erased h at the call, so it must stop, and never print a guess.
+        # No copy: h has to leave its cell ahead of the call.
         text = (f"match mk(d, {k}, t) with "
                 f"| Cons(e, h2, t2) => Cons@e(+(h, h2), t2) | Nil => Nil end")
         action = lambda h, tail: [(h + k) & mask] + tail
@@ -725,8 +703,6 @@ def tagged_if_program(rng: random.Random) -> tuple[bytes, int]:
 
 
 class Differential(unittest.TestCase):
-    compiler = staticmethod(compile_checked)
-
     def _campaign(self, generator, seed: int, *, min_compiled: float = 0.7) -> None:
         rng = random.Random(seed + 1000 * SEED)
         compiled = 0
@@ -735,12 +711,7 @@ class Differential(unittest.TestCase):
             for index in range(COUNT):
                 source, expected = generator(rng)
                 try:
-                    asm = self.compiler(source)
-                except FailFast as failure:
-                    self.assertIsNotNone(failure.limit, f"not a declared limit: {failure}\n"
-                                                         f"{source.decode()}")
-                    limits[failure.limit] += 1
-                    continue
+                    asm = compile_rt(source)
                 except Limit as failure:
                     limits[str(failure).split(":")[0]] += 1
                     continue
@@ -749,8 +720,8 @@ class Differential(unittest.TestCase):
                                  f"#{index}\n{source.decode()}\n{asm}")
                 got = build_and_run(asm, workdir)
                 self.assertEqual(got, expected, f"#{index}\n{source.decode()}\n{asm}")
-                if self.compiler is compile_rt:  # the pass has to find every `@` that was written
-                    self.assertEqual(compile_rt(without_annotations(source)), asm, f"#{index}\n{source.decode()}")
+                # The pass has to find every `@` that was written.
+                self.assertEqual(compile_rt(without_annotations(source)), asm, f"#{index}\n{source.decode()}")
                 compiled += 1
         print(f"{generator.__name__}: {compiled} ran, stopped at limits {dict(limits)}",
               file=sys.stderr)
@@ -789,11 +760,6 @@ class Differential(unittest.TestCase):
 
     def test_tagged_constructors_in_both_arms(self):
         self._campaign(tagged_if_program, 11)
-
-
-class DifferentialRT(Differential):
-    """Every generator again, through Lower's replacement."""
-    compiler = staticmethod(compile_rt)
 
 
 if __name__ == "__main__":

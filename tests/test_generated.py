@@ -18,8 +18,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.lfplo import compile_program  # noqa: E402
-from src.lower import build_and_run  # noqa: E402
+from src.lfplo import build_and_run, compile_program  # noqa: E402
 from src.ring import Reject  # noqa: E402
 from src.rtlower import Limit  # noqa: E402
 from src.symcheck import check_translation  # noqa: E402

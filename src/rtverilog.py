@@ -889,6 +889,9 @@ class Emitter:
         else:
             values = []
             for operand in a:
+                if operand == "#0":  # a null: the one pointer no cell has
+                    values.append((f"{self.pointer_bits}'d0", self.pointer_bits))
+                    continue
                 register = int(_REG.match(operand).group(1))
                 source = self.pending.get(register, register)
                 values.append((fn.flop(source), fn.widths[source]))

@@ -1,11 +1,11 @@
 """Lower: the checked event word to the register-transfer stream, as a fold.
 
 Each event is handled against the frame of the construct that encloses it, so a child's
-destination is fixed when it opens, exactly as the translation calculus asks. This is what the
-old lower.py did, without the part that made it 2,600 lines: no physical register, frame slot,
-flag or spill appears here. A value is a register with no limit on how many there are, or a
-literal, or a location of an open cell that has not needed to move. docs/rt-layer.md is the
-language it writes, and rtcheck types every line of it before anything is done with it.
+destination is fixed when it opens, exactly as the translation calculus asks. No physical
+register, frame slot, flag or spill appears here. A value is a register with no limit on how many
+there are, or a literal, or a location of an open cell that has not needed to move.
+docs/rt-layer.md is the language it writes, and rtcheck types every line of it before anything is
+done with it.
 
 Frames, values and binders live in real cells, on the ring, so this stage keeps the first
 specification's O(D) bound the same way every other stage does. The text it writes leaves on c5.
@@ -22,7 +22,7 @@ from typing import BinaryIO, Callable, Generic, Iterable, Iterator, NamedTuple, 
 
 from .check import (P_ARM_RT, P_BINDER, P_CALL_RT, P_DIAMOND_RT, P_FIELD, P_GET_RT, P_IDX_RT,
                     P_LET_RT, P_PARAM_RT, P_TYPE_RT, P_VAR, P_WITH_RT, CheckStage)
-from .dyck import (CC_NAMES, CLOSE, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP, K_CTOR,
+from .dyck import (CC_NAMES, CLOSE, DEFAULT_D_MAX, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP, K_CTOR,
                    K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER, K_IDX, K_IF, K_INT, K_LET, K_LIVE,
                    K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
                    K_RTDECLMORE, K_TUPLE, K_TYPE, K_VAR, K_VARLAST, K_WITH, LEAF, OP_NAMES, OPEN, SEP, Lexer,
@@ -426,6 +426,8 @@ class RTLower(Stage):
             members.reverse()
             registers = [self._as_reg(m) for m in members]
             self.i("ret " + ", ".join(f"r{r}" for r in registers))
+        elif value.kind == V_NULL:
+            self.i("ret #0")
         else:
             self.i(f"ret r{self._as_reg(value)}")
         self.live = False
@@ -478,13 +480,10 @@ class RTLower(Stage):
     def _branch_on(self, value: Value, t: int, f: int) -> None:
         if value.kind == V_TUPLE:  # delivered here before Check reaches the end of the condition
             raise Reject("a condition must be Bool, and this is a tuple")
-        if value.kind == V_LIT:
-            register = self.fresh()
-            self._into(value, register)
-            text = f"r{register}!"
-        else:
-            text = self._operand(value, last_use=True)
-        self.i(f"br ne, {text}, #0, L{t}, L{f}")
+        # A literal stays a literal, so that no boolean exists: the x86 backend knows which way this goes.
+        # It still says both labels, because the arm nothing jumps to has to type, and a label with no
+        # edge into it has no tokens to type it with.
+        self.i(f"br ne, {self._operand(value, last_use=True)}, #0, L{t}, L{f}")
         self.live = False
 
     def _operand(self, value: Value, last_use: bool = False) -> str:
@@ -958,22 +957,30 @@ class RTLower(Stage):
         right, left = self.V.pop(), self.V.pop()
         width = payload[0]
         name = OP_NAMES[top.aux]
-        parent = self.F.top()
-        phantom = len(self.F) > 1 and self.F.at(len(self.F) - 2).kind == K_MATCH and (
-            self.F.at(len(self.F) - 2).state == 0)
-        if (parent.kind == K_CTOR and not phantom and top.dest == D_ANY and left.kind == V_LOC
-                and name in _RMW and left.cell == parent.cell and right.kind in (V_LIT, V_REG)):
-            field = self.L.top()
-            if field.off == left.off and field.size == left.size == width:
-                self.V.push(right)
-                self.V.push(Value(V_FUNC, left.reg, left.off, left.size, top.aux, left.cell))
-                return
+        field = self._field_being_built()
+        if (field is not None and top.dest == D_ANY and left.kind == V_LOC and name in _RMW
+                and left.cell == self.F.top().cell and right.kind in (V_LIT, V_REG)
+                and field.off == left.off and field.size == left.size == width):
+            self.V.push(right)
+            self.V.push(Value(V_FUNC, left.reg, left.off, left.size, top.aux, left.cell))
+            return
         register = self._result(top)
         self.i(f"op r{register}, {_RT_OPS.get(name, name)}/{8 * width}, "
                f"{self._operand(left)}, {self._operand(right)}")
         self._release(left)
         self._release(right)
         self._finish(top, register)
+
+    def _field_being_built(self) -> Optional[Layout]:
+        """The field this value is going to, if it is one of a constructor that will really be built, or
+        of a `with`. A constructor a match takes apart at once is never written, so nothing can work in place."""
+        parent = self.F.top()
+        if parent.kind == K_WITH and parent.state == 2:
+            return Layout(parent.l3 & 255, parent.l3 >> 8 & 255, parent.l3 >> 16)
+        if parent.kind != K_CTOR:
+            return None
+        outer = self.F.at(len(self.F) - 2)
+        return None if outer.kind == K_MATCH and outer.state == 0 else self.L.top()
 
     def _close_cmp(self) -> None:
         top = self.F.pop()
@@ -1286,15 +1293,17 @@ class RTLower(Stage):
     def _close_with(self) -> None:
         top = self.F.pop()
         value = self.V.pop()
-        off, size = top.l3 & 255, top.l3 >> 8 & 255
-        field = Layout(off, size, top.l3 >> 16)
-        source = self._field_sources(top, [field], [(value, None)])[0]
+        operand = self.V.pop() if value.kind == V_FUNC else None
+        field = Layout(top.l3 & 255, top.l3 >> 8 & 255, top.l3 >> 16)
+        source = self._field_sources(top, [field], [(value, operand)])[0]
         sources = ["="] * top.l2
         sources[top.aux] = source
         self._pop_binders(top.bmark)
         self._close_cell(top.cell, frozenset(), len(self.V))
         self.i(f"build r{top.reg}, c{top.l1}, none, {', '.join(sources)}")
         self._release(value)
+        if operand is not None:
+            self._release(operand)
         result = Value(V_REG, top.reg, word=top.word, flags=OWNED | LINEAR)
         if top.dest == D_REG:
             self._into(result, top.d)
@@ -1424,6 +1433,14 @@ def file_bytes(handle: BinaryIO, chunk: int = 4096) -> Iterator[int]:
         yield from block
 
 
+def compiler_ring(source: Iterable[int], sink: Callable[[int, bytes], None],
+                  on_step: Optional[Callable[[Ring], None]] = None, *, phase1: bool = False,
+                  cells: Optional[int] = None, d_max: int = DEFAULT_D_MAX) -> Ring:
+    """Every stage, on one ring. `required_cells` of them is Theorem 7.2's claim, so that receiving a cell cannot fail."""
+    stages = [Lexer(), Parser(d_max), RightToLeft(), CheckStage(phase1=phase1), RTLower()]
+    return Ring(required_cells(d_max) if cells is None else cells, iter(source), stages, sink, on_step)
+
+
 def rt_lines(handle: BinaryIO, on_step: Optional[Callable[[Ring], None]] = None,
              *, phase1: bool = False) -> Iterator[str]:
     """The stream, one line at a time, as the ring writes it. Nothing is held in between: the
@@ -1437,8 +1454,7 @@ def rt_lines(handle: BinaryIO, on_step: Optional[Callable[[Ring], None]] = None,
             pending.append(text.decode())
             text.clear()
 
-    stages = [Lexer(), Parser(), RightToLeft(), CheckStage(lfplo=True, phase1=phase1), RTLower()]
-    ring = Ring(required_cells(64), file_bytes(handle), stages, sink, on_step)
+    ring = compiler_ring(file_bytes(handle), sink, on_step, phase1=phase1)
     for _ in _steps(ring):
         while pending:
             yield pending.pop(0)

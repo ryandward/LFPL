@@ -139,6 +139,8 @@ class Backend:
     def __init__(self, emit: Callable[[str], None], *, count_steps: bool = False):
         self.out = emit
         self.count_steps = count_steps  # to measure W(n): every step adds one to a counter
+        self.waiting: Optional[str] = None  # a label not placed yet: if it is only a jump, it is not a place
+        self.aliases: dict[str, list[str]] = {}  # the labels that turned out to be each label still to come
         self.ctors: dict[str, tuple[str, list]] = {}
         self.tagged: dict[str, bool] = {}
         self.tuples: dict[str, list[str]] = {}
@@ -170,6 +172,7 @@ class Backend:
     # --- the output
 
     def ins(self, op: str, dest: Optional[str] = None, src: Optional[str] = None) -> None:
+        self._place_waiting()
         if dest in _FULL and op not in ("cmp", "test"):
             self.clobbered.add(_FULL[dest])
         operands = ", ".join(o for o in (dest, src) if o is not None)
@@ -477,14 +480,18 @@ class Backend:
             return
         label = _LABEL.match(text)
         if label:
-            self._flush(label.group(1))
+            self._place_waiting()
             self._label(label.group(1))
             text = label.group(2)
             if not text:
                 return
-        else:
+        elif self.waiting is None:
             self._flush(None)
         head, _, rest = text.partition(" ")
+        if self.waiting is not None:
+            if self._only_a_jump(head, rest):
+                return
+            self._place_waiting()
         if head in ("fn", "handler"):
             self._header(text)
         elif head == "end":
@@ -558,7 +565,10 @@ class Backend:
                 self.ins("jmp", self.asm_label(hold[1]))
             return
         _kind, cc, then, other = hold
-        if other == next_label:
+        if then == other:  # both ways turned out to be only a jump to one place
+            if then != next_label:
+                self.ins("jmp", self.asm_label(then))
+        elif other == next_label:
             self.ins(f"j{cc}", self.asm_label(then))
         elif then == next_label:
             self.ins(f"j{NEGATED[cc]}", self.asm_label(other))
@@ -567,14 +577,54 @@ class Backend:
             self.ins("jmp", self.asm_label(other))
 
     def _label(self, label: str) -> None:
-        if self.live:
+        """The tables are the label's from here, and where it is in the code waits for the next line. What
+        was held waits too, because a jump to a label that turns out to be only a jump goes further."""
+        falls_into_it = self.live
+        if falls_into_it:
             self._arrive(label, dict(self.home), set(self.linear))
         edge = self.edges.pop(label, None)
         assert edge is not None, f"{label} has no incoming edge"
         self._table(edge[0])
         self.linear = set(edge[1])
-        self.place(self.asm_label(label))
         self.live = True
+        self.waiting = label
+        if falls_into_it:
+            self._place_waiting()
+
+    def _place_waiting(self) -> None:
+        """What was found to be another name for this label is said after it: NASM cannot settle the size of a
+        jump to a name defined by `equ` from a label further on, and gives up after a thousand passes."""
+        label, self.waiting = self.waiting, None
+        if label is not None:
+            self._flush(label)
+            self.place(self.asm_label(label))
+            for name in self.aliases.pop(label, ()):
+                self.out(f"{self.asm_label(name)} equ {self.asm_label(label)}")
+
+    def _only_a_jump(self, head: str, rest: str) -> bool:
+        """Is the waiting label followed by a jump, or a comparison of literals, which is one, with no
+        move on the way? Then it is another name for where that goes: section 5.3's zero trampolines. An
+        `if` on `if c then true else false` branches on c, straight to the outer labels."""
+        args = _args(rest)
+        target = args[0] if head == "jump" else _literal_branch(args) if head == "br" else None
+        if target is None or self.count_steps or self._needs_moves(target, self.home):
+            return False
+        waiting, self.waiting = self.waiting, None
+        assert waiting is not None
+        self.aliases.setdefault(target, []).extend((*self.aliases.pop(waiting, ()), waiting))
+        if self.hold is not None:
+            self.hold = (self.hold[0], *(target if part == waiting else part for part in self.hold[1:]))
+        self._go_to(target, _other_way(args, target) if head == "br" else None)
+        return True
+
+    def _go_to(self, target: str, other: Optional[str]) -> None:
+        """Control goes to `target`. The other way a branch names is never taken, but it has to type, so its
+        label gets an edge if it has none, and no move is written for it."""
+        linear = set(self.linear)
+        if other is not None and other not in self.edges:
+            self.edges[other] = (dict(self.home), set(linear))
+        self._arrive(target, dict(self.home), linear)
+        self.live = False
 
     def _needs_moves(self, label: str, table: dict[int, Home]) -> bool:
         edge = self.edges.get(label)
@@ -602,9 +652,8 @@ class Backend:
         self._table(target)
 
     def i_jump(self, a: list[str]) -> None:
-        self._arrive(a[0], dict(self.home), set(self.linear))
+        self._go_to(a[0], None)
         self.hold = ("jump", a[0])
-        self.live = False
 
     def _branch(self, cc: str, then: str, other: str, then_table: dict[int, Home],
                 other_table: dict[int, Home]) -> None:
@@ -648,6 +697,11 @@ class Backend:
             self.ins("cmp", first, TRANSIT)
 
     def i_br(self, a: list[str]) -> None:
+        target = _literal_branch(a)
+        if target is not None:
+            self._go_to(target, _other_way(a, target))
+            self.hold = ("jump", target)
+            return
         self._compare(a[1].rstrip("!"), a[2].rstrip("!"))
         for operand in (a[1], a[2]):
             if operand.endswith("!"):
@@ -788,6 +842,9 @@ class Backend:
             self.ins("mov", self.sub(register, 4), self.sub(register, 4))
 
     def i_pack(self, a: list[str]) -> None:
+        """Horner. The literals in front are one literal by the time this runs, shifted over the field
+        after them. Then each field is a shift and an `or`, into the subregister of the field's width,
+        which takes only those bits of a wider operand, so nothing has to be narrowed first."""
         widths = [int(w) for w in a[1].strip("<>").split()]
         pins: frozenset = frozenset()
         places = []
@@ -795,16 +852,47 @@ class Backend:
             place, pins = self._operand(operand, pins)
             places.append(place)
         register = self._take(pins)
-        for position, (bits, place) in enumerate(zip(widths, places)):
-            if position == 0:
-                self._load(register, place)
-                self._narrow(register, bits // 8)
-            else:
-                self.ins("shl", register, str(bits))
-                self._load(TRANSIT, place)
-                self._narrow(TRANSIT, bits // 8)
-                self.ins("or", register, TRANSIT)
+        known = 0
+        position = 0
+        while position < len(places) and isinstance(places[position], Imm):
+            known = (known << widths[position] | _masked(places[position].value, widths[position] // 8)) & _MASK64
+            position += 1
+        if position == len(places):
+            self._load(register, Imm(known))
+        elif position:
+            self._load(register, Imm(known << widths[position] & _MASK64))
+            self._or_into(register, widths[position] // 8, places[position])
+            position += 1
+        else:
+            self._load(register, _narrowed(places[0], widths[0] // 8))
+            if isinstance(places[0], Reg):
+                self._narrow(register, widths[0] // 8)
+            position = 1
+        for bits, place in zip(widths[position:], places[position:]):
+            self.ins("shl", register, str(bits))
+            self._or_into(register, bits // 8, place)
         self._define(a[0], register)
+
+    def _or_into(self, register: str, size: int, place: Union[Reg, Imm, Mem]) -> None:
+        """The low `size` bytes of the register are zero. A 32-bit `or` would clear the upper half."""
+        if isinstance(place, Imm):
+            value = _masked(place.value, size)
+            if value >= 1 << 31:
+                self._load(TRANSIT, Imm(value))
+                self.ins("or", register, TRANSIT)
+            elif value:
+                self.ins("or", register, str(value))
+        elif size == 4:
+            if isinstance(place, Reg):
+                self.ins("mov", self.sub(TRANSIT, 4), self.sub(place.name, 4))
+            else:
+                self._load(TRANSIT, _narrowed(place, 4))
+            self.ins("or", register, TRANSIT)
+        elif isinstance(place, Reg):
+            self.ins("or", self.sub(register, size), self.sub(place.name, size))
+        else:
+            narrowed = _narrowed(place, size)
+            self.ins("or", self.sub(register, narrowed.size), self.mem(narrowed))
 
     def i_idx(self, a: list[str]) -> None:
         mask = int(a[1]) - 1
@@ -991,13 +1079,35 @@ class Backend:
         if fn.at is not None:
             moves = [Move(Reg("rax"), _as_place(self.home[ROOT]))]
         else:
-            moves = [Move(Reg(RESULTS[position]), _as_place(self.home[self.reg(operand)]))
+            moves = [Move(Reg(RESULTS[position]), Imm(0) if operand == "#0" else _as_place(self.home[self.reg(operand)]))
                      for position, operand in enumerate(a)]
         self._pmove(moves)
         self.clobbered |= {m.dest.name for m in moves if isinstance(m.dest, Reg)}
         self.ins("add", "rsp", f"F_{fn.name}")
         self.ins("ret")
         self.live = False
+
+
+_MASK64 = (1 << 64) - 1
+_COMPARED = {"b": lambda x, y: x < y, "be": lambda x, y: x <= y, "a": lambda x, y: x > y, "ae": lambda x, y: x >= y,
+             "e": lambda x, y: x == y, "ne": lambda x, y: x != y}
+
+
+def _literal_branch(a: list[str]) -> Optional[str]:
+    """Where `br cc, #x, #y, Lt, Lf` goes, or None for a branch on anything else."""
+    x, y = _LIT.match(a[1]), _LIT.match(a[2])
+    if x is None or y is None:
+        return None
+    return a[3] if _COMPARED[a[0]](int(x.group(1)), int(y.group(1))) else a[4]
+
+
+def _other_way(a: list[str], target: str) -> str:
+    return a[4] if target == a[3] else a[3]
+
+
+def _narrowed(place: Union[Reg, Imm, Mem], size: int) -> Union[Reg, Imm, Mem]:
+    """A location, read at no more than this width: the low bytes are at the same address."""
+    return Mem(place.base, place.off, min(place.size, size)) if isinstance(place, Mem) else place
 
 
 def _as_place(home: Home) -> Union[Reg, Slot]:

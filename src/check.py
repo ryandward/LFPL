@@ -21,15 +21,15 @@ depends only on the program text, like D_max. Names go no further than this
 stage: Lower receives binder positions, offsets and widths in event payloads,
 so it never compares a name and its frames stay small.
 
-With `lfplo` set, this checks LFPL-O's additions too, and writes the declarations out as lines of
-the RT layer's text format, one event at a time, so they reach every reader of the stream:
+It checks LFPL-O's additions too, and writes the declarations out as lines of the RT layer's text
+format, one event at a time, so they reach every reader of the stream:
 
   * handlers and state, with the shape section 3.1 fixes;
   * Array[N] t, Fin N and unboxed tuples, which are types with no entry in G, because they appear
     in the middle of a parameter list and G's entries for one function must stay consecutive;
-  * idx, get and the narrowing low8, low16 and low32, which are primitives there, while Phase 1
-    programs may still call a function get;
+  * idx, get and the narrowing low8, low16 and low32, which are primitives;
   * a built-in Free, and a type declared but never defined, which is the runtime's own to build.
+    A program with a main has no runtime, so there it is refused.
 """
 from __future__ import annotations
 
@@ -51,8 +51,7 @@ LINEAR_BINDERS_MAX = 64
 # Type ids. Named types are G positions offset by FIRST_NAMED.
 T_I8, T_I16, T_I32, T_I64, T_BOOL, T_DIAMOND, T_LIT, T_LIT8, T_LIT16, T_LIT32 = range(10)
 FIRST_NAMED = 16
-# A literal whose type nothing has fixed yet, by the bytes it needs. T_LIT is the widest, and
-# the only one without `lfplo`, where a literal has always fitted whatever it met.
+# A literal whose type nothing has fixed yet, by the bytes it needs.
 _LITERALS = {T_LIT8: 1, T_LIT16: 2, T_LIT32: 4, T_LIT: 8}
 _NARROWING = {b"low8": T_I8, b"low16": T_I16, b"low32": T_I32}
 _PRIMITIVES = {b"idx", b"get", *_NARROWING}
@@ -73,24 +72,16 @@ _BINDER = struct.Struct("<HBHQB")  # type, linear index or 255, then its cell co
 _ARGUMENT = struct.Struct("<HQB")  # the cell count of one argument to a recursive call
 _FORWARD, _RESOLVED = 254, 253  # the `a` attribute of a forward-declared type
 
-# Payloads for Lower.
+# Payloads for Lower: positions, offsets and widths, and the id of whatever it must name.
 P_VAR = struct.Struct("<HBB")     # src index, linear, size
-P_CALL = struct.Struct("<HBB")    # function ordinal, is self, argument count
-P_DIAMOND = struct.Struct("<HBBBBBB")  # d src, tag, tagged, nfields, off, size, linear
 P_FIELD = struct.Struct("<BBBB")  # index, off, size, linear
-P_ARM = struct.Struct("<BBBBB")   # tag, tagged, is the null constructor, arm index, nctors
 P_BINDER = struct.Struct("<BBBB")  # 0 for diamond or 1 for a field, off, size, linear
-P_LET = struct.Struct("<BBB")     # separator 1, linear, size
-P_PARAM = struct.Struct("<HBB")   # src index, size, linear
-P_WITH = struct.Struct("<BBB")    # off, size, linear
-
-# The richer payloads an RT lowerer receives, with `lfplo` set: the id of whatever it must name.
 P_PARAM_RT = struct.Struct("<HBBH")      # src index, size, linear, type
-P_DIAMOND_RT = struct.Struct("<HBBBBBBH")  # as P_DIAMOND, then the constructor
-P_ARM_RT = struct.Struct("<BBBBBH")      # as P_ARM, then the constructor
-P_LET_RT = struct.Struct("<BBBB")        # as P_LET, then how many names it binds
-P_CALL_RT = struct.Struct("<HBBBB")      # as P_CALL, then its result count, then @k + 1 or 0
-P_WITH_RT = struct.Struct("<BBBHBB")     # as P_WITH, then the constructor, its position and count
+P_DIAMOND_RT = struct.Struct("<HBBBBBBH")  # d src, tag, tagged, nfields, off, size, linear, the constructor
+P_ARM_RT = struct.Struct("<BBBBBH")      # tag, tagged, is the null constructor, arm index, nctors, the constructor
+P_LET_RT = struct.Struct("<BBBB")        # separator 1, linear, size, how many names it binds
+P_CALL_RT = struct.Struct("<HBBBB")      # function ordinal, is self, argument count, result count, @k + 1 or 0
+P_WITH_RT = struct.Struct("<BBBHBB")     # off, size, linear, the constructor, its position and count
 P_TYPE_RT = struct.Struct("<H")          # a type
 P_GET_RT = struct.Struct("<B")           # the element's size
 P_IDX_RT = struct.Struct("<Q")           # the bound
@@ -129,11 +120,10 @@ class CheckStage(Stage):
 
     name = "check"
 
-    def __init__(self, g_max: int = 2048, *, lfplo: bool = False, phase1: bool = False) -> None:
+    def __init__(self, g_max: int = 2048, *, phase1: bool = False) -> None:
         super().__init__()
         self.g_max = g_max
-        self.lfplo = lfplo
-        self.phase1 = phase1 or not lfplo  # a program with a main, which _start calls and reads
+        self.phase1 = phase1  # a program with a main, which _start calls and reads
         self.decl_from = self.decl_to = 0  # the G entries still to be written out as RT lines
         self.decl_text = b""               # the rest of the line being written out
         self.decl_queue: list[bytes] = []  # at most one declaration's few extra lines
@@ -168,8 +158,7 @@ class CheckStage(Stage):
         self.TF = self.stack()  # Fin types: bound
         self.TT = self.stack()  # tuple types: their members
         self.TM = self.stack()  # the members of each tuple still open, type or expression
-        if self.lfplo:
-            self._seed_reserve()
+        self._seed_reserve()
 
     def _seed_reserve(self) -> None:
         """LFPL-O's Free is built in: End | More(next: Free), so every program and the runtime
@@ -323,8 +312,6 @@ class CheckStage(Stage):
         return members
 
     def _type_token(self, kind: int, payload: bytes) -> int:
-        if kind != K_TYPE and not self.lfplo:
-            raise self._reject("Array and Fin belong to LFPL-O: compile this with src.lfplo")
         if kind == K_TARRAY:
             length = struct.unpack_from("<Q", payload)[0]
             element = _ELEMENT_TYPES[payload[8]]
@@ -421,7 +408,7 @@ class CheckStage(Stage):
     def _literal_meets(self, literal: int, ty: int, where: str) -> int:
         """A literal has to be a value of the type it is used at. If it could be more, a register
         would hold an Int8 of 300, and the same value would be 44 to + and not 44 to ==."""
-        if self.lfplo and _LITERALS[literal] > _SIZES[ty]:
+        if _LITERALS[literal] > _SIZES[ty]:
             raise self._reject(f"a literal in {where} does not fit {self._show(ty)}")
         return ty
 
@@ -486,8 +473,6 @@ class CheckStage(Stage):
     # --- declarations: consumed here, never forwarded
 
     def _declaration(self, cls: int, kind: int, payload: bytes) -> None:
-        if not self.lfplo and kind == K_STATE:
-            raise self._reject("state belongs to LFPL-O: compile this with src.lfplo")
         if cls == OPEN and kind == K_STATE:
             if len(self.G) and self._g_find(E_STATE, payload) is not None:
                 raise self._reject("duplicate state name")
@@ -511,7 +496,7 @@ class CheckStage(Stage):
             if found is not None:
                 # G's first entry is the built-in Free, which a Phase 1 program declares for
                 # itself. The runtime still checks the shape of what a handler is given.
-                if self._g(found)[1] != _FORWARD and not (self.lfplo and found == 0):
+                if self._g(found)[1] != _FORWARD and found != 0:
                     raise self._reject("duplicate type name")
                 self.decl_forward = found
             self.decl_type = self._g_push(E_TYPE, payload, a=kind)
@@ -561,8 +546,7 @@ class CheckStage(Stage):
             raise self._reject("malformed declaration")
 
     def _write_out_declaration(self) -> None:
-        if self.lfplo:
-            self.decl_from, self.decl_to = self.decl_type, len(self.G)
+        self.decl_from, self.decl_to = self.decl_type, len(self.G)
 
     def _resolve_forward(self) -> None:
         """Fields written against the forward declaration now name the definition.
@@ -571,8 +555,7 @@ class CheckStage(Stage):
             return
         old = self.decl_forward + FIRST_NAMED
         new = self.decl_type + FIRST_NAMED
-        if self.lfplo:
-            self.decl_queue.append(f"alias t{old} t{new}".encode())
+        self.decl_queue.append(f"alias t{old} t{new}".encode())
         for index in range(len(self.G)):
             entry = self._g(index)
             if entry[0] == E_FIELD and entry[7] == old:
@@ -581,7 +564,7 @@ class CheckStage(Stage):
         self._g_set(self.decl_forward, _RESOLVED, b, c, d, x, y, z)
 
     def _check_forwards_resolved(self) -> None:
-        if self.lfplo:
+        if not self.phase1:
             return  # a type never defined is one the runtime builds and the program only moves
         for index in range(len(self.G)):
             entry = self._g(index)
@@ -665,16 +648,12 @@ class CheckStage(Stage):
         if len(self.K) and self.K.peek()[0] == K_IDX and self._top()[1]:
             raise self._reject("the bound of idx must be a literal")
         if kind == K_TTUPLE:
-            if not self.lfplo:
-                raise self._reject("a tuple belongs to LFPL-O: compile this with src.lfplo")
             self._frame(K_TTUPLE, c1=len(self.TM))
             return None
-        if kind == K_HANDLER and not self.lfplo:
-            raise self._reject("a handler belongs to LFPL-O: compile this with src.lfplo")
         if kind in (K_FN, K_HANDLER):
             if self._g_find(E_FUNC, payload) is not None:
                 raise self._reject("duplicate function name")
-            if self.lfplo and payload.rstrip(bytes(1)) in _PRIMITIVES:
+            if payload.rstrip(bytes(1)) in _PRIMITIVES:
                 raise self._reject(f"{payload.rstrip(bytes(1)).decode()} is a primitive")
             self.fn_handler = kind == K_HANDLER
             self.fn_recursive = False
@@ -691,14 +670,12 @@ class CheckStage(Stage):
         elif kind in (K_IF, K_MATCH, K_CMP, K_AND, K_OR, K_NOT):
             self._frame(kind, t1=T_LIT)
         elif kind == K_TUPLE:
-            if not self.lfplo:
-                raise self._reject("a tuple belongs to LFPL-O: compile this with src.lfplo")
             self._frame(K_TUPLE, c1=len(self.TM))
-        elif (kind == K_CALL and self.lfplo and payload.rstrip(bytes(1)) in (b"idx", b"get")):
+        elif kind == K_CALL and payload.rstrip(bytes(1)) in (b"idx", b"get"):
             primitive = K_IDX if payload.rstrip(bytes(1)) == b"idx" else K_GET
             self._frame(primitive)
             return primitive, b""
-        elif kind == K_CALL and self.lfplo and payload.rstrip(bytes(1)) in _NARROWING:
+        elif kind == K_CALL and payload.rstrip(bytes(1)) in _NARROWING:
             self._frame(K_LOW, t1=_NARROWING[payload.rstrip(bytes(1))])
             self.child_seen = False
             return K_LOW, b""
@@ -713,10 +690,8 @@ class CheckStage(Stage):
                 raise self._reject("a handler is an entry point, and nothing can call one")
             self._frame(K_CALL, a=nparams, b=found == self.fn_self, t1=ret, c1=first)
             self.child_seen = False
-            if self.lfplo:
-                results = len(self._tuple_of(ret)) if self._is_tuple(ret) else 1
-                return kind, P_CALL_RT.pack(ordinal, found == self.fn_self, nparams, results, at)
-            return kind, P_CALL.pack(ordinal, found == self.fn_self, nparams)
+            results = len(self._tuple_of(ret)) if self._is_tuple(ret) else 1
+            return kind, P_CALL_RT.pack(ordinal, found == self.fn_self, nparams, results, at)
         elif kind == K_CTOR:
             found = self._g_find(E_CTOR, payload)
             if found is None:
@@ -764,9 +739,7 @@ class CheckStage(Stage):
                     t1=0 if position is None else position + 1,
                     t2=0 if saved is None else saved.constant, c1=len(self.B), c2=found,
                     m1=0 if saved is None else saved.unknowns)
-        if self.lfplo:
-            return K_ARM, P_ARM_RT.pack(tag, tagged, is_null, arm_index, nctors, found)
-        return K_ARM, P_ARM.pack(tag, tagged, is_null, arm_index, nctors)
+        return K_ARM, P_ARM_RT.pack(tag, tagged, is_null, arm_index, nctors, found)
 
     # --- sep
 
@@ -798,9 +771,7 @@ class CheckStage(Stage):
             self.N.pop()
             # let is a renaming, so the value's count carries over to the name
             self._bind(name, ty, self.form if is_linear(ty) else Cells())
-            if self.lfplo:
-                return kind, P_LET_RT.pack(1, is_linear(ty), size_of(ty), 1)
-            return kind, P_LET.pack(1, is_linear(ty), size_of(ty))
+            return kind, P_LET_RT.pack(1, is_linear(ty), size_of(ty), 1)
         if kind == K_TUPLE:
             if len(self.TM) - frame[4] >= TUPLE_MAX:
                 raise self._reject(f"a tuple of more than {TUPLE_MAX}")
@@ -993,7 +964,7 @@ class CheckStage(Stage):
 
     def _on_leaf(self, kind: int, payload: bytes):
         if kind == K_LIVE:  # the right-to-left pass, on its way to Lower: not a value
-            return (kind, payload) if self.lfplo else None
+            return kind, payload
         if kind == K_EOF:
             self._check_forwards_resolved()
             return kind, payload
@@ -1010,15 +981,13 @@ class CheckStage(Stage):
                 return None
             if frame[0] == 1:
                 self.ret_ty = ty
-                return (K_TYPE, P_TYPE_RT.pack(ty)) if self.lfplo else None
+                return K_TYPE, P_TYPE_RT.pack(ty)
             if len(self.G) - frame[4] == 6:
                 raise self._reject("more than 6 parameters (the register budget)")
             src = self._bind(self.pending_name, ty)
             self.entry.append(self._form_of(src))
             self._g_push(E_PARAM, self.pending_name, x=ty)
-            if self.lfplo:
-                return K_PARAM, P_PARAM_RT.pack(src, size_of(ty), is_linear(ty), ty)
-            return K_PARAM, P_PARAM.pack(src, size_of(ty), is_linear(ty))
+            return K_PARAM, P_PARAM_RT.pack(src, size_of(ty), is_linear(ty), ty)
         if kind == K_RESWORD:
             src, ty, _ = self._lookup(payload)
             if ty != self.ret_ty:
@@ -1040,9 +1009,7 @@ class CheckStage(Stage):
                 field = self._g(frame[4] + 1)
                 off, size, linear = field[1], field[2], is_linear(field[7])
             self.child_seen = False
-            if self.lfplo:
-                return kind, P_DIAMOND_RT.pack(src, tag, tagged, count, off, size, linear, frame[4])
-            return kind, P_DIAMOND.pack(src, tag, tagged, count, off, size, linear)
+            return kind, P_DIAMOND_RT.pack(src, tag, tagged, count, off, size, linear, frame[4])
         if len(self.K) and self.K.peek()[0] == K_IDX and self._top()[1]:
             if kind != K_INT:
                 raise self._reject("the bound of idx must be a literal")
@@ -1061,13 +1028,11 @@ class CheckStage(Stage):
             src, ty, linear = self._use(payload)
             self.ty = ty
             self.form = self._form_of(src)
-            return (kind if self.lfplo else K_VAR), P_VAR.pack(src, linear != 255, size_of(ty))
+            return kind, P_VAR.pack(src, linear != 255, size_of(ty))
         if kind == K_INT:
-            self.ty = T_LIT
-            if self.lfplo:
-                value = struct.unpack_from("<Q", payload)[0]
-                self.ty = (T_LIT8 if value < 1 << 8 else T_LIT16 if value < 1 << 16
-                           else T_LIT32 if value < 1 << 32 else T_LIT)
+            value = struct.unpack_from("<Q", payload)[0]
+            self.ty = (T_LIT8 if value < 1 << 8 else T_LIT16 if value < 1 << 16
+                       else T_LIT32 if value < 1 << 32 else T_LIT)
         elif kind == K_BOOL:
             self.ty = T_BOOL
         elif kind == K_NULLCTOR:
@@ -1076,8 +1041,7 @@ class CheckStage(Stage):
                 raise self._reject(
                     f"{payload.rstrip(bytes(1)).decode()} is not a null constructor")
             self.ty = self._g(found)[5] + FIRST_NAMED
-            if self.lfplo:
-                return kind, P_TYPE_RT.pack(self.ty)
+            return kind, P_TYPE_RT.pack(self.ty)
         return kind, payload
 
     def _binder(self, payload: bytes):
@@ -1086,7 +1050,7 @@ class CheckStage(Stage):
             if len(self.N) - frame[5] >= TUPLE_MAX:
                 raise self._reject(f"more than {TUPLE_MAX} names in one let")
             self.N.push(0, payload)
-            return (K_BINDER, b"") if self.lfplo else None
+            return K_BINDER, b""
         position = frame[1]
         if position >= frame[0]:
             raise self._reject(f"pattern has too many binders: expected {frame[0]}")
@@ -1111,10 +1075,8 @@ class CheckStage(Stage):
                 frame[3] = field[7]
                 self._store(frame)
                 self._bind(payload, field[7])
-                if self.lfplo:
-                    return K_FIELD, P_WITH_RT.pack(field[1], field[2], is_linear(field[7]), ctor,
-                                                   position - ctor - 1, count)
-                return K_FIELD, P_WITH.pack(field[1], field[2], is_linear(field[7]))
+                return K_FIELD, P_WITH_RT.pack(field[1], field[2], is_linear(field[7]), ctor,
+                                               position - ctor - 1, count)
         raise self._reject(f"no field {payload.rstrip(bytes(1)).decode()} in {self._show(frame[2])}")
 
     # --- close
@@ -1164,7 +1126,7 @@ class CheckStage(Stage):
             self._unbind_to(0)
             self.fn_count += 1
             self.K.pop()
-            return kind, bytes((self._decreasing_set(),)) if self.lfplo else payload
+            return kind, bytes((self._decreasing_set(),))
         if kind == K_LET:
             self.closing = self.form  # the value of a let is the value of its body
             self._unbind_to(frame[4])
@@ -1227,7 +1189,7 @@ class CheckStage(Stage):
             elif frame[1]:
                 self._rule_r3(frame[0])
             self.ty = frame[2]
-            if self.lfplo and kind == K_CALL:
+            if kind == K_CALL:
                 members = self._tuple_of(self.ty) if self._is_tuple(self.ty) else [self.ty]
                 mask = sum(1 << i for i, m in enumerate(members) if is_linear(m))
                 self.K.pop()

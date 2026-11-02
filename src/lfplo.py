@@ -1,10 +1,13 @@
 """The LFPL-O compiler: source to a running binary, or a refusal and no binary.
 
-    Lex -> Parse -> Check -> Lower (RT) -> rtcheck -> x86 -> certificate -> symcheck, stack -> nasm, ld
+    Lex -> Parse -> Right-to-left -> Check -> Lower (RT) -> rtcheck -> x86 -> certificate -> symcheck, stack -> nasm, ld
 
 LFPL-O section 8.4 is the shape of this file. Those checks run on every build, and a failure in any
 of them leaves nothing behind, so a program that compiled is one that passed. The fourth check of
 that section, redundant moves, runs only in the test suite so far.
+
+A program with `fn main` and no handler runs once and exits, with no runtime: `--nasm` prints its
+assembly, and `--run` assembles, links and runs it, and prints what main returned.
 """
 from __future__ import annotations
 
@@ -83,12 +86,70 @@ def _generate(lines: Iterable[str], asm_path: str, options: Options,
     return image
 
 
+def _trailer(mode: int, target_cells: int) -> str:
+    """_start, for a program with a main: the single mint. It threads the cells into one free list,
+    which main receives, and runs exactly once per process. 0 is no main, a library assembled but
+    not run; 1 is `fn main()`, which owns no cells and so returns a scalar directly; and 2 is
+    `fn main(free: Free)`, which with exactly-once linearity cannot turn cells into a bare scalar, so
+    it returns Fail, which is null, or a cell whose first field is the Int64 result, and the rest of
+    its fields hand every other cell back."""
+    if mode == 0:
+        return "section .note.GNU-stack noalloc noexec nowrite progbits"
+    takes_cells = mode == 2
+    lines = ["_start:",
+             "    mov rdi, cells",
+             *((f"    mov rcx, {target_cells - 1}",
+                "    mov rax, rdi",
+                ".mint:",
+                "    lea rdx, [rax+16]",
+                "    mov [rax], rdx",
+                "    mov rax, rdx",
+                "    dec rcx",
+                "    jnz .mint",
+                "    mov qword [rax], 0") if takes_cells else ()),
+             "    call fn_main",
+             *(("    test rax, rax",
+                "    jz .fail",
+                "    mov rax, [rax]") if takes_cells else ()),
+             "    push rax",
+             "    mov rax, 1",
+             "    mov rdi, 1",
+             "    mov rsi, rsp",
+             "    mov rdx, 8",
+             "    syscall",
+             "    mov rax, 60",
+             "    xor edi, edi",
+             "    syscall",
+             *((".fail:",
+                "    mov rax, 60",
+                "    mov edi, 1",
+                "    syscall") if takes_cells else ()),
+             "section .bss",
+             "alignb 16",
+             f"cells: resb {target_cells * 16}",
+             "section .note.GNU-stack noalloc noexec nowrite progbits"]
+    return "\n".join(lines)
+
+
+def build_and_run(asm: str, workdir: str, *, name: str = "prog") -> int:
+    """Assemble with nasm and link with ld, so no libc and no C compiler, run it on the silicon, and
+    return the 64-bit result `_start` writes to stdout."""
+    source = os.path.join(workdir, f"{name}.asm")
+    obj = os.path.join(workdir, f"{name}.o")
+    exe = os.path.join(workdir, name)
+    with open(source, "w") as handle:
+        handle.write(asm)
+    # -Werror: NASM only warns when it truncates an immediate, which is a miscompile that still assembles.
+    subprocess.run(["nasm", "-Werror", "-f", "elf64", "-o", obj, source], check=True,
+                   capture_output=True, text=True)
+    subprocess.run(["ld", "-o", exe, obj], check=True, capture_output=True, text=True)
+    done = subprocess.run([exe], check=True, capture_output=True, timeout=10)
+    return int.from_bytes(done.stdout, "little")
+
+
 def compile_program(source: bytes, *, target_cells: int = 1024,
                     on_step: Optional[Callable[[Ring], None]] = None) -> str:
-    """A Phase 1 program, with `fn main` and no handler: the assembly, to run once and exit. The
-    runtime is not involved, so this is what shows the compiler does what the old one did."""
-    from .lower import _trailer
-
+    """A program with `fn main` and no handler: the assembly, to run once and exit."""
     out: list[str] = []
     checker = Checker()
     backend = Backend(out.append)
@@ -174,10 +235,28 @@ def _print_rt(source_path: str) -> int:
     return 0
 
 
+def _main_program(source_path: str, run: bool) -> int:
+    """`--nasm` and `--run`."""
+    try:
+        with open(source_path, "rb") as handle:
+            asm = compile_program(handle.read())
+    except (Reject, RTError, Limit, FStarved, Starved, OSError) as failure:
+        print(f"{source_path}: refused: {failure}", file=sys.stderr)
+        return 1
+    if not run:
+        print(asm, end="")
+        return 0
+    with tempfile.TemporaryDirectory() as workdir:
+        print(build_and_run(asm, workdir))
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="lfplo", description=__doc__.splitlines()[0])
     parser.add_argument("source")
     parser.add_argument("--rt", action="store_true", help="print the checked RT stream, and stop")
+    parser.add_argument("--nasm", action="store_true", help="a program with a main: print its assembly, and stop")
+    parser.add_argument("--run", action="store_true", help="a program with a main: run it, and print what it returned")
     parser.add_argument("-o", dest="output")
     parser.add_argument("--in-port", type=int)
     parser.add_argument("--out-port", type=int,
@@ -196,6 +275,8 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.rt:
         return _print_rt(args.source)
+    if args.nasm or args.run:
+        return _main_program(args.source, args.run)
     if None in (args.output, args.in_port, args.out_port, args.ctl_port):
         parser.error("a build needs -o, --in-port, --out-port and --ctl-port")
     initial = {}
