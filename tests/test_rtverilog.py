@@ -5,7 +5,8 @@ stream goes down both backends, each datagram goes through both, and every outpu
 is tested parity on these inputs, and not a proof of equivalence.
 
 The other half is that the emitter says what the machine will take before anything runs. rtverilog
-derives k and c from the states it wrote, and these tests hold the simulation to them exactly. A run
+charges every clock of its machine to an instruction and has rtcheck certify the clocks as it does steps,
+and these tests hold the simulation to that bound, exactly where a handler has one path for each n. A run
 over the bound, or with a different cost per cell, is a bug in the emitter and not latency.
 
 Needs iverilog and vvp, and for the synthesis tests yosys and verilator. A missing tool skips what
@@ -17,6 +18,7 @@ import os
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -28,7 +30,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.ring import Reject  # noqa: E402
 from src.rtcheck import RTError, Unbounded  # noqa: E402
 from src.rtlower import Limit, rt_lines  # noqa: E402
-from src.rtverilog import CELL_BITS, Translation, translate  # noqa: E402
+from src.certify import certify_turn  # noqa: E402
+from src.rtcheck import Checker  # noqa: E402
+from src.rtverilog import CELL_BITS, Emitter, Translation, translate  # noqa: E402
 from tests.test_checksum import (LARGEST, PORT, SOURCE, cells_in, internet_checksum,  # noqa: E402
                                  packet, payload)
 from tests.reference import hgen, ipv4_model  # noqa: E402
@@ -186,20 +190,25 @@ handler h(p: P, free: Free) : (P, Free) =
 class TheEmittersOwnArithmetic(unittest.TestCase):
     """These run nothing. They are what the simulation is then held to."""
 
-    def test_the_checksum_is_one_cycle_per_step_and_one_read_outside_the_walks(self):
-        timing = translate_file(SOURCE).timing
-        self.assertEqual((timing.k, timing.c), (1, 1))
+    def test_a_walk_of_the_checksum_is_two_clocks_a_cell(self):
+        """The test and the read of the next cell in one clock, and everything an iteration computes, its write
+        and its jump back in the other: 24 steps of `add` are two clocks."""
+        translation = translate_file(SOURCE)
+        walks = {name: (str(iteration), str(leaving)) for name, iteration, leaving in translation.timing.iterations}
+        self.assertEqual(walks, {"add": ("2", "2"), "reverse": ("2", "2")})
+        self.assertEqual(translation.timing.clocks.c, 2 + 2)
 
-    def test_each_kind_says_what_it_takes(self):
-        kinds = {kind: (steps, low, high) for kind, steps, low, high, _count in translate_file(SOURCE).timing.kinds}
-        self.assertEqual(kinds["pack"], (1, 1, 1))
-        self.assertEqual(kinds["take"], (1, 1, 1))
-        self.assertEqual(kinds["build"], (1, 1, 1))
-        self.assertEqual(kinds["tail"], (1, 1, 1))
-        self.assertEqual(kinds["br.null"], (1, 1, 1))
-        self.assertEqual(kinds["drop"], (0, 0, 0))
-        self.assertEqual(kinds["open"], (0, 0, 0))
-        self.assertEqual(kinds["call"], (1, 1, 2), "the first names a field of a cell that has not been read")
+    def test_straight_line_code_is_one_clock(self):
+        """A read of the cell, and then the arithmetic, the build and the return in one clock: the values in
+        between are wires, and only what is still read afterwards is a register."""
+        source = """record Hd { a: Int64, b: Int64 };
+data Out = Send(port: Int8, x: Int64);
+handler h(m: Hd, free: Free) : (Out, Free) = match m with Hd(d, a, b) => (Send@d(1, +(*(a, b), -(a, ^(b, 3)))), free) end;
+"""
+        translation = translate_text(source)
+        clocks = translation.timing.clocks
+        self.assertEqual((translation.timing.states - 1, clocks.c, clocks.d), (2, 0, 2))
+        self.assertRegex(translation.verilog, r"wire \[63:0\] h_w\d+ = ")
 
     def test_a_tag_and_a_field_of_an_enum_are_slices(self):
         source = """enum V = Drop | Send(port: Int8);
@@ -210,8 +219,8 @@ handler h(m: Hd, free: Free) : (Out, Free) = match m with Hd(d, a, b) =>
   match way(a) with Drop => (Sent@d(0, b), free) | Send(p) => (Sent@d(p, b), free) end end;
 """
         verilog = translate(list(rt_lines(io.BytesIO(source.encode())))).verilog
-        self.assertRegex(verilog, r"<= h_r\d+\[7:0\];")
-        self.assertRegex(verilog, r"<= h_r\d+\[15:8\];")
+        self.assertRegex(verilog, r"= h_r\d+\[7:0\];")
+        self.assertRegex(verilog, r"= h_r\d+\[15:8\];")
 
     def test_a_register_compared_with_less_or_equal_is_read_and_so_it_is_kept(self):
         """`(r <= 94)` is Verilog's comparison, and it looks like a write. Taking it for one left a register that
@@ -231,39 +240,26 @@ handler h(m: Hd, free: Free) : (Out, Free) = match m with Hd(d, a) => (Send@d(if
         with open(os.path.join(ROOT, "examples", "ipv4.lfpl"), "rb") as handle:
             verilog = translate(list(rt_lines(handle)), n_max=217).verilog
         self.assertIn("output reg  [63:0] verdict_out,", verilog)
-        self.assertRegex(verilog, r"<= \{56'd0, 8'd1\};", "Expired is its tag alone")
-        self.assertRegex(verilog, r"<= \{48'd0, [^,]+, 8'd2\};", "Send's port is the byte above its tag")
+        self.assertRegex(verilog, r"= \{56'd0, 8'd1\};", "Expired is its tag alone")
+        self.assertRegex(verilog, r"= \{48'd0, [^,]+, 8'd2\};", "Send's port is the byte above its tag")
         self.assertRegex(verilog, r"verdict_out <= \S+;")
 
-    def test_the_walks_add_up_to_the_steps_per_cell(self):
-        translation = translate_file(SOURCE)
-        walks = {name: (str(iteration), str(leaving)) for name, iteration, leaving in translation.timing.iterations}
-        self.assertEqual(walks, {"add": ("24", "2"), "reverse": ("4", "2")})
-        self.assertEqual(24 + 4, translation.timing.per_cell(translation.bound))
-
     def test_the_report_gives_the_bound_before_anything_runs(self):
-        report = translate_file(SOURCE).report()
-        self.assertIn("cycles(n) <= 1*W(n) + 1 = 28 n + 5", report)
-        self.assertRegex(report, r"br\.null\s+1\s+1\s+2")
+        self.assertIn("clocks(n) <= 4 n + 14, certified", translate_file(SOURCE).report())
 
-    def test_a_tag_is_a_read_and_then_a_compare_so_a_walk_of_them_doubles_k(self):
-        timing = translate_text(pipeline_text(["marks"])).timing
-        self.assertEqual(timing.k, 2)
-        kinds = {kind: (steps, low, high) for kind, steps, low, high, _count in timing.kinds}
-        self.assertEqual(kinds["br.tag"], (1, 1, 2))
+    def test_a_tag_is_a_read_and_then_a_compare(self):
+        """The tag is in the cell, so a tagged walk spends a clock more an iteration than one that tests for null,
+        whose test is the read of the next cell."""
+        walks = {name: iteration.high for name, iteration, _leaving in
+                 translate_text(pipeline_text(["marks", "rev"])).timing.iterations}
+        self.assertEqual(walks["mark"], walks["rev"] + 1)
 
     def test_two_cells_in_one_instruction_cost_a_read_and_a_latch(self):
-        """There is one read port. `sums` adds a byte of one cell to a byte of the next."""
-        timing = translate_text(pipeline_text(["sums"])).timing
-        kinds = {kind: high for kind, _steps, _low, high, _count in timing.kinds}
-        self.assertEqual(kinds["op"], 3, "latch the byte at the port, read the other cell, and add")
-        self.assertEqual(timing.k, 3)
-
-
-    def test_c_counts_what_a_helper_does_outside_a_walk(self):
-        """The handler reads its header, and `late` has to read its cell again after calling rev."""
-        timing = translate_text(pipeline_text(["late"])).timing
-        self.assertEqual((timing.k, timing.c), (1, 2))
+        """There is one read port. `sums` adds a byte of one cell to a byte of the next, so the byte at the port
+        is latched while the other cell is read."""
+        translation = translate_text(pipeline_text(["sums"]))
+        self.assertRegex(translation.verilog, r"sums_t0 <= a_dout\[")
+        self.assertIn("latch", translation.verilog)
 
     LOOK = """data Bytes = Last | Chunk(used: Int8, b0: Int8, b1: Int8, b2: Int8, b3: Int8, b4: Int8,
                           b5: Int8, b6: Int8, next: Bytes);
@@ -279,9 +275,12 @@ handler h(t: Array[8] Int8, p: P, free: Free) : (Array[8] Int8, P, Free) =
   match p with P(d, port, body) => let (t2, a) = walk(t, body, Last) in (t2, P@d(port, a), free) end;
 """
 
-    def test_k_counts_what_a_walk_calls(self):
-        """`look` is not recursive, and it runs once a cell. An array read is two states."""
-        self.assertEqual(translate_text(self.LOOK).timing.k, 2)
+    def test_what_a_walk_calls_is_in_its_clocks(self):
+        """`look` is not recursive, and it runs once a cell: its call, the read of the array and the return are
+        clocks of every iteration."""
+        timing = translate_text(self.LOOK).timing
+        self.assertEqual([(name, str(iteration)) for name, iteration, _leaving in timing.iterations], [("walk", "5")])
+        self.assertEqual(timing.clocks.c, 5)
 
     TAGGED = """
 type t16 tagged Two
@@ -319,7 +318,7 @@ L5: open r0, c17
 L3: ret r0, r1
 end""").splitlines()).verilog
             with self.subTest(name):
-                self.assertEqual(text.count("read the cell in r0 (a state RT does not charge for)"), 2)
+                self.assertEqual(len(re.findall(r"^\s*//[^\n]*read the cell in r0", text, re.M)), 2)
 
     def test_a_field_put_back_where_it_came_from_has_no_write_enable(self):
         """RESTORE, which is the other half of RTL-3."""
@@ -345,9 +344,244 @@ handler f0 h(r0 : t40, r1 : t30) : t50
     ret r0, r1
 end
 """.splitlines()).verilog
-        arm = re.search(r"build r0, c41, none, #1, r2!\n(.*?)\n\s*end", text, re.S).group(1)
+        arm = re.search(r"build r0, c41, none, #1, r2![^\n]*\n(.*?)\n\s*end", text, re.S).group(1)
         self.assertIn("b_we = 16'h0001;", arm)
         self.assertEqual(arm.count("b_din"), 1)
+
+
+class TheHeader(unittest.TestCase):
+    """A turn's machine keeps the record the turn gives its handler in registers, at cells the machine names. That is
+    sound only if those registers are what the emitter thinks they are, and it refuses what would make them not.
+    Each stream here is one rtcheck accepts."""
+
+    ONE = """type t1 record R
+ctor c1 t1 - R
+field c1 0 1 i8 x
+type t3 tagless Free
+ctor c3 t3 null End
+ctor c4 t3 - More
+field c4 0 8 t3 next
+type t4 tagless Pool
+ctor c6 t4 null Dry
+ctor c7 t4 - Cell
+field c7 0 8 t4 next
+tuple t10 t1 t3
+tuple t12 t1 t4 t3
+handler f0 h(r0 : t1, r1 : t3) : t10
+    open r0, c1
+    read r2, r0[0:1]
+    op r3, add/8, r2, #1
+    build r0, c1, none, r3
+    ret r0, r1
+end
+"""
+    TWO = """type t1 record R
+ctor c1 t1 - R
+field c1 0 1 i8 x
+field c1 8 8 t2 $next
+type t2 record $1.1
+ctor c2 t2 - $1.1
+field c2 0 1 i8 y
+type t3 tagless Free
+ctor c3 t3 null End
+ctor c4 t3 - More
+field c4 0 8 t3 next
+type t4 tagless Pool
+ctor c6 t4 null Dry
+ctor c7 t4 - Cell
+field c7 0 8 t4 next
+tuple t10 t1 t3
+tuple t12 t1 t4 t3
+handler f0 h(r0 : t1, r1 : t3) : t10
+    ret r0, r1
+end
+"""
+
+    def emit(self, declared: str, turn: str):
+        lines = (declared + "turn f1 t(r0 : t1, r1 : t4, r2 : i8) : t12\n" + turn + "end\n").splitlines()
+        checker = Checker()
+        for line in lines:
+            checker.feed(line)
+        checker.finish()  # every one of these is a stream rtcheck accepts
+        emitter = Emitter(4, header=1)
+        for line in lines:
+            emitter.feed(line)
+        return checker, emitter
+
+    def test_what_the_handler_reads_and_writes_of_it_is_a_register(self):
+        checker, emitter = self.emit(self.ONE, """    call (r3, r4), f0, r0, #0
+    ret r3, r1, r4
+""")
+        turn = next(f for f in emitter.functions.values() if f.turn)
+        bound = certify_turn(checker, "t", {0: 1})
+        translation = emitter.render(turn, "core", bound, 8, {}, sizes={0: 1})
+        self.assertIn("header_1 <= (header_1 & 128'hffffffffffffffffffffffffffffff00) | ", translation.verilog)
+        handler = next(f for f in emitter.functions.values() if f.handler)
+        self.assertEqual([s.name for s in handler.states if s.ports or s.reads or s.writes], [])
+
+    def test_a_link_of_it_stored_is_refused(self):
+        """Its links are what make a link taken from one of its cells the next of them."""
+        with self.assertRaisesRegex(RTError, "stores a link of the header's cell 0"):
+            self.emit(self.TWO, """    open r0, c1
+    take r3, r0[8:8]
+    br.null r1, L1, L2
+L1: build r0, c1, none, =, r3!
+    call (r4, r5), f0, r0, #0
+    ret r4, #0, r5
+L2: take r6, r1[0:8]
+    build r1, c2, none, #9
+    build r0, c1, none, =, r1
+    open r3, c2
+    build r3, c7, none, r6
+    call (r4, r5), f0, r0, #0
+    ret r4, r3, r5
+""")
+
+    def test_a_field_taken_that_is_no_link_is_not_one_of_its_cells(self):
+        """A record whose chain shares its first cell with the link: the chain, taken, is a pointer like any other,
+        and a test of it for null is what it looks like."""
+        chain = """type t1 record R
+ctor c1 t1 - R
+field c1 0 8 t5 body
+field c1 8 8 t2 $next
+type t2 record $1.1
+ctor c2 t2 - $1.1
+field c2 0 1 i8 y
+type t5 tagless Bytes
+ctor c8 t5 null Last
+ctor c9 t5 - Chunk
+field c9 0 1 i8 used
+field c9 8 8 t5 next
+type t3 tagless Free
+ctor c3 t3 null End
+ctor c4 t3 - More
+field c4 0 8 t3 next
+type t4 tagless Pool
+ctor c6 t4 null Dry
+ctor c7 t4 - Cell
+field c7 0 8 t4 next
+tuple t10 t1 t3
+tuple t12 t1 t4 t3
+handler f0 h(r0 : t1, r1 : t3) : t10
+    open r0, c1
+    take r2, r0[0:8]
+    br.null r2, L1, L2
+L1: build r0, c1, none, #0, =
+    ret r0, r1
+L2: build r2, c9, none, =, =
+    build r0, c1, none, r2!, =
+    ret r0, r1
+end
+"""
+        _checker, emitter = self.emit(chain, """    call (r3, r4), f0, r0, #0
+    ret r3, r1, r4
+""")
+        handler = next(f for f in emitter.functions.values() if f.handler)
+        self.assertTrue(any(state.reads for state in handler.states), "the chain's cell is read from the block RAM")
+
+    def test_the_handler_is_given_it(self):
+        with self.assertRaisesRegex(RTError, "gives its handler something other than the header"):
+            self.emit(self.ONE, """    br.null r1, L1, L2
+L1: call (r3, r4), f0, r0, #0
+    ret r3, #0, r4
+L2: take r5, r1[0:8]
+    build r1, c1, none, #7
+    call (r3, r4), f0, r1, #0
+    open r0, c1
+    build r0, c7, none, r5
+    ret r3, r0, r4
+""")
+
+    def test_the_turn_gives_it_back(self):
+        """So it is at the same cells on the next turn."""
+        with self.assertRaisesRegex(RTError, "returns something other than the header"):
+            self.emit(self.ONE, """    call (r3, r4), f0, r0, #0
+    br.null r1, L1, L2
+L1: ret r3, #0, r4
+L2: take r5, r1[0:8]
+    build r1, c1, none, #7
+    open r3, c1
+    build r3, c7, none, r5
+    ret r1, r3, r4
+""")
+
+    def test_a_join_knows_only_what_every_edge_knew(self):
+        """One edge has the header in r6 and a copy of it in r7, the other the other way round: after the join,
+        neither is known to be it, so it cannot be given back."""
+        with self.assertRaisesRegex(RTError, "returns something other than the header"):
+            self.emit(self.ONE, """    call (r3, r4), f0, r0, #0
+    br.null r1, L1, L2
+L1: ret r3, #0, r4
+L2: take r5, r1[0:8]
+    build r1, c1, none, #7
+    br e, r2, #0, L3, L4
+L3: move r6, r3
+    move r7, r1
+    jump L5
+L4: move r6, r1
+    move r7, r3
+    jump L5
+L5: open r7, c1
+    build r7, c7, none, r5
+    ret r6, r7, r4
+""")
+
+
+@SIMULATOR
+class OneClock(unittest.TestCase):
+    """Straight-line code joined into one clock has to mean what the instructions meant one after another. These
+    are streams Lower does not write, since it neither reuses a register nor falls into a label, and RT allows both."""
+
+    STREAM = """type t16 abstract Bytes
+type t17 record Hdr
+ctor c18 t17 - Hdr
+field c18 0 1 i8 port
+field c18 2 2 i16 sum
+field c18 8 8 t16 body
+type t30 tagless Free
+ctor c31 t30 null End
+ctor c32 t30 - More
+field c32 0 8 t30 next
+tuple t50 t17 t30
+handler f0 h(r0 : t17, r1 : t30) : t50
+{body}end
+"""
+
+    def sums(self, body: str, ports: tuple) -> list:
+        """The sum each datagram comes back with, by its port."""
+        translation = translate(self.STREAM.format(body=body).splitlines())
+        datagrams = [struct.pack("<BH", port, 0xABCD) + b"tail" for port in ports]
+        results, _summary = simulate(translation, [(datagram, 0) for datagram in datagrams], 2)
+        return [int.from_bytes(bytes.fromhex(result["out"])[:2], "little") for result in results]
+
+    def test_a_register_written_again_is_read_as_its_new_value(self):
+        """r5 is written, read, dropped and written again, all in one clock, and what reads it after that reads
+        the second value."""
+        body = """    open r0, c18
+    read r2, r0[0:1]
+    pack r3, <8>, r2
+    trunc r4, 16, r3
+    op r5, add/16, r4, #1
+    op r6, add/16, r5, #1
+    drop r5
+    op r5, add/16, r6, #1
+    op r7, add/16, r5, #1
+    build r0, c18, none, =, r7, =
+    ret r0, r1
+"""
+        self.assertEqual(self.sums(body, (0, 1, 7, 250)), [4, 5, 11, 254])
+
+    def test_a_label_another_edge_reaches_is_a_clock_of_its_own(self):
+        """L1 falls into L2, and the branch reaches L2 too: L2 cannot be part of L1's clock."""
+        body = """    open r0, c18
+    read r2, r0[0:1]
+    br e, r2, #0, L1, L2
+L1: op r3, add/8, r2, #1
+    drop r3
+L2: build r0, c18, none, =, #5, =
+    ret r0, r1
+"""
+        self.assertEqual(self.sums(body, (0, 1, 9)), [5, 5, 5])
 
 
 @SIMULATOR
@@ -383,16 +617,16 @@ class TheChecksum(unittest.TestCase):
             n = cells_in(len(body))
             self.assertEqual(result["n"], n)
             self.assertLessEqual(steps, self.bound.c * n + self.bound.d)
-            self.assertLessEqual(result["cycles"], timing.bound(n, self.bound), f"{len(body)} bytes: a bug, not latency")
+            self.assertLessEqual(result["cycles"], timing.bound(n), f"{len(body)} bytes: a bug, not latency")
 
-    def test_cycles_are_steps_plus_the_one_read_the_emitter_counted(self):
+    def test_the_clocks_are_the_bound(self):
         """No input is special: this handler has one path for each n, so this is an equality, and a
         difference at any length is something the emitter does not know about its own machine."""
-        for body, result, (_answer, steps) in zip(self.payloads, self.results, self.native):
-            self.assertEqual(result["cycles"], self.translation.timing.k * steps + self.translation.timing.c, len(body))
+        for body, result in zip(self.payloads, self.results):
+            self.assertEqual(result["cycles"], self.translation.timing.bound(cells_in(len(body))), len(body))
 
     def test_each_cell_costs_what_the_emitter_said(self):
-        per_cell = self.translation.timing.per_cell(self.bound)
+        per_cell = self.translation.timing.clocks.c
         by_n = {result["n"]: result["cycles"] for result in self.results}
         low = min(by_n)
         for n, cycles in by_n.items():
@@ -418,14 +652,14 @@ class TheChecksum(unittest.TestCase):
 
 
 def cycle_table(bound, translation, payloads, results, native) -> str:
-    rows = ["payload    n   W(n)  steps  cycles  cycles/steps  bound k*W(n)+c"]
+    rows = ["payload    n   W(n)  steps  clocks  clocks/steps  certified clocks(n)"]
     seen = set()
     for body, result, (_answer, steps) in zip(payloads, results, native):
         if len(body) in NAMED and len(body) not in seen:
             seen.add(len(body))
             n = result["n"]
             rows.append(f"{len(body):>7} {n:>4} {bound.c * n + bound.d:>6} {steps:>6} {result['cycles']:>7} "
-                        f"{result['cycles'] / steps:>13.4f} {translation.timing.bound(n, bound):>15}")
+                        f"{result['cycles'] / steps:>13.4f} {translation.timing.bound(n):>19}")
     return "\n".join(rows)
 
 
@@ -461,8 +695,9 @@ class RandomWalks(unittest.TestCase):
             self.assertEqual(result["out"], answer.hex(), f"{said}, {body.hex()}")
             self.assertEqual(answer, wire_of(cells), said)
             self.assertEqual(result["back"], n + reserve, said)
-            self.assertLessEqual(result["cycles"], translation.timing.bound(n, bound), f"{said}: a bug, not latency")
-            self.assertGreaterEqual(result["cycles"], steps, f"{said}: a state RT charges for did not run")
+            self.assertLessEqual(result["cycles"], translation.timing.bound(n), f"{said}: a bug, not latency")
+            self.assertGreaterEqual(result["cycles"], result["reads"] + result["writes"],
+                                    f"{said}: two accesses to the cell store in one clock")
 
     def test_every_walk_by_itself(self):
         """So that each is run whatever the seeds choose: each has a path no other walk has."""
@@ -726,10 +961,7 @@ class OtherHandlers(unittest.TestCase):
                     now = router.settle(number)
                     if port is None:
                         self.assertEqual(now["dropped"] - before["dropped"], 1, context)
-                    steps = now["steps"] - before["steps"]
-                    self.assertLessEqual(result["cycles"], translation.timing.bound(n, translation.bound),
-                                         f"{context}: a bug, not latency")
-                    self.assertGreaterEqual(result["cycles"], steps, context)
+                    self.assertLessEqual(result["cycles"], translation.timing.bound(n), f"{context}: a bug, not latency")
                     before = now
             finally:
                 router.close()
@@ -751,9 +983,8 @@ class OtherHandlers(unittest.TestCase):
                 handle.write(routes)
             translation = self.compare(os.path.join(ROOT, "examples", "forward.lfpl"), {"routes": routes},
                                        ("--state", f"routes={table}"), datagrams, "forward")
-        kinds = {kind: high for kind, _steps, _low, high, _count in translation.timing.kinds}
-        self.assertEqual(kinds["aget"], 2, "an array is its own block RAM: a read, then a latch")
-        self.assertEqual((translation.timing.k, translation.timing.c), (1, 2))
+        clocks = translation.timing.clocks
+        self.assertEqual((clocks.c, clocks.d), (0, 4), "the item's cell read, the route's read, and what uses them")
 
     def test_pack_puts_its_first_operand_highest(self):
         with tempfile.TemporaryDirectory() as workdir:
@@ -772,7 +1003,8 @@ handler h(m: Hd, free: Free) : (Out, Free) = match m with Hd(d, a, b) => (Out@d(
             self.compare(path, {}, (), [datagram, bytes(3), b"\xff\xff\xff"], "pack")
 
     def test_a_walk_that_calls_an_array_read(self):
-        """So k is 2, and the bound holds by a wide margin. `look`'s table says each byte's new value."""
+        """The read of the array is a clock of its own, and the call of `look` and its return two more. `look`'s
+        table says each byte's new value."""
         table = bytes((i * 11 + 3) & 255 for i in range(8))
         with tempfile.TemporaryDirectory() as workdir:
             path, state = os.path.join(workdir, "look.lfpl"), os.path.join(workdir, "t.bin")
@@ -909,7 +1141,7 @@ class Synthesis(unittest.TestCase):
     def test_a_field_that_stays_has_no_write_enable(self):
         """RTL-3, and the first specification's Theorem 6.1. Eight fields say `=`, and one is stored."""
         text = translate_file(SOURCE).verilog
-        arm = re.search(r"build r2, c6, none, =, =, =, =, =, =, =, =, r3\n(.*?)\n\s*end", text, re.S).group(1)
+        arm = re.search(r"build r2, c6, none, =, =, =, =, =, =, =, =, r3[^\n]*\n(.*?)\n\s*end", text, re.S).group(1)
         self.assertIn("b_we = 16'hff00;", arm)
         self.assertEqual(arm.count("b_din"), 1)
 

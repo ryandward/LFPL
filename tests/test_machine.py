@@ -8,8 +8,10 @@ What would hang is stopped by the design itself, not by a test's timeout, and Wh
 generated Verilog on purpose to show it: a turn past its bound, a queue whose head no turn's outcome accounts for,
 and a chain longer than any frame can have.
 """
+import collections
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -20,10 +22,11 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.certify import certify_turn  # noqa: E402
+from src.certify import certify, certify_turn  # noqa: E402
 from src.machine import HALTS, Machine, build  # noqa: E402
 from src.rtcheck import Checker, RTError, Unbounded  # noqa: E402
 from src.rtlower import rt_lines  # noqa: E402
+from src.rtverilog import Emitter  # noqa: E402
 from src.turn import OUTCOMES, TurnRefused, turn_source  # noqa: E402
 from tests.reference import ipv4_model as model  # noqa: E402
 from tests.test_forward import ROOT, Forwarder  # noqa: E402
@@ -53,6 +56,7 @@ def sent(frame: bytes) -> bytes:
 class Run:
     outputs: list   # (port, bytes), in the order they left
     turns: list     # (outcome, cycles), in the order they ran
+    clocks: list    # the clock each turn was seen to end in, in the same order
     final: tuple    # the pool, the ingress slot, the queue's head and the rest of the queue, when it was done
     counted: dict   # turns stopped at their bound, turns whose queue broke the count, frames egress cut short
     words: dict     # every cell's contents, when it was done
@@ -70,13 +74,14 @@ def simulate(m: Machine, frames: list, *, top: Optional[str] = None, core: Optio
         with open(os.path.join(work, "frames.txt"), "w") as handle:
             for hold, frame in frames:
                 handle.write(f"{int(hold)} {len(frame)} " + " ".join(f"{byte:02x}" for byte in frame) + "\n")
-        compiled = subprocess.run(["iverilog", "-g2005", f"-DCELLS={m.cells}", "-o", os.path.join(work, "sim"),
+        compiled = subprocess.run(["iverilog", "-g2005", f"-DCELLS={m.cells}", f"-DPARTS={m.shape.parts}",
+                                   "-o", os.path.join(work, "sim"),
                                    os.path.join(ROOT, "tests", "tb_machine.v"), os.path.join(work, "machine.v"),
                                    os.path.join(work, "serve_core.v")], capture_output=True, text=True)
         assert compiled.returncode == 0, compiled.stderr
         done = subprocess.run(["vvp", os.path.join(work, "sim"), "+frames=frames.txt"], cwd=work, check=True,
                               capture_output=True, text=True, timeout=3000)
-    run = Run([], [], (), {}, {})
+    run = Run([], [], [], (), {}, {})
     for line in done.stdout.splitlines():
         parts = line.split()
         if parts[0] == "OUT":
@@ -84,6 +89,7 @@ def simulate(m: Machine, frames: list, *, top: Optional[str] = None, core: Optio
         elif parts[0] == "TURN":
             code = int(parts[1])
             run.turns.append((HALTS[code] if code in HALTS else OUTCOMES[code], int(parts[2])))
+            run.clocks.append(int(parts[3]))
         elif parts[0] == "FINAL":
             numbers = tuple(int(part) for part in parts[1:])
             run.final, run.counted = numbers[:4], dict(zip(("overruns", "faults", "cuts"), numbers[4:]))
@@ -177,6 +183,61 @@ def x86(frames: list) -> list:
     return results
 
 
+def egress(m: Machine, sent: bytes) -> int:
+    """T10's E(f), in the specification's section 10: the clocks egress takes to send a frame of B bytes and C chunks, from the clock it leaves
+    IDLE for it to the clock it asks for its release. A byte a clock, five clocks a chunk for two reads, a word and
+    its last test, and what reading the record's own cells takes."""
+    walk = m.shape.item_walk
+    chunks = -(-(len(sent) - m.shape.wire) // 7)
+    return len(sent) + 5 * chunks + 2 * (len(walk.links) + 1) + 3 * len({cell for cell, _o, _s in walk.scalars}) + 4
+
+
+def ingress(m: Machine, frame: bytes) -> int:
+    """T10's I(f), in the specification's section 10: the clocks the writer takes for a frame whose bytes come a clock each, from the clock it
+    leaves IDLE for it to the clock it starts the frame's turn. Its own links once, a clock a byte, and two clocks
+    to move to the next chunk after each one it fills, but for one the frame ends in."""
+    walk = m.shape.item_walk
+    body = max(len(frame) - m.shape.wire, 0)
+    moves = body // 7 - (1 if body and body % 7 == 0 else 0)
+    return len(frame) + 2 * moves + 2 * (len(walk.links) + 1) + 3
+
+
+def receiving(m: Machine, run: Run, frames: list) -> list:
+    """Every frame the writer took straight after a turn that queued nothing, so that nothing else ran between:
+    the clocks from that turn's end to its own, less its turn and the three clocks of the controller around it,
+    against `ingress`. What differs, as (frame, measured, said)."""
+    wrong = []
+    admitted = iter(frames)
+    for index in range(len(run.turns)):
+        outcome, cycles = run.turns[index]
+        if outcome == "idle":
+            continue
+        frame = next(admitted)
+        before = run.turns[index - 1][0] if index else None
+        if before is not None and before != "queued" and len(frame) <= m.shape.capacity:
+            measured = run.clocks[index] - run.clocks[index - 1] - cycles - 3
+            if measured != ingress(m, frame):
+                wrong.append((frame.hex()[:16], measured, ingress(m, frame)))
+    return wrong
+
+
+def sending(m: Machine, run: Run, frames: list) -> list:
+    """Every frame that was queued and sent at once, as egress was ready and nothing else was waiting: the clocks
+    from its admission's end to its release's end, less the release and four clocks of the controller, which is
+    egress's alone, against `egress`. The four are the clock in IDLE that chooses egress, and around the release
+    the clock in TURN, the one serve_core samples start in and the one done is seen in. What differs, as
+    (frame, measured, said)."""
+    wrong, sent = [], iter(run.outputs)
+    for index in range(len(run.turns) - 1):
+        (outcome, _cycles), (following, release) = run.turns[index], run.turns[index + 1]
+        if outcome == "queued" and following == "idle":
+            _port, out = next(sent)
+            measured = run.clocks[index + 1] - run.clocks[index] - release - 4
+            if measured != egress(m, out):
+                wrong.append((out.hex()[:16], measured, egress(m, out)))
+    return wrong
+
+
 # What the machine calls each of x86's counters.
 CALLED = {"forwarded": "queued", "dropped": "dropped", "malformed": "runt", "too_large": "too_large"}
 
@@ -194,8 +255,8 @@ class TheBound(unittest.TestCase):
     def test_it_is_stated_for_a_whole_turn(self):
         m = machine()
         self.assertRegex(m.report(), r"W = \d+ steps for any frame of up to 217 cells in and 217 out, with 4 places "
-                                     r"in the queue; cycles <= \d+\*W \+ \d+ = \d+ a turn")
-        self.assertEqual(m.turn_cycles, m.timing.k * m.bound.d + m.timing.c)
+                                     r"in the queue; clocks <= \d+ a turn, certified")
+        self.assertEqual(m.turn_cycles, m.timing.clocks.d)
         self.assertIn(f"A turn takes at most {m.turn_cycles} clock cycles", m.top)
         self.assertIn(f"TURN_LIMIT = 32'd{m.turn_cycles};", m.top)
 
@@ -257,6 +318,38 @@ handler h(l: L, free: Free) : (L, Free) = (l, free);
             checker.finish()
             bounds.append(certify_turn(checker, "t", {0: 10}))
         self.assertEqual(bounds[0], bounds[1])
+
+    HANDLER = ("ipv4", "fold", "halves", "well_formed", "patched", "next_hop")  # and what it calls
+
+    def test_the_decision_touches_no_block_ram(self):
+        """Ingress's record is registers, and the handler reads and writes nothing else: none of its states, nor
+        any of what it calls, drives a port of the cell store."""
+        core = machine().core
+        ports = core[core.index("What each state drives on the memory ports"):core.index("// The machine.")]
+        driving = {name.rsplit("_s", 1)[0] for name in re.findall(r"^\s+(\w+_s\d+): begin", ports, re.M)}
+        self.assertTrue(driving)
+        self.assertEqual(driving & set(self.HANDLER), set())
+        self.assertIn("serve", driving)
+
+    def test_the_readme_says_what_the_decision_costs(self):
+        """Its steps, as x86 counts them, and its clocks in the machine, certified with the clocks charged there."""
+        m = machine()
+        lines = list(rt_lines(io.BytesIO(m.turn_text.encode())))
+        emitter = Emitter(m.pointer_bits, header=m.start[1])
+        for line in lines:
+            emitter.feed(line)
+        turn = next(f for f in emitter.functions.values() if f.turn)
+        emitter.render(turn, "serve_core", m.bound, m.cells, {}, sizes={1: N_MAX, 2: 1 + N_MAX})
+        costs = collections.Counter(state.line for fn in emitter._reachable(turn) for state in fn.states)
+        steps, clocks = Checker(), Checker(costs)
+        for checker in (steps, clocks):
+            for line in lines:
+                checker.feed(line)
+            checker.finish()
+        said = (f"its {certify(steps, 'ipv4', N_MAX).d} steps are at most {certify(clocks, 'ipv4', N_MAX).d} "
+                f"clocks")
+        with open(os.path.join(ROOT, "README.md")) as handle:
+            self.assertIn(said, " ".join(handle.read().split()))
 
     def test_a_longer_queue_costs_more_and_is_still_bounded(self):
         self.assertGreater(machine(k_out=8).bound.d, machine().bound.d)
@@ -332,6 +425,8 @@ class TheCorpus(unittest.TestCase):
             self.assertLessEqual(cycles, m.turn_cycles, outcome)
         held = holdings(m, run)
         self.assertEqual(sorted(held), list(range(1, m.cells + 1)))
+        self.assertEqual(sending(m, run, frames), [], "egress takes what T10's E(f) says, to the clock")
+        self.assertEqual(receiving(m, run, frames), [], "and the writer what its I(f) says")
         admitted = max(cycles for outcome, cycles in run.turns if outcome != "idle")
         released = max(cycles for outcome, cycles in run.turns if outcome == "idle")
         with open(os.path.join(ROOT, "README.md")) as handle:
@@ -431,15 +526,31 @@ class WhatTheHardwareStops(unittest.TestCase):
     def test_the_mutant_that_hung_is_stopped(self):
         """tools/mutate_bounds.py's "every argument of a turn is its first" gives the turn the pool for each argument.
         Each of its turns finished within the bound, and egress sent the same head forever. Wired that way by hand,
-        no frame goes out, every turn is stopped by the queue's count, and every cell is in one place."""
+        egress sends no more than the turns said they queued, the release that releases nothing is a fault, and
+        every cell is in one place."""
         m = machine()
         top = m.top.replace(".arg1(slot), .arg2(head), .arg3(queue)", ".arg1(pool), .arg2(pool), .arg3(pool)")
         top = top.replace(".arg4(length), .arg5(sent)", ".arg4(pool), .arg5(pool[0])")
         self.assertEqual(top.count("(pool"), 6)
         run = simulate(m, [(True, frame) for frame in FORWARDED[:5]], top=top)
+        what = [outcome for outcome, _cycles in run.turns]
+        self.assertLessEqual(len(run.outputs), what.count("queued"))
+        self.assertEqual(what[-1], "faulted")
+        self.assertEqual(run.counted, {**NOTHING_COUNTED, "faults": 1})
+        self.assertEqual(sorted(holdings(m, run)), list(range(1, m.cells + 1)))
+
+    def test_more_queued_than_the_queue_holds_is_a_fault(self):
+        """A turn whose outcome always says Queued: four frames fill the queue, and the fifth, which the turn
+        refused as Full, would be a fifth output in four places. The machine takes none of that turn's results,
+        and starts again."""
+        m = machine()
+        top = m.top.replace("    wire [63:0] r_outcome;", "    wire [63:0] r_said;\n    wire [63:0] r_outcome = 64'd1;")
+        top = top.replace(".res4(r_outcome)", ".res4(r_said)")
+        self.assertNotIn(".res4(r_outcome)", top)
+        run = simulate(m, [(True, frame) for frame in FORWARDED[:5]], top=top)
+        self.assertEqual([outcome for outcome, _cycles in run.turns], ["queued"] * 4 + ["faulted"])
         self.assertEqual(run.outputs, [])
-        self.assertEqual([outcome for outcome, _cycles in run.turns], ["faulted"] * 5)
-        self.assertEqual(run.counted, {**NOTHING_COUNTED, "faults": 5})
+        self.assertEqual(run.counted, {**NOTHING_COUNTED, "faults": 1})
         self.assertEqual(sorted(holdings(m, run)), list(range(1, m.cells + 1)))
 
     def test_egress_cuts_a_chain_longer_than_it_may_read(self):

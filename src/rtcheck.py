@@ -229,9 +229,14 @@ _LABEL = re.compile(r"(L\d+):\s*(.*)$")
 
 
 class Checker:
-    """Feed it lines. It raises RTError at the first one that breaks a rule."""
+    """Feed it lines. It raises RTError at the first one that breaks a rule.
 
-    def __init__(self) -> None:
+    `costs` is for a backend that counts something other than steps: what each instruction costs, by its line in
+    the stream, counted from 1. src/rtverilog.py gives the clocks it spends, so the same potential method that
+    bounds steps bounds clocks. Without it, every working instruction is one step and the rest are none."""
+
+    def __init__(self, costs: Optional[Mapping[int, int]] = None) -> None:
+        self.costs = costs
         self.types: dict[str, TypeDecl] = {}
         self.aliases: dict[str, str] = {}
         self.composite: dict[str, Type] = {}
@@ -707,7 +712,9 @@ class Checker:
             return
         if self.S is None:
             raise self.fail(f"{head} cannot be reached: control left before it")
-        if head not in NO_WORK:
+        if self.costs is not None:
+            self.S.budget = self.S.budget.spend(steps=self.costs.get(self.line_number, 0))
+        elif head not in NO_WORK:
             self.S.budget = self.S.budget.spend(steps=1)
         handler = getattr(self, "i_" + head.replace(".", "_"), None)
         if handler is None:

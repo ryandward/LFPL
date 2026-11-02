@@ -376,25 +376,27 @@ type's width, named for its function, so nothing spills. There is no stack: rtch
 recursion, so no function is ever active twice and its registers can be static. A cell is one 128-bit
 word of a dual-port block RAM addressed by a log2(C)-bit pointer, whose word 0 is null and never a
 cell. Port A reads, and its output holds until the next read. Port B writes, with a byte enable per
-byte. No state uses both.
+byte. No clock uses both.
+
+The emitter first writes a state for each instruction:
 
     drop, open         no state. `open` needs no read until a field of the cell is named
-    move               no state: the move happens in the next clock, as one more <=
+    move               no state: the move happens with the next state, as one more <=
     const, copy, op,   one state, one <=. Verilog's << and >> are already 0 past the width, and a
       cmp, trunc,      literal is written at the width it meets. bswap is nothing but wires: a
       pack, idx,       concatenation of the same bytes the other way round, and so is enum: the tag,
       bswap, enum,     each field at its bytes, and zeros between. etag and efield are slices
       etag, efield
-    read, take         one state: a slice of port A's output, latched
+    read, take         one state: a slice of port A's output
     build              one state: one write, whose byte enables cover exactly the sources that are
                        not `=`, `r!` or `*`, and the tag on `write`. RTL-3 is then a property of this
                        rule. If nothing changes, memory is not touched
     br, jump           one state, with no boolean register
     br.null            one state. The test and the read are the same clock, with the pointer as the
-                       address, so the word is at port A in the next state and a walk spends no extra
-                       clock per cell. Nothing is read if the pointer is null
+                       address, so the word is at port A in the next clock. Nothing is read if the
+                       pointer is null
     br.tag             one state, and a read in front of it if the word is not already at the port
-    aget               two states: an array is its own block RAM, so a read, and a latch
+    aget               two states: an array is its own block RAM, so a read, and then its word
     call               one state: <= on the callee's parameters, and on its return state if it has
                        more than one. The results come back by the callee's `ret`
     tail               one state: <= on every parameter, and the entry state. `tail f0, r23, r24,
@@ -410,24 +412,39 @@ read port. The emitter tracks which cell's word is at the port along each path: 
 it, a `build` of that cell ends it, a call to something that reads ends it, and a join keeps it only
 if every edge agrees.
 
-### The bound in cycles
+Then straight-line code becomes one clock. Each state that falls through and reads no memory is joined
+with the state after it, unless something else can enter that one: a label, a return site or a function's
+entry. A clock touches the block RAM once at most. So a clock ends at a read, whose word comes back only in
+the next clock, at a branch or jump, at a call or return, and before a label; a write ends one only if a read
+or another write follows. What a joined state computes for a later instruction in the same clock is a wire,
+and a register gets the last value written to it. Nothing is reordered and nothing is inlined, so a call of
+even a one-instruction function costs two clocks, its call and its return.
 
-Those extra states are the only ones RT does not charge for, so the emitter can derive a bound
-from what it emitted, and it prints it at compile time, before anything runs. Count from the edge that
-samples `start` to the edge that raises `done`. Each state holds the machine for one clock, so that
-count is the number of states executed. Write cost(I) for one plus the hardware-only states in front
-of an instruction I, and split the code in two:
+A turn's machine has one more thing. `src/machine.py` says where the record the turn gives its handler lives,
+and those cells are registers, a 128-bit word each, behind the same two ports as the block RAM, which decode
+their addresses. The emitter knows which registers hold one of those cells: the turn's parameter of the
+handler's item type holds the first, the handler's item parameter holds it while the handler runs, and a link
+taken from one holds the next. A field of a cell it knows is a slice of the register, and a build of one is that
+register, in the clock of the code around it, with no read and no write of the block RAM. So `examples/ipv4.lfpl`'s
+handler, whose decision reads and writes only its record, touches no block RAM at all. It refuses a program that
+would store a link of one of those cells, so the links never change, and one whose handler or turn returns
+anything else in that record's place, so the record is at the same address on the next turn. A pointer to
+one that reaches anything else is read and written through the ports, whose decode finds the register: slower,
+and not wrong.
 
-- **In a walk:** a recursive function and everything it calls, which run a number of times that depends
-  on the item. k is the largest cost(I) among them.
-- **The rest:** runs at most once per call on a call graph with no cycle. c is the largest number of
-  hardware-only states on any path through it, found by walking the states.
+### The bound in clocks
 
-So cycles <= k * steps + c, and rtcheck has certified steps <= W(n). The checksum's numbers are k = 1
-and c = 1: its walks are one state per instruction, and the one state RT does not charge for is the read
-of the header cell, the first time a field of it is named. Since every path of that handler takes W(n)
-steps, the bound is an equality, and `tests/test_rtverilog.py` requires it to be. A tagged walk has k = 2,
-and one that adds a field of one cell to a field of another has k = 3.
+Each state is a clock, and each is charged to an instruction: the first in it, or, for a state in front of an
+instruction, that one. Every instruction of a state runs whenever the state does, so the charges add up to the
+clocks exactly, but for a state that only makes the moves before a join, which is charged to the instruction
+after the label, which may be reached from elsewhere too. rtcheck then reads the stream again with
+`Checker(costs)`, charging each instruction those clocks in place of its step, and its certificate is a bound
+in clocks by the same potential method, from the edge that samples `start` to the edge that raises `done`.
+
+The checksum's is 4 n + 14. Its walks are two clocks a cell: the test and the read of the next cell in one,
+and the other twenty-three instructions of an iteration, its write and its jump back among them, in the other. Since every path
+of that handler takes the same clocks for each n, the bound is an equality, and `tests/test_rtverilog.py`
+requires it to be.
 
 ### What only made sense for x86
 
@@ -437,8 +454,8 @@ x86's habits shows what in it came from x86:
 
 - **`open` costs nothing, and `br.tag` one step.** On x86 a field is read by naming it, and
   `cmp byte [p], k` reads memory and compares in one instruction. A block RAM returns a word a clock
-  after it is asked, so a tag test here is two clocks, and that is what k > 1 comes from. W(n) charges
-  for x86's way of touching memory. It is a count of steps, and k is what it costs to treat it as cycles.
+  after it is asked, so a tag test here is two clocks, where a null test is one. W(n) charges for x86's
+  way of touching memory, and the clocks of this target are a certificate of their own for that reason.
 - **A computed source `f([l], b)` is limited to add, sub, and, or and xor,** because that is what one
   x86 instruction does in memory (`READ_MODIFY_WRITE` in rtcheck). Here it is a slice of port A through
   whatever logic, and into port B, for any operation.

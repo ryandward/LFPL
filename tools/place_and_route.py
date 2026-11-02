@@ -1,6 +1,10 @@
 """Place and route a handler on an iCE40, and turn its bound in cycles into a bound in seconds.
 
     python3 tools/place_and_route.py [examples/checksum.lfpl] [--cells 432] [--seeds 5]
+    python3 tools/place_and_route.py --machine DIR [--seeds 5]
+
+With --machine, DIR holds what `python3 -m src.machine ... -o DIR` wrote, and that machine is placed instead, its
+ports behind shift registers the same way. It reads cells.mem from DIR, as the machine does.
 
 Needs yosys and nextpnr-ice40, which NEXTPNR_ICE40 can name if it is not on the path. The handler's
 ports are far more than a package has pins, so a wrapper puts them all behind shift registers, and
@@ -52,6 +56,63 @@ endmodule
 `default_nettype wire
 """
 
+MACHINE_WRAPPER = """`default_nettype none
+module wrapper (input wire clk, input wire serial_in, input wire load, output reg serial_out);
+    localparam INPUTS = 12;   // rst, in_valid, in_data, in_last, out_ready
+    localparam OUTPUTS = 156; // in_ready, out_valid, out_data, out_last, out_port, turn_done, and the counts
+    reg [INPUTS - 1:0] shifting, held;
+    reg [OUTPUTS - 1:0] leaving;
+    wire in_ready, out_valid, out_last, turn_done;
+    wire [7:0] out_data, out_port, turn_outcome;
+    wire [31:0] turn_cycles, overruns, faults, cuts;
+    machine dut (.clk(clk), .rst(held[0]), .in_valid(held[1]), .in_data(held[2 +: 8]), .in_last(held[10]),
+        .in_ready(in_ready), .out_valid(out_valid), .out_data(out_data), .out_last(out_last), .out_port(out_port),
+        .out_ready(held[11]), .turn_done(turn_done), .turn_cycles(turn_cycles), .turn_outcome(turn_outcome),
+        .overruns(overruns), .faults(faults), .cuts(cuts));
+    always @(posedge clk) begin
+        shifting <= {shifting[INPUTS - 2:0], serial_in};
+        if (load) held <= shifting;
+        leaving <= load ? {in_ready, out_valid, out_data, out_last, out_port, turn_done, turn_cycles, turn_outcome,
+                           overruns, faults, cuts} : {leaving[OUTPUTS - 2:0], 1'b0};
+        serial_out <= leaving[OUTPUTS - 1];
+    end
+endmodule
+`default_nettype wire
+"""
+
+
+def place(nextpnr: str, workdir: str, sources: list, wrapper: str, args) -> list:
+    """Synthesize in `workdir`, where the sources read their memories from, then route `args.seeds` times."""
+    with open(os.path.join(workdir, "wrapper.v"), "w") as handle:
+        handle.write(wrapper)
+    netlist = os.path.join(workdir, "out.json")
+    files = " ".join(sources + [os.path.join(workdir, "wrapper.v")])
+    done = subprocess.run(["yosys", "-q", "-p", f"read_verilog -sv {files}; synth_ice40 -top wrapper -json {netlist}; "
+                           f"tee -o {workdir}/stat.txt stat"], capture_output=True, text=True, cwd=workdir)
+    if done.returncode:
+        print(done.stdout + done.stderr, file=sys.stderr)
+        return []
+    with open(f"{workdir}/stat.txt") as handle:
+        for line in handle:
+            if re.search(r"SB_RAM40_4K|SB_DFF|SB_LUT4|SB_CARRY", line):
+                print(line.rstrip())
+    speeds = []
+    for seed in range(1, args.seeds + 1):
+        done = subprocess.run([nextpnr, f"--{args.device}", "--package", args.package, "--json", netlist,
+                               "--freq", str(args.target), "--seed", str(seed), "--pcf-allow-unconstrained",
+                               "--timing-allow-fail"],  # what it reaches is the answer, whatever was asked
+                              capture_output=True, text=True)
+        found = re.findall(r"Max frequency for clock\s+'[^']*':\s*([\d.]+) MHz", done.stderr)
+        if done.returncode or not found:
+            print(done.stderr[-2000:], file=sys.stderr)
+            return []
+        speeds.append(float(found[-1]))  # the last report is the routed one
+        used = re.findall(r"ICESTORM_LC:\s*(\d+)/\s*(\d+)", done.stderr)
+        rams = re.findall(r"ICESTORM_RAM:\s*(\d+)/\s*(\d+)", done.stderr)
+        print(f"seed {seed}: fmax {speeds[-1]:.2f} MHz, {used[-1][0]} of {used[-1][1]} logic cells, "
+              f"{rams[-1][0]} of {rams[-1][1]} block RAMs")
+    return speeds
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -62,50 +123,37 @@ def main() -> int:
     parser.add_argument("--package", default="ct256")
     parser.add_argument("--target", type=float, default=60.0,
                         help="the MHz to ask nextpnr for: far past what it can do, and routing takes minutes")
+    parser.add_argument("--machine", metavar="DIR", help="the machine src/machine.py wrote into DIR, not a handler")
     args = parser.parse_args()
     nextpnr = os.environ.get("NEXTPNR_ICE40") or shutil.which("nextpnr-ice40")
     if not nextpnr:
         print("nextpnr-ice40 is not on the path, and NEXTPNR_ICE40 does not name it", file=sys.stderr)
         return 2
+    if args.machine:
+        directory = os.path.abspath(args.machine)
+        speeds = place(nextpnr, directory, [os.path.join(directory, name) for name in ("machine.v", "serve_core.v")],
+                       MACHINE_WRAPPER, args)
+        if not speeds:
+            return 1
+        print(f"the slowest of {args.seeds} seeds: {min(speeds):.2f} MHz")
+        return 0
     with open(args.source, "rb") as handle:
         translation = translate(rt_lines(handle), cells=args.cells)
     print(translation.report())
     with tempfile.TemporaryDirectory() as workdir:
-        design, wrapper, netlist = (os.path.join(workdir, name) for name in ("design.v", "wrapper.v", "out.json"))
+        design = os.path.join(workdir, "design.v")
         with open(design, "w") as handle:
             handle.write(translation.verilog)
-        with open(wrapper, "w") as handle:
-            handle.write(WRAPPER.format(pointer=translation.pointer_bits, enables=CELL_BYTES, bits=CELL_BITS,
-                                        module=translation.module))
-        done = subprocess.run(["yosys", "-q", "-p", f"read_verilog -sv {design} {wrapper}; "
-                               f"synth_ice40 -top wrapper -json {netlist}; tee -o {workdir}/stat.txt stat"],
-                              capture_output=True, text=True)
-        if done.returncode:
-            print(done.stdout + done.stderr, file=sys.stderr)
-            return 1
-        with open(f"{workdir}/stat.txt") as handle:
-            for line in handle:
-                if re.search(r"SB_RAM40_4K|SB_DFF|SB_LUT4|SB_CARRY", line):
-                    print(line.rstrip())
-        speeds = []
-        for seed in range(1, args.seeds + 1):
-            done = subprocess.run([nextpnr, f"--{args.device}", "--package", args.package, "--json", netlist,
-                                   "--freq", str(args.target), "--seed", str(seed), "--pcf-allow-unconstrained"],
-                                  capture_output=True, text=True)
-            found = re.findall(r"Max frequency for clock\s+'[^']*':\s*([\d.]+) MHz", done.stderr)
-            if done.returncode or not found:
-                print(done.stderr[-2000:], file=sys.stderr)
-                return 1
-            speeds.append(float(found[-1]))  # the last report is the routed one
-            used = re.findall(r"ICESTORM_LC:\s*(\d+)/\s*(\d+)", done.stderr)
-            print(f"seed {seed}: fmax {speeds[-1]:.2f} MHz, {used[-1][0]} of {used[-1][1]} logic cells")
+        speeds = place(nextpnr, workdir, [design], WRAPPER.format(pointer=translation.pointer_bits, enables=CELL_BYTES,
+                                                                  bits=CELL_BITS, module=translation.module), args)
+    if not speeds:
+        return 1
     fmax = min(speeds)
-    timing, bound = translation.timing, translation.bound
     print(f"the slowest of {args.seeds} seeds: {fmax:.2f} MHz")
-    print("    n  k*W(n)+c cycles  bound in seconds")
+    print("    n  clocks(n)  bound in seconds")
     for n in (1, 2, 3, 144, 216):
-        cycles = timing.bound(n, bound)
-        print(f"{n:>5} {cycles:>15} {cycles / (fmax * 1e6) * 1e6:>14.2f} us")
+        clocks = translation.timing.bound(n)
+        print(f"{n:>5} {clocks:>10} {clocks / (fmax * 1e6) * 1e6:>14.2f} us")
     return 0
 
 

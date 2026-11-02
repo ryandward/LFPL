@@ -170,10 +170,10 @@ def _fill(handler: str, item: str, fields: list, chain: int, chain_type: str, la
     for index, name in enumerate(taken):
         take.append(f"  match {pools[index]} with Dry => ({nest(taken[:index], 'Dry')}, slot, head0, queue0, Short) "
                     f"| Cell({name}, {pools[index + 1]}) =>")
-    zeros = []
-    for index, (_name, ty) in enumerate(fields):
-        zeros.append("refill(fresh, rest)" if index == chain else "false" if ty == "bool" else "0")
     built = cells[0] if parts == 1 else "(" + ", ".join(cells) + ")"
+    out = [f"y{index}" for index in range(len(fields))]  # the record as the handler gave it back
+    copy = f"{item}@{built}({', '.join(out)})"  # what the queue holds: ingress's record keeps its cells
+    slot = f"{item}@o {{ {fields[chain][0]} = refill(fresh, rest) }}"
     enqueue, head = [], "Pending@h(port, frame)"
     for index, place in enumerate(places):
         kept = [f"{places[j]} = Pending@e{j}(p{j}, f{j})" for j in range(index)]
@@ -186,9 +186,10 @@ def _fill(handler: str, item: str, fields: list, chain: int, chain_type: str, la
     for ctor in verdict.ctors:
         if ctor.fields:
             arms.append(f"      | {ctor.name}(port) => let (head1, queue2, extra) = enqueue(head0, queue1, "
-                        f"Pending@e(port, out)) in (give_out(extra, pool2), slot1, head1, queue2, Queued)")
+                        f"Pending@e(port, {copy})) in (give_out(extra, pool2), {slot}, head1, queue2, Queued)")
         else:
-            arms.append(f"      | {ctor.name} => (give_frame(out, Cell@e(pool2)), slot1, head0, queue1, Dropped)")
+            arms.append(f"      | {ctor.name} => (give_chain(y{chain}, {nest(taken, 'pool2')}), {slot}, head0, queue1, "
+                        f"Dropped)")
     with open(TEMPLATE) as handle:
         template = string.Template(handle.read())
     return template.substitute(
@@ -199,5 +200,5 @@ def _fill(handler: str, item: str, fields: list, chain: int, chain_type: str, la
         enqueue_body="\n".join(enqueue), pattern=f"{item}(d, {', '.join(binders)})", chain_binder=binders[chain],
         chain_field=fields[chain][0], peel_cells=peel, cells_to_pool=nest(cells, "pool") if parts > 1 else "Cell@d(pool)",
         take="\n".join(take), take_end=" end" * len(taken), after_take=pools[-1], taken_back=nest(taken, "pool1"),
-        wire=wire, capacity=capacity, handler=handler, fresh_record=f"{item}@{built}({', '.join(zeros)})",
+        wire=wire, capacity=capacity, handler=handler, out_pattern=f"{item}(o, {', '.join(out)})",
         done_arms="\n".join(arms))

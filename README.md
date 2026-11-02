@@ -244,69 +244,68 @@ nothing until `src/rtcheck.py` has accepted every line.
 
 ```
 $ python3 -m src.rtverilog examples/checksum.lfpl -o checksum.v
+handler checksum: R(n) = 0 cells, W(n) = 28 n + 4 steps, 14256 cells of 128 bits, 14-bit pointers, 18 states
+walk add: 2 clocks per iteration, 2 to leave
+walk reverse: 2 clocks per iteration, 2 to leave
+clocks(n) <= 4 n + 14, certified, from the edge that samples start to the edge that raises done
+```
+
+Every RT register becomes flip-flops, and every cell a word of block RAM. The program becomes its own circuit:
+straight-line code is logic that settles in one clock. The emitter writes a state for each instruction, and then
+joins each state that reads no memory and falls through with the one after it, unless something else can enter
+that one, and a clock touches the block RAM once at most. So a clock ends only at a read, whose word comes back in
+the next clock, at a branch, a call or a return, and before a label. Nothing is reordered. Here is `add`'s loop,
+as the compiler wrote it, with the comment on the second state cut short:
+
+```
+// br.null r2, L2, L3
+add_s0: state <= (add_r2 == 14'd0) ? add_s1 : add_s2;
 ...
-walk add: 24 cycles per iteration, 2 to leave
-walk reverse: 4 cycles per iteration, 2 to leave
-k = 1: the most cycles any one instruction takes in a walk
-c = 1: the most states RT does not charge for, on a path outside the walks
-cycles(n) <= 1*W(n) + 1 = 28 n + 5, from the edge that samples start to the edge that raises done
-```
-
-Every RT register becomes flip-flops, and every cell a word of block RAM. A state is one instruction,
-and here is the end of `add`'s loop, as the compiler wrote it:
-
-```
-// take r25, r2[8:8]
-add_s22: begin
-    add_r25 <= a_dout[77:64];
-    state <= add_s23;
-end
-// build r2, c6, none, =, =, =, =, =, =, =, =, r3
-add_s23: state <= add_s24;
-// tail f0, r23, r24, r25, r2
-add_s24: begin
-    add_r0 <= add_r23;
-    add_r1 <= add_r24;
-    add_r2 <= add_r25;
+// pack r5, <8>, r2[1:1]; pack r6, <8>, r2[3:1]; ... take r25, r2[8:8]; build r2, c6, none, =, =, =, =, =, =, =, =, r3; tail f0, r23, r24, r25, r2
+add_s2: begin
+    add_r0 <= add_w18;
+    add_r1 <= add_w19;
+    add_r2 <= add_w20;
     add_r3 <= add_r2;
     state <= add_s0;
 end
 ```
 
-The `tail` is the part x86 finds hard. Four registers change at once, and `add_r3` gets the value `add_r2`
-held before the clock edge, because that is what `<=` means, so the parallel move that takes
-the x86 backend a scheduler and a scratch register does not exist. The `build` is a state with no
-assignment, because its work is on the block RAM's write port, where `b_we = 16'hff00` enables the
-eight bytes of the link and no others. Eight of its nine fields say `=`, and a field with no enable
-cannot be written. Nothing checks for that: it is what the instruction means. And `add_s0`, the null
-test, is also the read of the next cell, whose word is at the port in the next state, so a walk
-spends no extra clock per cell.
+The twenty-three instructions of an iteration after the null test are one clock: what each computes for the next
+is a wire, `add_w0` to `add_w20`, and only what the next iteration reads is a register. The `tail` is the part x86
+finds hard. Four registers change at once, and `add_r3` gets the value `add_r2` held before the clock edge, because
+that is what `<=` means, so the parallel move that takes the x86 backend a scheduler and a scratch register does not
+exist. The `build` is in the same clock with no assignment at all, because its work is on the block RAM's write port,
+where `b_we = 16'hff00` enables the eight bytes of the link and no others. Eight of its nine fields say `=`, and a field
+with no enable cannot be written. Nothing checks for that: it is what the instruction means. And `add_s0`, the null
+test, is also the read of the next cell, whose word is at the port in the next clock, which is why the walk is two
+clocks a cell and not one.
 
-So the emitter can say what the machine will take before anything runs, as the report above does.
-`tests/test_rtverilog.py` then holds it to that, on the datagrams of the live UDP run, 240 random ones
-and those that take each path all the way along, with each output compared with the x86 binary's
-on the same bytes. These are the five the UDP run showed, with the steps counted by an x86 build:
+The emitter charges each clock to the first instruction in it, and `src/rtcheck.py` reads the stream again with those
+charges in place of steps, so the bound in clocks is a certificate, as W(n) is, and the report says it before
+anything runs. `tests/test_rtverilog.py` then holds the machine to it, on the datagrams of the live UDP run, 240 random
+ones and those that take each path all the way along, with each output compared with the x86 binary's on the same
+bytes. These are the five the UDP run showed, with the steps counted by an x86 build:
 
-| Payload bytes | n | W(n) | x86 steps | Cycles | Cycles / steps |
+| Payload bytes | n | W(n) | x86 steps | Clocks | Clocks / steps |
 | --- | --- | --- | --- | --- | --- |
-| 0 | 1 | 32 | 32 | 33 | 1.0312 |
-| 7 | 2 | 60 | 60 | 61 | 1.0167 |
-| 8 | 3 | 88 | 88 | 89 | 1.0114 |
-| 1000 | 144 | 4036 | 4036 | 4037 | 1.0002 |
-| 1505 | 216 | 6052 | 6052 | 6053 | 1.0002 |
+| 0 | 1 | 32 | 32 | 18 | 0.5625 |
+| 7 | 2 | 60 | 60 | 22 | 0.3667 |
+| 8 | 3 | 88 | 88 | 26 | 0.2955 |
+| 1000 | 144 | 4036 | 4036 | 590 | 0.1462 |
+| 1505 | 216 | 6052 | 6052 | 878 | 0.1451 |
 
-The one extra cycle is the read of the header cell, the first time a field of it is named. x86 reads a
-field by naming it, so RT's `open` charges nothing, and a block RAM has to be asked first. That is
-tested parity on those inputs, and not a proof. The random pipelines of `tests/test_walks.py`, the
-forwarding handler and the generated handlers run on both targets as well, which is what covers
-joins, tagged types, arrays and tail recursion modulo cons. `yosys` maps the cell store to block RAM,
-`verilator -Wall` has nothing to say, and `tools/place_and_route.py` routes the checksum on an iCE40 HX8K,
-with an image of 432 cells, at no worse than 81.82 MHz over five seeds, by `nextpnr`'s timing analysis.
-So the largest item has a bound in time: 6053 cycles, or 73.98 microseconds. There are no caches or
-interrupts in the machine for that to depend on, which is what x86 cannot say.
+Every run takes exactly what the certificate says, since this handler has one path for each n. That is tested parity
+on those inputs, and not a proof. The random pipelines of `tests/test_walks.py`, the forwarding handler and the
+generated handlers run on both targets as well, which is what covers joins, tagged types, arrays and tail recursion
+modulo cons. `yosys` maps the cell store to block RAM, `verilator -Wall` has nothing to say, and
+`tools/place_and_route.py` routes the checksum on an iCE40 HX8K, with an image of 432 cells, at no worse than
+49.89 MHz over five seeds, by `nextpnr`'s timing analysis. One clock does more than it did when it was one instruction,
+so the clock is slower, and the largest item is faster: its bound in time is 878 clocks, or 17.60 microseconds. There
+are no caches or interrupts in the machine for that to depend on, which is what x86 cannot say.
 
-What is not built on this target is everything around the handler. Ingress, egress and admission are
-test code driving the block RAM between items, so a datagram does not reach this machine by itself yet.
+Around a handler by itself, ingress, egress and admission are test code driving the block RAM between items. The
+runtime's turn, below, is what puts a handler in a machine that takes frames in and sends them out.
 
 ## A program whose header is bigger than a cell
 
@@ -375,16 +374,22 @@ count of free cells to trust, because there is none at all.
 
 ```
 $ python3 -m src.machine examples/ipv4.lfpl -o machine --n-max 217
-turn serve for handler ipv4: W = 5958 steps for any frame of up to 217 cells in and 217 out, with 4 places in the queue; cycles <= 2*W + 40 = 11956 a turn; 1309 cells of 128 bits, 11-bit pointers
+turn serve for handler ipv4: W = 5984 steps for any frame of up to 217 cells in and 217 out, with 4 places in the queue; clocks <= 3713 a turn, certified; 1309 cells of 128 bits, 11-bit pointers
 ```
 
 That is said before anything runs, and it holds of every turn, whatever the frame and whatever came before. A turn
 walks two things it is given, the frame in ingress and the output at the head of the queue, and the bound pays for
 both at their largest. The head is a parameter of its own, so the frames queued behind it cost the bound nothing: a
-turn releases one output, and that is what it pays for. The longest admission measured took 5190 cycles, and the
-longest release 886, against the bound of 11956. The admission was of a frame of 1518 bytes, all 217 cells. The bound
-pays for a release and an admission in one turn, which the machine never asks of one, and it charges every step of
-a walk two cycles, the most any of them takes.
+turn releases one output, and that is what it pays for. The longest admission measured took 3067 cycles, and the
+longest release 450, against the bound of 3713. The admission was of a frame of 1518 bytes, all 217 cells. The bound
+pays for a release and an admission in one turn, which the machine never asks of one.
+
+Ingress keeps its record: the handler is given it, with the chunks the frame reached, and it is ingress's again
+afterwards, and what goes into the queue is a copy, written into cells from the pool when the verdict sends the frame.
+So the record's five cells are registers in the machine, and `examples/ipv4.lfpl`'s decision, which reads and writes
+nothing else, touches no block RAM at all: its 94 steps are at most 21 clocks. The emitter knows which registers hold those
+cells, refuses a program that would store a link of one, and refuses a turn that gives back anything else in the
+record's place, so the record is where it was on the next turn.
 
 What runs is `machine.v`, with `serve_core.v` inside it. A frame comes in as bytes, with valid and ready, and goes
 into the scalar fields of the record ingress holds and then into its chain, and a frame leaves the same way, read out
@@ -395,8 +400,10 @@ afterwards every cell is in exactly one place.
 
 A hang is stopped by the design, not caught by a test. The writer stores no byte past what 217 cells hold, and the
 reader follows no more of a chain than that. A turn that runs past its bound is stopped, and a turn whose results
-put an output at the head of the queue that no outcome accounts for is not taken: the machine counts it and writes
-every cell back as it was before the first turn, which is what a reset does. That second stop exists because a
+put an output at the head of the queue that no outcome accounts for, or more outputs in it than it has places, is
+not taken: the machine counts it and writes every cell back as it was before the first turn, which is what a reset
+does. With those, the specification's T10 says how soon a frame goes: once egress is ready, every frame admitted is
+sent or released within five turns, and the testbench holds every frame it sends to the clocks T10 counts for it. That second stop exists because a
 deliberately broken build, with every argument of the turn wired to its first, never ran a turn past its bound: its
 first turn ended in 47 cycles and every one after it in 5, and egress sent the same head forever. `tests/test_machine.py` breaks the generated
 Verilog that way and others, and each time the machine stops, counts it and goes on.

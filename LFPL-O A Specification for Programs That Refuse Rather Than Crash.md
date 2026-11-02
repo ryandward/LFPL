@@ -60,6 +60,7 @@ LFPL-O rules out all three, under three stated assumptions about the machine und
 - **A1 Hardware.** The processor executes the ISA, or the FPGA executes the netlist, as specified. Memory errors are corrected by ECC; uncorrected ones are out of scope.
 - **A2 Operating system** (x86-64 only; the RTL target has none). The OS maps the image, honors `mlockall`, exempts the process from out-of-memory killing (`oom_score_adj = -1000`), and returns a defined result from every I/O system call.
 - **A3 Toolchain.** The assembler, linker and synthesis tools are correct, and the compiler's output for this program has passed translation validation (section 8.4).
+- **A4 Ingress** (RTL target). Every frame that begins on the ingress stream ends with `in_last`, its bytes back to back: a MAC that starts a frame finishes it. Nothing here needs a frame to arrive at all, only that one which has begun does not stop half way.
 
 ### 1.3 The properties
 
@@ -648,7 +649,7 @@ Lower does not write x86 directly. `src/rtlower.py` emits a flat, typed register
 - **Explicit ownership.** Registers are unbounded per function, and moves consume their source, so ownership is written into the code instead of being reconstructed beside it.
 - **Atomic constructors.** A constructor is one instruction: it reads all its sources, then writes, and each field's source says STAY, RESTORE or STORE. Writing a value back where it came from is a local type error, and so is claiming RESTORE when a store is needed. That is the first specification's Theorem 6.1, checked locally.
 - **Joins and calls.** Labels apply the merge rule of section 8.3. A call removes every token of a cell whose capability it receives.
-- **Two backends.** x86 becomes register allocation over this stream, which is `src/x86.py`, and RTL maps almost one instruction to one state, which is `src/rtverilog.py`.
+- **Two backends.** x86 becomes register allocation over this stream, which is `src/x86.py`, and RTL makes straight-line code one clock of logic, which is `src/rtverilog.py`.
 
 Of the 12 wrong-code bugs found in Phase 1, 8 are local type errors at this level. The other 4 are facts about x86: a truncated immediate, a spilled operand, the result register lost across a back-edge, and a masked shift count. Those stay with the symbolic checker. The layer keeps the O(D) bound: control flow is structured, so the checker holds token states only for labels still open, at most one per enclosing construct.
 
@@ -695,18 +696,18 @@ The tail is never written, because its byte enables are never set. The first spe
 
 ### 9.3 Cycle bounds
 
-Each term-machine step maps to at most k\_rtl states. The schedule respects the block RAM's ports: at most two accesses per cycle for dual-port RAM. So:
+Straight-line code is one clock. The emitter writes a state for each instruction, then joins each state that reads no memory and falls through with the next, unless another path can enter that one, and a clock touches the block RAM once at most. So a clock ends at a read of block RAM, at a branch, call or return, and before a label. Nothing is reordered. Each clock is charged to the first instruction in it, and the potential method of section 5 bounds the sum with those charges in place of steps, so the bound in clocks is a certificate, C(n), checked as W(n) is:
 
 ```latex
-\mathrm{cycles}(h, n) \;\le\; k_{\mathsf{rtl}} \cdot W(n) \qquad\qquad \mathrm{latency}(h, n) \;\le\; \frac{k_{\mathsf{rtl}} \cdot W(n)}{f_{\max}}
+\mathrm{cycles}(h, n) \;\le\; C(n) \qquad\qquad \mathrm{latency}(h, n) \;\le\; \frac{C(n)}{f_{\max}}
 ```
 
-Here f\_max is the clock frequency synthesis achieves, set by the longest combinational path within one state. There are no caches and no interrupts, so this is a true upper bound in time. x86-64 has no equivalent.
+Here f\_max is the clock frequency synthesis achieves, set by the longest combinational path within one clock, which straight-line code makes longer. There are no caches and no interrupts, so this is a true upper bound in time. x86-64 has no equivalent.
 
 ### 9.4 Properties specific to this target
 
 - **RTL-1 (storage is the image).** All storage is the block RAM and registers sized at synthesis. The netlist has no other memory.
-- **RTL-2 (cycle bound).** An admitted item finishes within k\_rtl · W(n) cycles.
+- **RTL-2 (cycle bound).** An admitted item finishes within C(n) cycles, and a turn within its certificate in clocks.
 - **RTL-3 (write masks).** No write enable ever covers an unchanged field.
 
 ### 9.5 How to check it
@@ -722,23 +723,23 @@ On this target the serving loop's rules of section 3.3 are LFPL, not a runtime w
 
 - **State.** The turn holds the pool, the ingress slot, the queue's head and the rest of the queue, and returns them for the next turn. The machine keeps them in registers between turns, and does nothing else with them.
 - **The pool** is a type of its own, laid out as a Free is. Running out of it is Short, which happens, so its `End` arm is charged, where a reserve's is not.
-- **Ingress** is a value of the item's type, N\_max cells: the record and a chain as long as the slot holds. The hardware writes a frame's bytes into the record's scalar fields and then the chain's chunks, with a used count, the length field, and zeros after the last byte. It never writes a link, so whatever it is given, no cell can come to point at another.
-- **Admission** finds n by walking ingress's chain while it counts the frame's bytes down, since there is no division, and TooLarge compares the length with what N\_max cells hold. It takes the cells it needs out of the pool by matching it, one for each the item takes out of ingress and one for the output's place in the queue, and running dry gives back what was taken, in order: Short. No count is trusted, because none is kept.
+- **Ingress** is a value of the item's type, N\_max cells: the record and a chain as long as the slot holds. The hardware writes a frame's bytes into the record's scalar fields and then the chain's chunks, with a used count, the length field, and zeros after the last byte. It never writes a link, so whatever it is given, no cell can come to point at another. The record keeps its cells: the handler is given it with the chunks the frame reached, and it is ingress's again afterwards. So its cells are registers, behind the same ports as the block RAM, and the handler's decision, which reads and writes only the record, touches no block RAM.
+- **Admission** finds n by walking ingress's chain while it counts the frame's bytes down, since there is no division, and TooLarge compares the length with what N\_max cells hold. It takes the cells it needs out of the pool by matching it, the cells of a copy of the record and one for the copy's place in the queue, and one for each chunk the frame takes out of ingress, and running dry gives back what was taken, in order: Short. No count is trusted, because none is kept. What the queue holds is that copy, written to its cells when the verdict sends the frame. A frame dropped gives the copy's cells back, with its chunks.
 - **The queue** is K\_out outputs, oldest first: its head, a parameter of the turn's own, and K\_out - 1 places in a record after it, shifted up when egress has sent the head. Full is the last place being taken. A list kept in arrival order could not be certified: appending walks entries whose potential has already been spent.
-- **The bound** is for a whole turn: ingress counted at N\_max cells and the head at its own cell and N\_out more, every other linear parameter given nothing. So it holds of every turn on its own, whatever came before, and it pays for releasing one output, which is all a turn releases. Were the head a place in the queue's record, it would pay for every frame the queue holds, since the potential of a value is per cell of it and does not tell one place from another.
+- **The bound** is for a whole turn: ingress counted at N\_max cells and the head at its own cell and N\_out more, every other linear parameter given nothing. So it holds of every turn on its own, whatever came before, and it pays for releasing one output, which is all a turn releases. Were the head a place in the queue's record, it would pay for every frame the queue holds, since the potential of a value is per cell of it and does not tell one place from another. It is certified twice, in steps and in clocks (section 9.3), and the machine is held to the second: T, from the edge that samples `start` to the edge that raises `done`.
 
 The hardware around the turn, `src/machine.py`, is a writer, a reader and a controller that runs turns forever. They move no cell between owners, so conservation is the turn's. The writer stores at most the bytes N\_max cells hold: the byte past them ends the frame, which the turn refuses as TooLarge, and the rest of it is read and thrown away between turns. The reader follows no more of a chain than N\_out cells hold, and cuts and counts a frame with more. So each takes a number of cycles that grows with the frame up to a constant, outside the turn's bound, whatever any turn did.
 
 What would hang is stopped in the design, not by a test:
 
-- **A turn past its bound** is stopped at k*W + c cycles, and counted, and every cell is written back as it was before the first turn, which is also what a reset does. The frame it held is lost, and so is the queue.
-- **A head no outcome accounts for.** The controller counts outputs the turns' outcomes say the queue holds, one more for Queued and one fewer for a release. The count decides nothing a turn does. When a turn returns an output at the head with the count at none, or none with the count above it, its results are not taken: the machine counts a fault and writes every cell back. Without this, a turn that keeps an output at the head without queuing it has egress send that output again after every release, each turn within its bound and none of them ending it.
+- **A turn past its bound** is stopped at T clocks, and counted, and every cell is written back as it was before the first turn, which is also what a reset does. The frame it held is lost, and so is the queue.
+- **A head no outcome accounts for.** The controller counts outputs the turns' outcomes say the queue holds, one more for Queued and one fewer for a release. The count decides nothing a turn does. When a turn returns an output at the head with the count at none, or none with the count above it, or a count past K\_out, its results are not taken: the machine counts a fault and writes every cell back. Without this, a turn that keeps an output at the head without queuing it has egress send that output again after every release, each turn within its bound and none of them ending it.
 
-So no more frames go out than turns said they queued: once frames stop coming in, egress sends at most what is queued, a release follows each, and the machine is idle.
+So no more frames go out than turns said they queued, and never more than K\_out are waiting: once frames stop coming in, egress sends at most K\_out, a release follows each, and the machine is idle. T10 says how soon.
 
 ## 10. Theorems and proof sketches
 
-The guarantee rests on nine theorems. T1–T7 are about the abstract machine of section 3. T8 is about the compiler. T9 carries the abstract results down to each binary.
+The guarantee rests on nine theorems, and a tenth for the RTL target. T1–T7 are about the abstract machine of section 3. T8 is about the compiler. T9 carries the abstract results down to each binary. T10 is progress on the RTL target's machine of section 9.6.
 
 **Main theorem.** Under assumptions A1–A3, every started LFPL-O program satisfies C1–C9. *Proof:* T1 gives C1 and C9. T2 gives C2 and C3. T3 gives C4, T6 gives C5, T4 gives C6, T5 gives C7, and T7 gives C8. T9 and A3 carry these from the abstract machine to the binary, and A1 and A2 carry them from the binary to the machine. ∎
 
@@ -798,6 +799,22 @@ Proof sketch: each turn runs one transaction to completion, at most W(N\_max) by
 *The partition of section 3.4 holds in every reachable configuration, so no cell leaks, however many items are processed.*
 
 Proof sketch: by induction over transitions. Each rule moves cells between components and creates none. At DONE, the handler must account for every cell it received, as Σ′, as output o, or as returned reserve b, because discarding a linear value is a type error. So the pool after each item equals the pool before it, minus two amounts: the cells held by queued output, which DRAIN returns, and any net growth of the state's slots, which S\_cap bounds.
+
+### T10 Progress on the RTL target (C5)
+
+*Assume A4, that egress is ready from some clock t\_0 on, and that no turn is stopped or faulted (section 9.6). Then every frame admitted is sent or released within K\_out + 1 turns of the later of t\_0 and its admission, and within L clocks:*
+
+```latex
+L \;\le\; I_{\max} + (K_{\mathsf{out}} + 1)\,(T + 3) + \sum_{j=1}^{p} \big(1 + E(f_j)\big), \qquad p \le K_{\mathsf{out}}
+```
+
+```latex
+E(f) \;=\; B(f) + 5\,C(f) + e \qquad\qquad I(f) \;=\; B(f) + 2\,M(f) + i \;\le\; B_{\max} + 1 + 2\,(N_{\max} - \mathit{cells}) + i \;=\; I_{\max}
+```
+
+*T is the turn's certificate in clocks, and f\_1 to f\_p are the frames ahead of this one in the queue, and this one. E(f) is the clocks egress takes to send a frame of B(f) bytes in C(f) chunks, and I(f) the clocks the writer takes for one whose bytes come a clock each, M(f) being the chunks it moves on from, every one it fills but one the frame ends in. I\_max is the most I(f) can be, since the writer stores no byte past the B\_max that N\_max cells hold. Both have a constant of the record's own: for a record of `cells` cells, `links` links between them and `wire` of them holding bytes on the wire, e = 2 (links + 1) + 3 wire + 4 and i = 2 (links + 1) + 3. `examples/ipv4.lfpl`'s record has 5 cells, 4 links and 5 with bytes on the wire, so E(f) = B + 5C + 29.*
+
+Proof sketch: a turn is the core's T clocks at most, by its certificate and the emitter's charges (section 9.3), and three of the controller's around it: the clock it is started in, the clock the core samples `start` in, and the clock `done` is seen in. With egress ready, the controller chooses egress whenever the queue's head holds an output: so once the frame is admitted, no frame is admitted until the queue is empty, and each output ahead of it is sent and released, one release turn each, before its own. The queue holds at most K\_out outputs, so that is at most K\_out release turns after the one admission turn. If the controller was in the writer when egress became ready, A4 bounds the rest of that frame by I\_max, a clock a byte and two a chunk, and the writer stores no byte past N\_max cells, so its admission turn is the one, and K\_out + 1 holds. Egress reads the head's cell, walks the record's links, counts the chain, sends the record's bytes a clock each with two clocks a cell and one between cells, and each chunk's in three clocks and a clock a byte, which is E(f), and it follows no more than N\_out cells. `tests/test_machine.py` holds every frame the corpus forwards to E(f), and every frame the writer takes after a turn that queued nothing to I(f), to the clock. ∎
 
 ### T8 Completeness of compilation
 
@@ -877,8 +894,8 @@ The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and 
 | identity-morphism validator | present, but **only in the test suite**: `src/lfplo.py` does not run it, so a build does not yet make the fourth check of section 8.4 | run it on every build |
 | heap-flatness test | present, and it holds when run on its own | nothing |
 | cell conservation in the compiler ring | present, with Theorem 7.2's bound checked at every step | nothing |
-| RTL backend | the handler and everything it calls, for every RT instruction: `src/rtverilog.py`, which needed no change to anything before it. Its bound in cycles is derived by the emitter and held to in simulation, its outputs are compared with the x86 binary's on the same bytes, and yosys maps its cell store to block RAM. | `swap` |
-| the runtime's turn (section 9.6) | present on the RTL target: admission, ADMIT, DONE and the output queue are LFPL, lowered with `examples/ipv4.lfpl` by `src/machine.py`, with frames in and out as bytes. The emitter states one bound for a whole turn before anything runs, every turn of the corpus is held to it, every frame out is the x86 build's, and every cell is in one place afterwards. The design stops a turn past its bound and a head of the queue no outcome accounts for, and writes every cell back; ingress and egress stop at N\_max and N\_out cells. x86 keeps its runtime. | the turn on x86; handlers with state slots, draws or outputs built in a cell; several frames in ingress at once |
+| RTL backend | the handler and everything it calls, for every RT instruction: `src/rtverilog.py`, which makes straight-line code one clock of logic (section 9.3). Its bound in clocks is a certificate, rtcheck's with the clocks the emitter charges in place of steps, held to in simulation and exact for the checksum; its outputs are compared with the x86 binary's on the same bytes, and yosys maps its cell store to block RAM. A turn's record is registers. | `swap`; inlining a call, which costs two clocks |
+| the runtime's turn (section 9.6) | present on the RTL target: admission, ADMIT, DONE and the output queue are LFPL, lowered with `examples/ipv4.lfpl` by `src/machine.py`, with frames in and out as bytes. The emitter states one bound in clocks for a whole turn before anything runs, every turn of the corpus is held to it, every frame out is the x86 build's, and every cell is in one place afterwards. Ingress's record is registers, so the handler's decision touches no block RAM. The design stops a turn past its bound and a head of the queue no outcome accounts for, or more outputs than places, and writes every cell back; ingress and egress stop at N\_max and N\_out cells. T10 is tested to the clock for every frame the corpus sends. x86 keeps its runtime. | the turn on x86; handlers with state slots, draws or outputs built in a cell; several frames in ingress at once |
 | enum matching | present: an arm binds the fields, out of the register | storing an enum in a cell |
 
 The implementation decides some things this text leaves open, or does not mention:
@@ -898,7 +915,7 @@ The implementation decides some things this text leaves open, or does not mentio
 - **The inferred cell.** It is conservative, and exact about nothing but what `rtcheck` will accept: the rule is at the head of `src/righttoleft.py`, and `src/symcheck.py` works it out again without sharing any code, so a disagreement refuses the build. Where it finds nothing, the function simply has no `@`, as if none were written. A `@` that is written is held to every exit as before, and what the pass finds is held to the same. Nothing is inferred for a result that is no cell, such as an integer or an enum, and a `@` written on one is refused.
 - **Narrowing.** `low8`, `low16` and `low32` keep the low bits of an integer. `pack` only widens, and without these a sum worked out in Int64 could not be stored in a narrower field.
 - **Steps.** A step is one instruction of the register-transfer stream, except `move`, `drop` and `open`, which lower to nothing on x86. On the RTL target `open` can take a clock, and so can the read in front of `br.tag`, because a block RAM returns a word a clock after it is asked. `docs/rt-layer.md` lists what else in the stream came from x86.
-- **k\_rtl.** It is not a constant of the translation. The emitter derives k and c for each program from the states it wrote, and section 9.3's bound becomes cycles(n) <= k * W(n) + c, counted from the edge that samples `start` to the edge that raises `done`. For `examples/checksum.lfpl`, k = 1 and c = 1.
+- **k\_rtl.** It is gone. The emitter charges each clock of its machine to the first instruction in it, and rtcheck certifies the clocks with those charges in place of steps: section 9.3's C(n), counted from the edge that samples `start` to the edge that raises `done`. For `examples/checksum.lfpl`, C(n) = 4 n + 14, which every run takes exactly, where W(n) = 28 n + 4.
 - **Read during write.** No state of the machine enables both of the cell store's ports, and a host that writes does not read, so a clock never reads and writes one address. In the Verilog such a read would return the old word, but no block RAM is asked to say so: yosys proves from the state decode that the two enables never meet, and maps the store with no logic for it. If the host's write did not hold off its read, yosys could not prove it, and on iCE40 it spends about 300 flip-flops delaying the write to keep the old-word answer.
 
 The plan, with what is done marked. Arrays and tuples came ahead of resource analysis, because the handler needs them:

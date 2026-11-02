@@ -18,7 +18,7 @@ here is what LFPL cannot be: the cell store's first contents, and the module aro
               the chain's bytes, read out of the cells, and the next turn releases it. It follows no more of a chain
               than N_out cells hold, and a frame with more is cut there, ends, and is counted.
     turns     one after another, forever, each started with what the last one returned. A turn is the checked unit:
-              rtcheck certified its steps for any frame, and src/rtverilog.py turned that into a number of cycles.
+              rtcheck certified its clocks for any frame, charging each instruction what serve_core spends on it.
 
 Nothing outside serve_core moves a cell from one owner to another, so conservation is the turn's, and the tests check it
 by walking the store afterwards. Ingress and egress take a number of cycles that grows with the frame, at most what
@@ -71,13 +71,14 @@ class Machine:
 
     @property
     def turn_cycles(self) -> int:
-        """The most clock cycles a turn can take, from the edge that starts it to the edge that ends it."""
-        return self.timing.k * self.bound.d + self.timing.c
+        """The most clock cycles a turn can take, from the edge that starts it to the edge that ends it: rtcheck's
+        certificate with each instruction charged the clocks serve_core spends on it."""
+        return self.timing.clocks.d
 
     def report(self) -> str:
         return (f"turn {TURN} for handler {self.shape.handler}: W = {self.bound.d} steps for any frame of up to "
                 f"{self.shape.n_max} cells in and {self.shape.n_out} out, with {self.shape.k_out} places in the queue; "
-                f"cycles <= {self.timing.k}*W + {self.timing.c} = {self.turn_cycles} a turn; "
+                f"clocks <= {self.turn_cycles} a turn, certified; "
                 f"{self.cells} cells of {8 * CELL_BYTES} bits, {self.pointer_bits}-bit pointers")
 
 
@@ -92,7 +93,8 @@ def build(program: bytes, *, n_max: int, k_out: int = 4, cells: int | None = Non
     queue_cells = len(queue)
     # The turn walks two things it is given: the frame in ingress, and the output at the head of the queue, which is
     # its own cell and a record of at most N_out cells. The rest of the queue and the pool are charged nothing.
-    bound = certify_turn(checker, TURN, {1: n_max, 2: 1 + shape.n_out})
+    sizes = {1: n_max, 2: 1 + shape.n_out}
+    bound = certify_turn(checker, TURN, sizes)
     needed = n_max + queue_cells + k_out * (1 + n_max) + (n_max + 1)
     count = needed if cells is None else cells
     first_pool = n_max + queue_cells + 1
@@ -100,13 +102,13 @@ def build(program: bytes, *, n_max: int, k_out: int = 4, cells: int | None = Non
         raise RTError(f"section 3.4: {count} cells cannot hold ingress and the queue, which take {first_pool - 1}")
     pointer_bits = _bits_for(count + 1)
     image, start = _image(checker, shape, queue, count)
-    emitter = Emitter(pointer_bits)
+    emitter = Emitter(pointer_bits, header=start[1])  # ingress's record: registers, at the cells _image gave it
     for line in lines:
         emitter.feed(line)
     turn = next(f for f in emitter.functions.values() if f.turn)
-    core = emitter.render(turn, "serve_core", bound, count, {})
+    core = emitter.render(turn, "serve_core", bound, count, {}, sizes=sizes)
     entry = _offsets(_ctor(checker, "Pending"))
-    top = _top(shape, pointer_bits, start, entry, core.timing.k * bound.d + core.timing.c, count)
+    top = _top(shape, pointer_bits, start, entry, core.timing.clocks.d, count)
     return Machine(shape, bound, core.timing, count, pointer_bits, core.verilog, top, image, text, start,
                    tuple(queue), entry)
 
@@ -221,6 +223,7 @@ def _top(shape: Shape, p: int, start: tuple, entry: dict, turn_cycles: int, cell
     add(f"    localparam CHUNKS_OUT = 16'd{shape.n_out - parts};  // a chain's share of N_out cells")
     add(f"    localparam [31:0] TURN_LIMIT = 32'd{turn_cycles};")
     add(f"    localparam [7:0] QUEUED = 8'd{OUTCOMES.index('queued')};")
+    add(f"    localparam K_OUT = {shape.k_out};")
     add(f"    localparam [7:0] FAULTED = 8'd{FAULTED};")
     add(f"    localparam [7:0] STOPPED = 8'd{STOPPED};")
     for position, name in enumerate(states):
@@ -405,7 +408,7 @@ def _top(shape: Shape, p: int, start: tuple, entry: dict, turn_cycles: int, cell
     add("            S_TURN_WAIT: if (done) begin")
     add("                turn_cycles <= cycles;")
     add("                turn_done <= 1'b1;")
-    add("                if ((r_head != {P{1'b0}}) != (held_after != 0)) begin")
+    add("                if ((r_head != {P{1'b0}}) != (held_after != 0) || held_after > K_OUT) begin")
     add("                    faults <= faults + 32'd1;")
     add("                    turn_outcome <= FAULTED;")
     add(f"                    {wipe}")

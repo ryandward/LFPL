@@ -75,8 +75,10 @@ fn enqueue(head: Out, queue: Queue, out: Out) : (Out, Queue, Out) = match head w
 $enqueue_body;
 
 # One turn. What egress has sent goes back first. Then the frame ingress holds, if there is one, is refused or
-# admitted: ADMIT, the handler, then DONE. The cells come out of the pool by matching it, one for each the item
-# takes out of ingress and one for the output's place in the queue, and running dry gives back what was taken.
+# admitted: ADMIT, the handler, then DONE. Ingress keeps its record: the handler is given it, with the chunks the
+# frame reached, and it is ingress's again afterwards, so on the hardware target its cells can be registers. What
+# goes into the queue is a copy of it, in cells taken from the pool by matching it, with one more for the copy's
+# place in the queue and one for each chunk the frame takes out of ingress. Running dry gives back what was taken.
 turn serve(pool: Pool, slot: $item, head: Out, queue: Queue, length: Int16, sent: Bool) : (Pool, $item, Out, Queue, Turned) =
   let (head0, queue0, pool0) = if sent then release(head, queue, pool) else (head, queue, pool) in
   if ==(length, 0) then (pool0, slot, head0, queue0, Idle)
@@ -92,8 +94,8 @@ $take
     else
       let (verdict, out, free) = $handler($item@d { $chain_field = unsplit(item, $last) }, End) in
       let pool2 = give_free(free, pool1) in
-      let slot1 = $fresh_record in
+      match out with $out_pattern =>
       match verdict with
 $done_arms
-      end
+      end end
   end$take_end;

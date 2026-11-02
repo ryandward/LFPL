@@ -20,16 +20,22 @@ A function's registers are static, with no stack and no frames. rtcheck refuses 
 the call graph has no cycle but a function's jump to its own entry, and no function is ever active
 twice.
 
-Every state belongs to one RT instruction, so a cycle count can be derived before anything runs. A
-state occupies the machine for exactly one clock. Most instructions are exactly one state, and three
-things put another in front of one. A field can only be read from port A's output, so an instruction
-that names a field of a cell whose word is not there has to wait for a read. An array read needs a clock
-for the same reason. And locations of two cells in one instruction need the first one latched, because
-there is one read port. See `Timing`.
+A program is its own circuit: straight-line code is combinational logic that settles in one clock. The
+emitter writes a state for each RT instruction first, and three things put another in front of one: a
+field can only be read from port A's output, so an instruction that names a field of a cell whose word is
+not there waits for a read; an array read needs a clock for the same reason; and locations of two cells in
+one instruction need the first one latched, because there is one read port. Then every state that touches
+no memory and does not branch is joined with the state after it, unless something else can enter that one,
+and what it computed becomes a wire. So a clock ends only at a block-RAM access, a branch or jump, a call or
+return, or a label another path reaches, and nothing is reordered.
+
+Each state is a clock, charged to the first instruction in it. rtcheck runs again with those charges in
+place of its steps, and the same potential method that bounds steps bounds clocks. See `Timing`.
 """
 from __future__ import annotations
 
 import argparse
+import collections
 import io
 import math
 import os
@@ -38,7 +44,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Union
 
-from .certify import certify
+from .certify import certify, certify_turn
 from .ring import FStarved, Reject
 from .rtcheck import NO_WORK, Bound, Checker, RTError
 from .rtlower import Limit, rt_lines
@@ -149,12 +155,13 @@ Next = Union[str, Enter, Return, Choice]
 class State:
     name: str
     comment: str
-    clocked: list = field(default_factory=list)  # <= statements, at the clock edge
+    clocked: list = field(default_factory=list)  # (register, expression): <= at the clock edge
     ports: list = field(default_factory=list)    # what this state drives on the memory ports
     next: Next = FALL
-    hardware: bool = False  # a state RT charges nothing for, in front of an instruction it does
+    hardware: bool = False  # a state in front of an instruction, which RT has no instruction for
     reads: bool = False
     writes: bool = False
+    line: Optional[int] = None  # the instruction its clock is charged to, by its line in the stream
 
 
 @dataclass
@@ -176,7 +183,7 @@ class Function:
     calls: list = field(default_factory=list)
     recursive: bool = False
     reads: bool = False
-    costs: list = field(default_factory=list)     # (kind, cycles) of each instruction RT charges for
+    wires: list = field(default_factory=list)     # (name, width, expression): what a joined state computed
 
     def flop(self, register: int) -> str:
         return f"{self.name}_r{register}"
@@ -196,35 +203,23 @@ class Span:
 
 @dataclass(frozen=True)
 class Timing:
-    """The clock cycles this machine takes, derived from the states it was given.
+    """The clocks this machine takes, certified before anything runs.
 
-    Count from the edge that samples `start` to the edge that raises `done`. Each state holds the
-    machine for one clock, and none is ever entered but by a transition, so that count is the
-    number of states executed. Each of those belongs to an instruction RT charges a step for, or is
-    a hardware-only state in front of one, or the handler's zero-step `open` of a cell: and that
-    costs nothing here until a field of it is named, when it is a hardware-only state too.
-
-    Write cost(I) for 1 plus the hardware-only states in front of I. Split the code in two:
-
-        in a walk   a recursive function, and all it calls. These run a number of times that depends
-                    on the item. k is the largest cost(I) among them, so each execution of one of
-                    them takes at most k cycles for its one step
-        the rest    runs at most once per call, on a call graph with no cycle. c is the largest number
-                    of hardware-only states on any path through it, found by walking its states
-
-    So cycles <= k * steps + c, and rtcheck has certified steps <= W(n), which gives the bound.
+    Count from the edge that samples `start` to the edge that raises `done`. Each state holds the machine
+    for one clock, and none is entered but by a transition, so that count is the number of states entered.
+    Every state is charged to one instruction: the first in it, or for a state in front of an instruction,
+    that instruction. Every instruction of a state runs whenever the state does, since a state is
+    straight-line code, so the charges add up to the clocks exactly, but for a state that only makes the
+    moves before a join, which is charged to the instruction after the label, and that one may be reached
+    from elsewhere too. rtcheck charges each instruction what it was charged here, in place of a step, and
+    its certificate is then a bound in clocks: `clocks`, as c n + d.
     """
-    k: int
-    c: int
-    kinds: tuple           # (kind, steps, fewest cycles, most cycles, how many in the machine)
+    clocks: Bound          # its c and d: clocks(n) <= c n + d
     iterations: tuple      # (function name, Span of an iteration, Span of leaving)
     states: int
 
-    def bound(self, n: int, bound: Bound) -> int:
-        return self.k * (bound.c * n + bound.d) + self.c
-
-    def per_cell(self, bound: Bound) -> int:
-        return self.k * bound.c
+    def bound(self, n: int) -> int:
+        return self.clocks.c * n + self.clocks.d
 
 
 @dataclass(frozen=True)
@@ -241,22 +236,12 @@ class Translation:
     def report(self) -> str:
         lines = [f"handler {self.module}: R(n) = {_linear(self.bound.a, self.bound.b)} cells, "
                  f"W(n) = {_linear(self.bound.c, self.bound.d)} steps, {self.cells} cells of "
-                 f"{CELL_BITS} bits, {self.pointer_bits}-bit pointers, {self.timing.states} states",
-                 "the emitted machine, by RT instruction:",
-                 "  kind      steps  cycles  in the machine"]
-        for kind, steps, low, high, count in self.timing.kinds:
-            cycles = str(low) if low == high else f"{low}-{high}"
-            lines.append(f"  {kind:<9} {steps:>5}  {cycles:>6}  {count:>14}")
-        if any(low != high for _kind, _steps, low, high, _count in self.timing.kinds):
-            lines.append("  (the extra cycle is a state in front: a read of the cell, or a latch)")
+                 f"{CELL_BITS} bits, {self.pointer_bits}-bit pointers, {self.timing.states} states"]
         for name, iteration, leaving in self.timing.iterations:
-            lines.append(f"walk {name}: {iteration} cycles per iteration, {leaving} to leave")
-        k, c = self.timing.k, self.timing.c
-        lines.append(f"k = {k}: the most cycles any one instruction takes in a walk")
-        lines.append(f"c = {c}: the most states RT does not charge for, on a path outside the walks")
-        slope, constant = k * self.bound.c, k * self.bound.d + c
-        lines.append(f"cycles(n) <= {k}*W(n) + {c} = {_linear(slope, constant)}, from the edge that "
-                     f"samples start to the edge that raises done")
+            lines.append(f"walk {name}: {iteration} clocks per iteration, {leaving} to leave")
+        clocks = self.timing.clocks
+        lines.append(f"clocks(n) <= {_linear(clocks.c, clocks.d)}, certified, from the edge that samples start to "
+                     f"the edge that raises done")
         return "\n".join(lines)
 
 
@@ -269,8 +254,16 @@ def _linear(slope: int, constant: int) -> str:
 class Emitter:
     """Reads a stream rtcheck has accepted, and holds the machine until `render`."""
 
-    def __init__(self, pointer_bits: int) -> None:
+    def __init__(self, pointer_bits: int, header: Optional[int] = None) -> None:
+        """`header` is where the record a turn hands its handler lives, if it does: its cells, from that address
+        on, are registers, and so the handler's decision reads and writes no block RAM. See `_header_text`."""
         self.pointer_bits = pointer_bits
+        self.header = header
+        self.header_type: Optional[str] = None       # the record's type, once the handler names it
+        self.header_cells: list[str] = []            # its constructors, a cell each, in the order its links go
+        self.facts: dict[int, int] = {}              # a register that holds one of its cells: which
+        self.links: dict[str, tuple[int, int, str]] = {}  # a constructor's `$next`: offset, size, the next type
+        self.ctor_types: dict[str, str] = {}
         self.aliases: dict[str, str] = {}
         self.composite: dict[str, tuple] = {}
         self.tuples: dict[str, list[str]] = {}
@@ -282,30 +275,33 @@ class Emitter:
         self.fn: Optional[Function] = None
         self.loaded: Optional[int] = None  # the register whose cell's word is at port A's output
         self.pending: dict[int, int] = {}  # moves not yet made: a move costs no state of its own
-        self.edges: dict[str, list[Optional[int]]] = {}
+        self.edges: dict[str, list[tuple[Optional[int], dict]]] = {}
         self.waiting_labels: list[str] = []
         self.waiting_sites: list[Site] = []
         self.latched: dict[str, tuple[str, int]] = {}
-        self.attached = 0
+        self.unattributed: list[State] = []  # states in front of an instruction not yet reached
         self.open_path = False
-        self.kinds: dict[str, list[int]] = {}
         self.cut: dict[str, tuple[int, int]] = {}  # registers only read in part: (kept, width)
+        self.lines: list[str] = []  # the stream, for rtcheck to read again with clocks for steps
+        self.line = 0               # the line of the instruction being emitted
 
     # --- declarations
 
     def feed(self, line: str) -> None:
+        self.lines.append(line)
+        number = len(self.lines)  # as rtcheck counts them: every line fed, from 1
         text = line.strip()
         if not text:
             return
         if self.current:
-            self.current.append(text)
+            self.current.append((number, text))
             if text.split()[0] == "end":
                 self._function(self.current)
                 self.current = []
             return
         head, *parts = text.split()
         if head in ("fn", "handler", "turn"):
-            self.current = [text]
+            self.current = [(number, text)]
         elif head == "alias":
             self.aliases[parts[0]] = parts[1]
         elif head == "array":
@@ -318,8 +314,11 @@ class Emitter:
             self.enums.add(parts[0])
         elif head == "ctor":
             self.ctors[parts[0]] = Ctor(parts[2])
+            self.ctor_types[parts[0]] = parts[1]
         elif head == "field":
             self.ctors[parts[0]].fields.append((int(parts[1]), int(parts[2]), parts[3]))
+            if parts[4] == "$next":
+                self.links[parts[0]] = (int(parts[1]), int(parts[2]), parts[3])
         elif head == "state":
             self.slots.append((parts[0], parts[1]))
 
@@ -353,26 +352,39 @@ class Emitter:
 
     # --- one function: first what each register is, then what each instruction does
 
-    def _function(self, lines: list[str]) -> None:
-        match = _HEADER.match(lines[0])
+    def _function(self, lines: list[tuple[int, str]]) -> None:
+        match = _HEADER.match(lines[0][1])
         assert match is not None, lines[0]
         kind, ordinal, name, params, ret, at = match.groups()
         types = [part.partition(" : ")[2].strip() for part in _args(params)]
         fn = Function(ordinal, name, types, ret, int(at) if at else None, kind == "handler", kind == "turn")
         self.fn = fn
         body = [(_LABEL.match(line).group(1) if _LABEL.match(line) else None,
-                 _LABEL.match(line).group(2) if _LABEL.match(line) else line)
-                for line in lines[1:-1]]
-        self._measure_registers(fn, body)
+                 _LABEL.match(line).group(2) if _LABEL.match(line) else line, number)
+                for number, line in lines[1:-1]]
+        self._measure_registers(fn, [(label, instruction) for label, instruction, _number in body])
         self.loaded = None
         self.pending = {}
         self.edges = {}
-        self.attached = 0
+        self.facts = {}
+        if self.header is not None and fn.handler:
+            self.header_type = self._resolve(types[-2])
+            self.header_cells = self._cells_of(self.header_type)
+            self.facts[len(types) - 2] = 0
+        elif self.header is not None and fn.turn:
+            if self.header_type is None:
+                raise RTError("the turn comes before its handler, and the header is the handler's item")
+            mine = [position for position, ty in enumerate(types) if self._resolve(ty) == self.header_type]
+            if len(mine) != 1:
+                raise RTError(f"the turn takes {len(mine)} records of the handler's item type, and the header is one")
+            self.facts[mine[0]] = 0
+        self.unattributed = []
         self.open_path = True
-        for label, instruction in body:
+        for label, instruction, number in body:
             if label is not None:
                 self._label(label)
             if instruction:
+                self.line = number
                 self._instruction(instruction)
         # A callee comes before its caller, so this is all there is to know about what it reads.
         fn.reads = any(state.reads for state in fn.states) or any(callee.reads for callee in fn.calls)
@@ -462,46 +474,39 @@ class Emitter:
             site.state = state.name
         self.waiting_sites = []
         for target, source in self.pending.items():  # every waiting move happens in this clock
-            state.clocked.append(f"{fn.flop(target)} <= "
-                                 f"{_whole(fn.flop(source), fn.widths[source], fn.widths[target])};")
+            state.clocked.append((fn.flop(target), _whole(fn.flop(source), fn.widths[source], fn.widths[target])))
         self.pending = {}
         state.clocked.extend(clocked)
         fn.states.append(state)
         return state
 
     def _hardware(self, comment: str, **kwargs) -> None:
-        """A state in front of an instruction, which RT does not charge for."""
-        self._state(comment, hardware=True, **kwargs)
-        self.attached += 1
+        """A state in front of an instruction, which RT has no instruction for. Its clock is that
+        instruction's to pay."""
+        self.unattributed.append(self._state(comment, hardware=True, **kwargs))
 
     def _step(self, kind: str, comment: str, **kwargs) -> State:
-        """The state of an instruction RT charges a step for. Whatever hardware-only states came
-        just before it are part of what this instruction takes."""
-        fn = self.fn
-        assert fn is not None
+        """The state of an instruction, and the instruction the states just in front of it are charged to."""
         state = self._state(comment, **kwargs)
-        cost = 1 + self.attached
-        fn.costs.append((kind, cost))
-        self._count(kind, cost)
-        self.attached = 0
+        for waiting in self.unattributed + [state]:
+            waiting.line = self.line
+        self.unattributed = []
         return state
 
-    def _count(self, kind: str, cost: int) -> None:
-        low, high, count = self.kinds.get(kind, [cost, cost, 0])
-        self.kinds[kind] = [min(low, cost), max(high, cost), count + 1]
-
     def _edge(self, label: str, loaded: Optional[int]) -> None:
-        self.edges.setdefault(label, []).append(loaded)
+        self.edges.setdefault(label, []).append((loaded, dict(self.facts)))
 
     def _label(self, label: str) -> None:
         incoming = self.edges.pop(label, [])
         if self.open_path:
             if self.pending:  # a label has every register in its own flip-flop on every edge
                 self._hardware("the moves before a join")
-            incoming.append(self.loaded)
-        else:
-            self.attached = 0
-        self.loaded = incoming[0] if incoming and all(i == incoming[0] for i in incoming) else None
+            incoming.append((self.loaded, dict(self.facts)))
+        words = [loaded for loaded, _facts in incoming]
+        self.loaded = words[0] if words and all(i == words[0] for i in words) else None
+        known = [facts for _loaded, facts in incoming]
+        self.facts = {register: cell for register, cell in (known[0].items() if known else ())
+                      if all(facts.get(register) == cell for facts in known)}
         self.open_path = True
         self.waiting_labels.append(label)
 
@@ -527,13 +532,34 @@ class Emitter:
                        ports=["a_en = 1'b1;", f"a_addr = {pointer};"])
         self.loaded = register
 
+    def _cells_of(self, record: str) -> list[str]:
+        """A record's constructors, a cell each, in the order its `$next` links go."""
+        cells, ty = [], record
+        while True:
+            ctor = next(c for c, owner in self.ctor_types.items() if self._resolve(owner) == ty)
+            cells.append(ctor)
+            if ctor not in self.links:
+                return cells
+            ty = self._resolve(self.links[ctor][2])
+
+    def _header_word(self, cell: int) -> str:
+        assert self.header is not None
+        return f"header_{self.header + cell}"
+
+    def _in_header(self, text: str) -> Optional[tuple[int, int, int]]:
+        """The header cell, offset and size of a location the emitter knows is in the header."""
+        where = self._location(text.rstrip("!"))
+        if where is None or where[0] not in self.facts:
+            return None
+        return self.facts[where[0]], where[1], where[2]
+
     def _locations(self, texts: Iterable[str]) -> None:
         """Everything an instruction names in memory must be readable in its one clock. With one
         read port, that is one word. A location of any other cell is latched first, starting with
-        the cell already at the port, since that one needs no read."""
+        the cell already at the port, since that one needs no read. The header's are registers."""
         fn = self.fn
         assert fn is not None
-        locations = [text for text in texts if self._location(text)]
+        locations = [text for text in texts if self._location(text) and not self._in_header(text)]
         bases = list(dict.fromkeys(self._location(text)[0] for text in locations))
         if not bases:
             return
@@ -549,7 +575,7 @@ class Emitter:
                 name = f"{fn.name}_t{len(fn.temporaries)}"
                 fn.temporaries.append((name, width))
                 self._hardware(f"latch {text}: one read port, and two cells",
-                               clocked=[f"{name} <= {_slice('a_dout', 8 * where[1], width, width)};"])
+                               clocked=[(name, _slice("a_dout", 8 * where[1], width, width))])
                 self.latched[text] = (name, width)
         self._at_port(last)
 
@@ -564,10 +590,16 @@ class Emitter:
         if text in self.latched:
             name, width = self.latched[text]
             return _whole(name, width, want)
+        header = self._in_header(text)
+        if header is not None:
+            return _slice(self._header_word(header[0]), 8 * header[1], 8 * header[2], want)
         where = self._location(text)
         if where is not None:
             return _slice("a_dout", 8 * where[1], 8 * where[2], want)
         register = int(_REG.match(text).group(1))
+        if register in self.facts:  # one of the header's cells: its address, which nothing changes
+            assert self.header is not None
+            return _pad(f"{self.pointer_bits}'d{self.header + self.facts[register]}", self.pointer_bits, want)
         source = self.pending.get(register, register)
         if fn.widths[source] > want:
             name = fn.flop(source)
@@ -584,16 +616,19 @@ class Emitter:
         if where is not None:
             return 8 * where[2]
         register = int(_REG.match(text).group(1))
+        if register in self.facts:
+            return self.pointer_bits
         return fn.widths[self.pending.get(register, register)]
 
-    def _set(self, text: str, expression: str, width: int) -> str:
+    def _set(self, text: str, expression: str, width: int) -> tuple[str, str]:
         """`text` <= an expression of `width` bits. This is never a cell's capability, so it cannot
         be the register `loaded` names: those come from a dispatch, a move or a call."""
         fn = self.fn
         assert fn is not None
         register = int(_REG.match(text).group(1))
         self.pending.pop(register, None)
-        return f"{fn.flop(register)} <= {_pad(expression, width, fn.widths[register])};"
+        self.facts.pop(register, None)
+        return fn.flop(register), _pad(expression, width, fn.widths[register])
 
     # --- values
 
@@ -610,9 +645,12 @@ class Emitter:
         of the target reads the source."""
         target = int(_REG.match(a[0]).group(1))
         source = int(_REG.match(a[1]).group(1))
-        self._count("move", 0)
         real = self.pending.pop(source, source)
         self.pending[target] = real
+        if source in self.facts:
+            self.facts[target] = self.facts.pop(source)
+        else:
+            self.facts.pop(target, None)
         if self.loaded == source:
             self.loaded = target
         elif self.loaded == target:
@@ -626,7 +664,6 @@ class Emitter:
         self._step("copy", text, clocked=[self._set(a[0], value, width)])
 
     def i_drop(self, _text: str, a: list[str]) -> None:
-        self._count("drop", 0)
         self.pending.pop(int(_REG.match(a[0]).group(1)), None)
 
     def i_op(self, text: str, a: list[str]) -> None:
@@ -682,6 +719,9 @@ class Emitter:
         low = 8 * index
         if text in self.latched:
             return f"{self.latched[text][0]}[{low + 7}:{low}]"
+        header = self._in_header(text)
+        if header is not None:
+            return _slice(self._header_word(header[0]), 8 * header[1] + low, 8, 8)
         where = self._location(text)
         if where is not None:
             return _slice("a_dout", 8 * where[1] + low, 8, 8)
@@ -773,7 +813,6 @@ class Emitter:
 
     def i_open(self, _text: str, _a: list[str]) -> None:
         """Nothing yet. If a field of it is named, that is when its word has to be at the port."""
-        self._count("open", 0)
 
     def i_read(self, text: str, a: list[str]) -> None:
         self._locations(a[1:2])
@@ -781,9 +820,16 @@ class Emitter:
         self._step("read", text, clocked=[self._set(a[0], self._value(a[1], width), width)])
 
     def i_take(self, text: str, a: list[str]) -> None:
+        """A link of the header is the next of its cells: the links between them are fixed, see `_header_write`."""
         self._locations(a[1:2])
         width = self.pointer_bits
+        header = self._in_header(a[1])
+        link = self.links.get(self.header_cells[header[0]]) if header is not None else None
+        following = header is not None and link is not None and link[:2] == header[1:]
         self._step("take", text, clocked=[self._set(a[0], self._value(a[1], width), width)])
+        if following:
+            assert header is not None
+            self.facts[int(_REG.match(a[0]).group(1))] = header[0] + 1
 
     def _sources_in_memory(self, p: int, sources: list[str]) -> list[str]:
         """The locations a constructor's sources name, written as locations."""
@@ -828,9 +874,41 @@ class Emitter:
             return []  # every field stayed: the cell does not change, and memory is not touched
         return [f"b_we = {CELL_BYTES}'h{enables:04x};", f"b_addr = {self._pointer(p)};", *data]
 
+    def _header_write(self, cell: int, ctor_id: str, tag: str, sources: list[str]) -> list[tuple[str, str]]:
+        """A build of a header cell: its word, with what the build stores in place of what was there, in the
+        clock of the instructions around it. A link is never stored, so the cells stay in their order."""
+        word = self._header_word(cell)
+        kept, stored = (1 << CELL_BITS) - 1, []
+        for source, (offset, size, _type) in zip(sources, self.ctors[ctor_id].fields):
+            if source in ("=", "*") or source.endswith("!"):
+                continue
+            if self.links.get(ctor_id, (None, None))[:2] == (offset, size):
+                raise RTError(f"a build stores a link of the header's cell {cell}, whose links are fixed")
+            width = 8 * size
+            inner, computed = _INNER.match(source), _FUNC.match(source)
+            if inner:
+                value = _slice(word, 8 * int(inner.group(1)), 8 * int(inner.group(2)), width)
+            elif computed:
+                name, old_offset, old_size, operand = computed.groups()
+                value = (f"({_slice(word, 8 * int(old_offset), 8 * int(old_size), width)} {OPERATORS[name]} "
+                         f"{self._value(operand, width)})")
+            else:
+                value = self._value(source, width)
+            kept &= ~(((1 << width) - 1) << (8 * offset))
+            stored.append(f"({_pad(value, width, CELL_BITS)} << {8 * offset})" if offset else _pad(value, width, CELL_BITS))
+        if tag == "write":
+            raise RTError("a header cell is a record's, and a record has no tag")
+        if not stored:
+            return []  # every field stayed
+        return [(word, " | ".join([f"({word} & {CELL_BITS}'h{kept:032x})", *stored]))]
+
     def i_build(self, text: str, a: list[str]) -> None:
         p = int(_REG.match(a[0]).group(1))
         sources = a[3:]
+        if p in self.facts:
+            self._locations(sources)
+            self._step("build", text, clocked=self._header_write(self.facts[p], a[1], a[2], sources))
+            return
         self._locations(self._sources_in_memory(p, sources))
         ports = self._write(p, a[1], a[2], sources)
         self._step("build", text, ports=ports, writes=bool(ports))
@@ -857,6 +935,8 @@ class Emitter:
         tested, and its word is at port A's output in the next state, so a walk spends no extra
         clock per cell. If the pointer is null nothing is read, so what the port held still holds."""
         p = int(_REG.match(a[0]).group(1))
+        if p in self.facts:
+            raise RTError("a test of a header cell: the header is a record, and nothing tests one")
         pointer = self._pointer(p)
         zero = f"{self.pointer_bits}'d0"
         self._edge(a[1], self.loaded)
@@ -869,6 +949,8 @@ class Emitter:
         """The tag is in the cell, so unlike x86, whose compare reads memory itself, this needs the
         word first."""
         p = int(_REG.match(a[0]).group(1))
+        if p in self.facts:
+            raise RTError("a test of a header cell: the header is a record, and nothing tests one")
         self._at_port(p)
         self._edge(a[2], p)
         self._edge(a[3], p)
@@ -877,12 +959,12 @@ class Emitter:
 
     # --- calls and exits
 
-    def _parameters(self, callee: Function, operands: list[str]) -> list[str]:
+    def _parameters(self, callee: Function, operands: list[str]) -> list[tuple[str, str]]:
         """<= on every parameter, in one clock, each from what it was before the clock: so a swap,
         or any other cycle, is written out as it is and needs no scratch register."""
         fn = self.fn
         assert fn is not None
-        lines = []
+        writes = []
         for position, operand in enumerate(operands):
             width = callee.widths[position]
             if not width:
@@ -890,16 +972,19 @@ class Emitter:
             target = callee.flop(position)
             value = self._value(operand, width)
             if value != target:
-                lines.append(f"{target} <= {value};")
+                writes.append((target, value))
         if callee.at is not None and callee is not fn:
-            lines.append(f"{callee.name}_root <= {self._value(operands[callee.at], self.pointer_bits)};")
-        return lines
+            writes.append((f"{callee.name}_root", self._value(operands[callee.at], self.pointer_bits)))
+        return writes
 
     def i_call(self, text: str, a: list[str]) -> None:
         fn = self.fn
         assert fn is not None
         callee = self.functions[a[1]]
         operands = a[2:]
+        header = self.header is not None and callee.handler
+        if header and self.facts.get(int(_REG.match(operands[-2]).group(1)) if _REG.match(operands[-2]) else -1) != 0:
+            raise RTError("the turn gives its handler something other than the header, whose cells are registers")
         self._locations(operands)
         clocked = self._parameters(callee, operands)
         names = _args(a[0].strip("()")) if a[0].startswith("(") else [a[0]]
@@ -910,6 +995,9 @@ class Emitter:
             if self.loaded == register:
                 self.loaded = None
             self.pending.pop(register, None)
+            self.facts.pop(register, None)
+        if header:  # it returns what it was given: see i_ret
+            self.facts[int(_REG.match(names[-2]).group(1))] = 0
         callee.sites.append(site)
         fn.calls.append(callee)
         self._step("call", text, clocked=clocked, next_state=Enter(callee, site))
@@ -944,6 +1032,8 @@ class Emitter:
         callee = self._self_or_other(a[3 + count])
         operands = a[4 + count:]
         p = int(_REG.match(a[0]).group(1))
+        if p in self.facts:
+            raise RTError("tailmod of a header cell: nothing walks the header, whose cells are registers")
         self._locations(self._sources_in_memory(p, sources) + operands)
         ports = self._write(p, a[1], a[2], sources)
         clocked = self._parameters(callee, operands)
@@ -957,15 +1047,62 @@ class Emitter:
             values = [(f"{fn.name}_root", self.pointer_bits)]
         else:
             values = []
-            for operand in a:
+            for position, operand in enumerate(a):
                 if operand == "#0":  # a null: the one pointer no cell has
                     values.append((f"{self.pointer_bits}'d0", self.pointer_bits))
                     continue
                 register = int(_REG.match(operand).group(1))
+                if register in self.facts:
+                    values.append((self._value(operand, self.pointer_bits), self.pointer_bits))
+                    continue
                 source = self.pending.get(register, register)
                 values.append((fn.flop(source), fn.widths[source]))
+        if self.header is not None and (fn.handler or fn.turn):
+            self._gives_the_header_back(fn, a)
         self._step("ret", text, next_state=Return(values))
         self.open_path = False
+
+    def _header_text(self) -> list[str]:
+        """The header's cells, as registers behind the same two ports as the block RAM. The ports decode their
+        addresses, so what reaches a header cell through them, a host's write or a read of a pointer the emitter
+        could not place, reads and writes the register, and nothing is unsound, only slower. What the emitter
+        could place reads and writes the registers directly, in the clock of the code around it."""
+        assert self.header is not None
+        p, first, last = self.pointer_bits, self.header, self.header + len(self.header_cells) - 1
+        words = [self._header_word(cell) for cell in range(len(self.header_cells))]
+        out = [f"    // The header: cells {first} to {last}, the record a turn gives its handler, as registers. A "
+               f"block-RAM word", "    // at each of those addresses is never read or written."]
+        out.append(f"    wire header_a = a_addr >= {p}'d{first} && a_addr <= {p}'d{last};")
+        out.append(f"    wire header_b = b_addr >= {p}'d{first} && b_addr <= {p}'d{last};")
+        bits = ", ".join(f"{{8{{b_we[{lane}]}}}}" for lane in reversed(range(CELL_BYTES)))
+        out.append(f"    wire [{CELL_BITS - 1}:0] b_bits = {{{bits}}};")
+        out.append(f"    reg [{CELL_BITS - 1}:0] cells_dout, header_dout;")
+        out.append("    reg header_hit;")
+        out.append(f"    wire [{CELL_BITS - 1}:0] a_dout = header_hit ? header_dout : cells_dout;")
+        out.append("    assign host_dout = a_dout;")
+        out.append(f"    wire [{CELL_BITS - 1}:0] header [{first}:{last}];  // for a testbench to look at")
+        for cell, word in enumerate(words):
+            out.append(f"    assign header[{first + cell}] = {word};")
+        out.append("    always @(posedge clk) begin")
+        out.append("        if (a_en) cells_dout <= cells[a_addr];")
+        out.append(f"        for (lane = 0; lane < {CELL_BYTES}; lane = lane + 1)")
+        out.append("            if (b_we[lane] && !header_b) cells[b_addr][8 * lane +: 8] <= b_din[8 * lane +: 8];")
+        out.append("    end")
+        choice = f"{CELL_BITS}'d0"
+        for cell, word in reversed(list(enumerate(words))):
+            choice = f"a_addr == {p}'d{first + cell} ? {word} : {choice}"
+        out.append(f"    always @(posedge clk) if (a_en) begin header_hit <= header_a; header_dout <= {choice}; end")
+        return out
+
+    def _gives_the_header_back(self, fn: Function, operands: list[str]) -> None:
+        """The handler returns the record it was given, and the turn returns ingress's: so on the next turn it is
+        the header again, at the same address, and what this emitter knows of it holds by induction."""
+        members = [self._resolve(member) for member in self._results(fn.ret)]
+        position = len(members) - 2 if fn.handler else members.index(self.header_type)
+        register = _REG.match(operands[position])
+        if register is None or self.facts.get(int(register.group(1))) != 0:
+            raise RTError(f"{fn.name} returns something other than the header as its {position}th result, and "
+                          f"the header's cells are registers that stay where they are")
 
     # --- the whole machine
 
@@ -979,19 +1116,7 @@ class Emitter:
                     waiting.append(callee)
         return [fn for fn in self.functions.values() if fn.ordinal in seen]
 
-    def _timing(self, handler: Function, functions: list[Function]) -> Timing:
-        walking: set[str] = set()
-        waiting = [fn for fn in functions if fn.recursive]
-        while waiting:
-            fn = waiting.pop()
-            if fn.ordinal not in walking:
-                walking.add(fn.ordinal)
-                waiting.extend(fn.calls)
-        k = max((cost for fn in functions if fn.ordinal in walking for _kind, cost in fn.costs), default=1)
-        c = self._hardware_states(handler, walking, {})
-        kinds = []
-        for kind, (low, high, count) in sorted(self.kinds.items()):
-            kinds.append((kind, 0 if kind in NO_WORK else 1, low, high, count))
+    def _timing(self, functions: list[Function], clocks: Bound) -> Timing:
         spans: dict[str, tuple[Span, Span]] = {}
         iterations = []
         for fn in functions:  # a callee comes before its caller
@@ -999,7 +1124,84 @@ class Emitter:
             if fn.recursive:
                 iterations.append((fn.name, *spans[fn.ordinal]))
         total = sum(len(fn.states) for fn in functions) + 1
-        return Timing(max(1, k), c, tuple(kinds), tuple(iterations), total)
+        return Timing(clocks, tuple(iterations), total)
+
+    def _clocks(self, handler: Function, costs: collections.Counter, n_max: Optional[int],
+                sizes: Optional[dict]) -> Bound:
+        """The certificate again, with every instruction charged the clocks this machine spends on it in place
+        of its step: the same inequalities, and other numbers in them."""
+        checker = Checker(costs)
+        for line in self.lines:
+            checker.feed(line)
+        checker.finish()
+        if handler.turn:
+            assert sizes is not None
+            return certify_turn(checker, handler.name, sizes)
+        assert n_max is not None
+        return certify(checker, handler.name, n_max)
+
+    @staticmethod
+    def _goes_on(state: State) -> bool:
+        """The next state can share its clock: it falls through, and it enables no read, whose word would come
+        back only in the next clock. A write may: nothing after it can read that cell without a read of its own."""
+        return state.next == FALL and not any(line.startswith("a_") or "_en =" in line for line in state.ports)
+
+    def _join(self, fn: Function, entered: set) -> None:
+        """Straight-line code as one clock: each state is joined with the one after it while it goes on, the
+        next is entered from nowhere else, and the clock touches memory once at most. Nothing moves: the states
+        are taken in the order they were written."""
+        widths = {fn.flop(register): width for register, width in fn.widths.items() if width}
+        widths.update(dict(fn.temporaries))
+        widths.update({self._header_word(cell): CELL_BITS for cell in range(len(self.header_cells))})
+        joined: list[State] = []
+        renumber: dict[int, int] = {}
+        index = 0
+        while index < len(fn.states):
+            first = index
+            touched = bool(fn.states[index].ports)
+            while (index + 1 < len(fn.states) and self._goes_on(fn.states[index])
+                   and fn.states[index + 1].name not in entered and not (touched and fn.states[index + 1].ports)):
+                index += 1
+                touched = touched or bool(fn.states[index].ports)
+            renumber[first] = len(joined)
+            run = fn.states[first:index + 1]
+            joined.append(run[0] if len(run) == 1 else self._one_clock(fn, run, widths))
+            index += 1
+        fn.labels = {label: renumber[position] for label, position in fn.labels.items()}
+        fn.states = joined
+
+    def _one_clock(self, fn: Function, run: list[State], widths: dict) -> State:
+        """States that run one after another with at most one memory access between them, as one. A register
+        gets the last value written to it, and a value one of them computes that a later one reads is a wire."""
+        values: dict[str, str] = {}  # each register written so far, and the expression of its newest value
+        carried: dict[str, str] = {}  # the wire carrying that value, once something later in the clock reads it
+
+        def read(text: str) -> str:
+            for target, expression in values.items():
+                if target not in carried and re.search(rf"\b{re.escape(target)}\b", text):
+                    carried[target] = f"{fn.name}_w{len(fn.wires)}"
+                    fn.wires.append((carried[target], widths[target], expression))
+                    if target in self.cut:  # what is read of it in part is read of the wire now
+                        self.cut[carried[target]] = self.cut[target]
+            return _renamed(text, carried)
+
+        ports: list[str] = []
+        for state in run:
+            ports += [read(line) for line in state.ports]
+            writes = [(target, read(expression)) for target, expression in state.clocked]
+            for target, expression in writes:  # every expression of a state reads what held before it
+                values[target] = expression
+                carried.pop(target, None)
+        following = run[-1].next
+        if isinstance(following, Choice):
+            following = Choice(read(following.condition), following.yes, following.no)
+        elif isinstance(following, Return):
+            following = Return([(read(expression), width) for expression, width in following.values])
+        final = [(target, carried.get(target, expression)) for target, expression in values.items()]
+        reads, writes_memory = any(s.reads for s in run), any(s.writes for s in run)
+        assert not (reads and writes_memory), [s.comment for s in run]
+        return State(run[0].name, "; ".join(state.comment for state in run), final, ports, following,
+                     all(s.hardware for s in run), reads, writes_memory, run[0].line)
 
     @staticmethod
     def _successors(fn: Function, index: int) -> list[int]:
@@ -1011,24 +1213,6 @@ class Emitter:
             return []
         targets = [following.yes, following.no] if isinstance(following, Choice) else [following]
         return [index + 1 if target == FALL else fn.labels[target] for target in targets]
-
-    def _hardware_states(self, fn: Function, walking: set[str], known: dict[str, int]) -> int:
-        """The most hardware-only states on any path through code outside a walk. Edges only go
-        forward there, so one pass from the last state back finds it."""
-        if fn.ordinal in walking:
-            return 0  # all of it is in k
-        if fn.ordinal in known:
-            return known[fn.ordinal]
-        best = [0] * len(fn.states)
-        for index in range(len(fn.states) - 1, -1, -1):
-            state = fn.states[index]
-            own = 1 if state.hardware else 0
-            if isinstance(state.next, Enter):
-                own += self._hardware_states(state.next.callee, walking, known)
-            after = [best[s] for s in self._successors(fn, index)]
-            best[index] = own + (max(after) if after else 0)
-        known[fn.ordinal] = best[0]
-        return best[0]
 
     def _spans(self, fn: Function, known: dict[str, tuple[Span, Span]]) -> tuple[Span, Span]:
         """Cycles along each kind of path from the entry: those that come back to it (an iteration),
@@ -1069,8 +1253,10 @@ class Emitter:
             leave[index] = plus(join([leave[s] for s in successors]), cost)
         return (loop[0] or Span(0, 0), leave[0] or Span(0, 0))
 
-    def render(self, handler: Function, module: str, bound: Bound, cells: int,
-               initial: dict[str, str]) -> Translation:
+    def render(self, handler: Function, module: str, bound: Bound, cells: int, initial: dict[str, str], *,
+               n_max: Optional[int] = None, sizes: Optional[dict] = None) -> Translation:
+        """The machine, and its bound in clocks: a handler's for items of up to `n_max` cells, a turn's with
+        `sizes` saying how many cells each sized parameter holds, as src/certify.py's certify_turn."""
         functions = self._reachable(handler)
         kept = {fn.ordinal for fn in functions}
         for fn in functions:  # a function the handler never reaches is not in the machine
@@ -1091,11 +1277,17 @@ class Emitter:
                 for inherited in fn.sites:
                     if inherited not in callee.sites:
                         callee.sites.append(inherited)
-        timing = self._timing(handler, functions)
         for fn in functions:
             for state in fn.states:
                 if state.reads and state.writes:
                     raise RTError(f"{state.name} ({state.comment}) both reads and writes the cell store")
+        entered = {f.states[index].name for f in functions for index in f.labels.values()}
+        entered |= {site.state for f in functions for site in f.sites}
+        for fn in functions:
+            self._join(fn, entered)
+        costs = collections.Counter(state.line for fn in functions for state in fn.states)
+        assert None not in costs, "a state is charged to no instruction"
+        timing = self._timing(functions, self._clocks(handler, costs, n_max, sizes))
         memories = {name: _hex_lines(data, self._array_of(ty)) for (name, ty), data in
                     ((slot, initial[slot[0]]) for slot in self.slots if slot[0] in initial)}
         text = self._text(handler, functions, module, cells, timing, memories, bound)
@@ -1109,9 +1301,11 @@ class Emitter:
         out: list[str] = []
         add = out.append
         add("// Generated by src/rtverilog.py from the checked RT stream. Do not edit.")
-        add(f"// {module}: {timing.states} states, one RT instruction each but for what is marked.")
-        add(f"// cycles(n) <= {timing.k}*W(n) + {timing.c}, with W(n) = {_linear(bound.c, bound.d)}, counted from the edge")
-        add("// that samples start to the edge that raises done.")
+        add(f"// {module}: {timing.states} states, a clock each. Straight-line code is one state: a clock ends only at a")
+        add("// block-RAM access, a branch or jump, a call or return, or a label another path reaches.")
+        add(f"// clocks(n) <= {_linear(timing.clocks.c, timing.clocks.d)}, certified as W(n) = {_linear(bound.c, bound.d)} "
+            f"steps is, counted")
+        add("// from the edge that samples start to the edge that raises done.")
         add("`timescale 1ns/1ns")
         add("`default_nettype none")
         add(f"module {module} (")
@@ -1149,8 +1343,9 @@ class Emitter:
         add("")
         add("    // Every RT register is a flip-flop bank. A function's are static: nothing recurses but")
         add("    // by jumping to its own entry, so no function is ever active twice.")
-        bodies = {state.name: list(state.clocked) + self._transition(fn, index)
-                  for fn in functions for index, state in enumerate(fn.states)}
+        bodies = {state.name: [f"{target} <= {expression};" for target, expression in state.clocked]
+                  + self._transition(fn, index) for fn in functions for index, state in enumerate(fn.states)}
+        wires = {name: expression for fn in functions for name, _width, expression in fn.wires}
         declared = []
         for fn in functions:
             for register, width in sorted(fn.widths.items()):
@@ -1160,18 +1355,17 @@ class Emitter:
             if fn.at is not None:
                 declared.append((f"{fn.name}_root", p))
         entry = self._entry(handler)
-        written_only = _written_only(declared, bodies, entry, functions)
+        written_only, unread = _written_only(declared, bodies, entry, functions, wires)
         for fn in functions:
             for name, width in declared:
                 if name not in written_only and (name.startswith(fn.name + "_r") or name.startswith(fn.name + "_t")):
                     add(f"    reg {_range(width)}{name};")
             if len(fn.sites) > 1:
                 add(f"    reg [{state_bits - 1}:0] {fn.name}_ret;")
-        kept = [f"{name}[{width - 1}:{low}]" for name, (low, width) in sorted(self.cut.items())
-                if name not in written_only and any(name.startswith(fn.name + "_r") for fn in functions)]
-        if kept:
-            add("    // What a truncation throws away. RT says to compute it, and nothing reads it.")
-            add(f"    wire unused_bits = &{{1'b0, {', '.join(kept)}}};")
+        if self.header is not None:
+            add("    // The header's cells, a register each: see below where the ports reach them.")
+            for cell in range(len(self.header_cells)):
+                add(f"    reg [{CELL_BITS - 1}:0] {self._header_word(cell)};")
         add("")
         add(f"    // The cell store: {cells} cells, and word 0, which is null and never a cell. One block")
         add("    // RAM: port A reads, and its output holds until the next read; port B writes, a byte")
@@ -1181,17 +1375,20 @@ class Emitter:
         add(f"    reg [{CELL_BITS - 1}:0] cells [0:{cells}];")
         add("    reg a_en;")
         add(f"    reg [{p - 1}:0] a_addr;")
-        add(f"    reg [{CELL_BITS - 1}:0] a_dout;")
         add(f"    reg [{CELL_BYTES - 1}:0] b_we;")
         add(f"    reg [{p - 1}:0] b_addr;")
         add(f"    reg [{CELL_BITS - 1}:0] b_din;")
-        add("    assign host_dout = a_dout;")
         add("    integer lane;")
-        add("    always @(posedge clk) begin")
-        add("        if (a_en) a_dout <= cells[a_addr];")
-        add(f"        for (lane = 0; lane < {CELL_BYTES}; lane = lane + 1)")
-        add("            if (b_we[lane]) cells[b_addr][8 * lane +: 8] <= b_din[8 * lane +: 8];")
-        add("    end")
+        if self.header is None:
+            add(f"    reg [{CELL_BITS - 1}:0] a_dout;")
+            add("    assign host_dout = a_dout;")
+            add("    always @(posedge clk) begin")
+            add("        if (a_en) a_dout <= cells[a_addr];")
+            add(f"        for (lane = 0; lane < {CELL_BYTES}; lane = lane + 1)")
+            add("            if (b_we[lane]) cells[b_addr][8 * lane +: 8] <= b_din[8 * lane +: 8];")
+            add("    end")
+        else:
+            out.extend(self._header_text())
         for name, ty in self.slots:
             array = self._array_of(ty)
             assert array is not None
@@ -1209,6 +1406,20 @@ class Emitter:
                 add(f"    initial for ({name}_word = 0; {name}_word < {array[1]}; {name}_word = {name}_word + 1)")
                 add(f"        {name}_mem[{name}_word] = {width}'d0;")
             add(f"    always @(posedge clk) if ({name}_en) {name}_dout <= {name}_mem[{name}_addr];")
+        live = [(name, width, expression) for fn in functions for name, width, expression in fn.wires
+                if name not in unread]
+        if live:
+            add("")
+            add("    // What a state computes for a later instruction in the same clock: logic, settled within it.")
+            for name, width, expression in live:
+                add(f"    wire {_range(width)}{name} = {expression};")
+        kept = [f"{name}[{width - 1}:{low}]" for name, (low, width) in sorted(self.cut.items())
+                if name not in written_only and name not in unread
+                and any(name.startswith((fn.name + "_r", fn.name + "_w")) for fn in functions)
+                and (name in wires or any(name == declared_name for declared_name, _width in declared))]
+        if kept:
+            add("    // What a truncation throws away. RT says to compute it, and nothing reads it.")
+            add(f"    wire unused_bits = &{{1'b0, {', '.join(kept)}}};")
         add("")
         add("    // What each state drives on the memory ports, in the clock it is the state.")
         add("    always @* begin")
@@ -1243,6 +1454,13 @@ class Emitter:
         add("    // The machine. Every <= in one state happens at one edge, from what held before it.")
         add("    always @(posedge clk) begin")
         add("        done <= 1'b0;")
+        if self.header is not None:  # what the ports write to a header cell, the host's included
+            add("        if (header_b) case (b_addr)")
+            for cell in range(len(self.header_cells)):
+                word = self._header_word(cell)
+                add(f"            {p}'d{self.header + cell}: {word} <= ({word} & ~b_bits) | (b_din & b_bits);")
+            add("            default: ;")
+            add("        endcase")
         add("        if (rst) state <= IDLE;")
         add("        else case (state)")
         add("            IDLE: if (start) begin")
@@ -1339,25 +1557,38 @@ class Emitter:
         return lines
 
 
-def _written_only(declared: list, bodies: dict, entry: list, functions: list) -> set[str]:
+def _written_only(declared: list, bodies: dict, entry: list, functions: list, wires: dict) -> tuple[set, set]:
     """Registers RT writes and nothing reads, such as the null an `@` function's `ret` names when it
-    returns its root. They need no flip-flops. Their states stay: RT charged for them."""
+    returns its root, or a value a joined state used in its own clock and nothing after it does. They need
+    no flip-flops. And wires nothing reads, once those are gone. Their states stay: their clocks were charged."""
     dead: set[str] = set()
+    unread: set[str] = set()
     while True:
         lines = [line for body in bodies.values() for line in body] + entry
         lines += [line for fn in functions for state in fn.states for line in state.ports]
+        lines += [expression for name, expression in wires.items() if name not in unread]
         text = "\n".join(lines)
         # A write is a statement, so it starts a line or follows a space. `(r <= 94)` is a comparison, and a read.
         found = {name for name, _width in declared if name not in dead
                  and len(re.findall(rf"\b{name}\b", text)) == len(re.findall(rf"(?:^|(?<=\s)){name} <= ", text, re.M))}
-        if not found:
-            return dead
+        orphans = {name for name in wires if name not in unread and not re.search(rf"\b{name}\b", text)}
+        if not found and not orphans:
+            return dead, unread
         dead |= found
+        unread |= orphans
         for name in found:
             pattern = re.compile(rf"(^|(?<=\s)){name} <= [^;]*;\s*")
             for state_name, body in bodies.items():
                 bodies[state_name] = [kept for kept in (pattern.sub("", line) for line in body) if kept.strip()]
             entry[:] = [kept for kept in (pattern.sub("", line) for line in entry) if kept.strip()]
+
+
+def _renamed(text: str, env: dict) -> str:
+    """`text` with each register `env` names read as the value it was given earlier in the same clock."""
+    if not env:
+        return text
+    names = "|".join(re.escape(name) for name in sorted(env, key=len, reverse=True))
+    return re.sub(rf"\b({names})\b", lambda match: env[match.group(1)], text)
 
 
 def _range(width: int) -> str:
@@ -1400,7 +1631,7 @@ def translate(lines: Iterable[str], *, n_max: int = 216, k_out: int = 64, cells:
         emitter.feed(line)
     handler = next(f for f in emitter.functions.values() if f.handler)
     module = name + "_handler" if name in KEYWORDS else name
-    return emitter.render(handler, module, bound, count, initial or {})
+    return emitter.render(handler, module, bound, count, initial or {}, n_max=n_max)
 
 
 def main(argv: list[str]) -> int:

@@ -1,6 +1,6 @@
 // Drives src/machine.py's machine: frames in as bytes, and what comes out printed as it leaves.
 //
-//   iverilog -g2005 -DCELLS=1310 -o sim tests/tb_machine.v machine.v serve_core.v
+//   iverilog -g2005 -DCELLS=1310 -DPARTS=5 -o sim tests/tb_machine.v machine.v serve_core.v
 //   vvp sim +frames=frames.txt          (in the directory that holds cells.mem)
 //
 // frames.txt has a frame to a line: `hold length byte byte ...`, in hex bytes. With hold set, egress is held still
@@ -12,6 +12,9 @@
 
 `ifndef CELLS
  `define CELLS 1310
+`endif
+`ifndef PARTS
+ `define PARTS 5
 `endif
 
 module tb;
@@ -60,7 +63,7 @@ module tb;
                 $finish(0);
             end
             if (out_last) begin
-                $write("\n");
+                $write(" %0d\n", $time / 10);  // the clock its last byte left in
                 out_bytes = 0;
                 frames_out = frames_out + 1;
                 if (frames_out > frames_in) begin
@@ -69,7 +72,7 @@ module tb;
                 end
             end
         end
-        if (turn_done) $display("TURN %0d %0d", turn_outcome, turn_cycles);
+        if (turn_done) $display("TURN %0d %0d %0d", turn_outcome, turn_cycles, $time / 10);
     end
 
     reg [1023:0] path;
@@ -105,8 +108,8 @@ module tb;
             idle = (dut.state == 5'd0 && dut.head == 0 && !out_valid && !dut.draining) ? idle + 1 : 0;
         end
         $display("FINAL %0d %0d %0d %0d %0d %0d %0d", dut.pool, dut.slot, dut.head, dut.queue, overruns, faults, cuts);
-        for (index = 1; index <= `CELLS; index = index + 1)
-            $display("WORD %0d %032x", index, dut.core.cells[index]);
+        for (index = 1; index <= `CELLS; index = index + 1)  // ingress's record is in registers, cells 1 to PARTS
+            $display("WORD %0d %032x", index, index <= `PARTS ? dut.core.header[index] : dut.core.cells[index]);
         $display("DONE");
         $finish(0);
     end
