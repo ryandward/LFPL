@@ -1,0 +1,69 @@
+# examples/ipv4.lfpl with a stateless firewall in front of its forwarding: a TCP or UDP frame to port 23 or 445 is
+# dropped, and every other frame goes where ipv4.lfpl sends it, changed as ipv4.lfpl changes it.
+#
+# The ports are the first four bytes after the IP header, and the header is 20 bytes, since anything else is
+# refused as malformed. So they are fields of the record, read like the rest, and the record is 38 bytes on the wire
+# where ipv4.lfpl's is 34: a frame shorter than that is refused before the handler runs.
+data Bytes;
+record Frame {
+  dst_hi: Be32, dst_lo: Be16, src_hi: Be32, src_lo: Be16, ethertype: Be16,
+  version: Int8, tos: Int8, total: Be16, id: Be16, frag: Be16,
+  ttl: Int8, proto: Int8, sum: Be16, source: Be32, destination: Be32,
+  src_port: Be16, dst_port: Be16,
+  length: Int16,
+  body: Bytes
+};
+
+# Blocked is the firewall's: a frame it drops by its port, which ipv4.lfpl would have sent.
+enum Verdict = Malformed | Expired | Blocked | Send(port: Int8);
+
+# End-around carry.
+fn fold(s: Int64) : Int64 = +(&(s, 0xFFFF), >>(s, 16));
+
+fn halves(x: Int32) : Int64 = +(>>(pack<32>(x), 16), &(pack<32>(x), 0xFFFF));
+
+# 0x0800 is IPv4, and 0x45 is version 4 with 5 words of header. Ten 16-bit words add up to at most 0x9FFF6, so one
+# fold gives at most 0x10008. Anything above 0xFFFF would fold again to at most 9, and so could not have been
+# 0xFFFF: one fold is enough to tell.
+fn well_formed(ethertype: Int16, version: Int8, total: Int16, length: Int16, words: Int64) : Bool =
+  if !=(ethertype, 0x0800) then false
+  else if !=(version, 0x45) then false
+  else if <(total, 20) then false
+  else if >(+(pack<16>(total), 14), pack<16>(length)) then false
+  else ==(fold(words), 0xFFFF);
+
+# TCP is protocol 6 and UDP is 17. A fragment after the first carries no ports, and the first one, which does, is
+# the one checked: so the ports are read only from a fragment at offset 0.
+fn has_ports(proto: Int8, frag: Int16) : Bool = &&(||(==(proto, 6), ==(proto, 17)), ==(&(frag, 0x1FFF), 0));
+
+# Telnet, and SMB.
+fn closed(port: Int16) : Bool = ||(==(port, 23), ==(port, 445));
+
+# RFC 1624, equation 3, on the word holding the TTL and the protocol: HC' = ~(~HC + ~m + m'), and m' = m - 0x100. The
+# TTL is at least 2 here, so ~m + m' is 0xFEFF whatever m is. Added to ~HC that is at most 0x1FEFE: one fold is enough.
+fn patched(sum: Int16, ttl: Int8, proto: Int8) : Int16 =
+  let m = pack<8,8>(ttl, proto) in
+  low16(^(fold(+(^(pack<16>(sum), 0xFFFF), +(^(m, 0xFFFF), -(m, 0x100)))), 0xFFFF));
+
+# The next hop, by the top two bits of the destination. It is also the port the frame leaves by.
+fn next_hop(destination: Int32) : Int8 = low8(>>(destination, 30));
+
+handler firewall(f: Frame, free: Free) : (Verdict, Frame, Free) =
+  match f with Frame(d, dst_hi, dst_lo, src_hi, src_lo, ethertype, version, tos, total, id, frag,
+                     ttl, proto, sum, source, destination, src_port, dst_port, length, body) =>
+    let words = +(pack<8,8>(version, tos), +(pack<16>(total), +(pack<16>(id), +(pack<16>(frag),
+                +(pack<8,8>(ttl, proto), +(pack<16>(sum), +(halves(source), halves(destination)))))))) in
+    let ports = has_ports(proto, frag) in
+    if !(well_formed(ethertype, version, total, length, words)) then (Malformed, Frame@d {}, free)
+    # The ports are in the frame either way, and a datagram whose IP length leaves them out has none to check.
+    else if &&(ports, <(total, 24)) then (Malformed, Frame@d {}, free)
+    else if &&(ports, closed(dst_port)) then (Blocked, Frame@d {}, free)
+    else if <=(ttl, 1) then (Expired, Frame@d {}, free)
+    else
+      # The addresses: 02:00:00:00:00:1h and 02:00:00:00:01:1h, for hop h. The TTL and the checksum change, and
+      # every other field stays where it is: nothing here moves the frame.
+      let hop = next_hop(destination) in
+      (Send(hop), Frame@d { dst_hi = 0x02000000, dst_lo = low16(+(pack<8>(hop), 0x10)),
+                            src_hi = 0x02000000, src_lo = low16(+(pack<8>(hop), 0x110)),
+                            ttl = -(ttl, 1), sum = patched(sum, ttl, proto) }, free)
+  end;

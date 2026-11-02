@@ -1,0 +1,95 @@
+# examples/ipv4.lfpl's forwarding, and before it the UDP checksum of every datagram that has one, over the
+# pseudo-header, the UDP header and every byte of the payload: a frame whose checksum is wrong is dropped.
+#
+# This is written for the slot design, which does not exist yet, and it does not compile. The payload is not a chain
+# of cells but one slot of N_max consecutive cells, which the frame owns whole: its bytes are in order, from a base
+# and for a length within the slot, and `body[i]` reads byte i of them, with i a Fin counting down. The headers,
+# the UDP one with them, are a record, as in ipv4.lfpl, 42 bytes on the wire.
+slot Payload;
+record Frame {
+  dst_hi: Be32, dst_lo: Be16, src_hi: Be32, src_lo: Be16, ethertype: Be16,
+  version: Int8, tos: Int8, total: Be16, id: Be16, frag: Be16,
+  ttl: Int8, proto: Int8, sum: Be16, source: Be32, destination: Be32,
+  src_port: Be16, dst_port: Be16, ulen: Be16, usum: Be16,
+  length: Int16,
+  body: Payload
+};
+
+# Corrupt is this program's: a datagram whose UDP checksum is wrong, which ipv4.lfpl would have sent.
+enum Verdict = Malformed | Expired | Corrupt | Send(port: Int8);
+
+# What the UDP check found. Broken is a UDP length that does not agree with the IP length, or a payload shorter
+# than it says.
+enum Check = Fine | Broken | Wrong;
+
+# End-around carry.
+fn fold(s: Int64) : Int64 = +(&(s, 0xFFFF), >>(s, 16));
+
+fn halves(x: Int32) : Int64 = +(>>(pack<32>(x), 16), &(pack<32>(x), 0xFFFF));
+
+# As in ipv4.lfpl.
+fn well_formed(ethertype: Int16, version: Int8, total: Int16, length: Int16, words: Int64) : Bool =
+  if !=(ethertype, 0x0800) then false
+  else if !=(version, 0x45) then false
+  else if <(total, 20) then false
+  else if >(+(pack<16>(total), 14), pack<16>(length)) then false
+  else ==(fold(words), 0xFFFF);
+
+# The payload from byte i down to byte 0, each in its place in a 16-bit word in network order: a byte at an even
+# position is the high half of its word, and one at an odd position the low half. `high` says which byte i is, and
+# flips as i counts down. An odd byte at the end is the high half of a word whose low half is zero, as RFC 768 pads.
+fn add_up(body: Payload, i: Fin Payload, high: Bool, acc: Int64) : (Payload, Int64) =
+  let more = +(acc, if high then <<(pack<8>(body[i]), 8) else pack<8>(body[i])) in
+  match i with
+  | 0 => (body, more)
+  | down(j) => add_up(body, j, !(high), more)
+  end;
+
+# The first `bytes` bytes of the payload, summed: the last of them is byte bytes - 1, which is high if bytes is odd.
+fn payload_sum(body: Payload, bytes: Int16) : (Payload, Int64) =
+  if ==(bytes, 0) then (body, 0)
+  else add_up(body, idx(-(bytes, 1), Payload), ==(&(bytes, 1), 1), 0);
+
+# Only a datagram in one frame can be checked, since its checksum covers all of it, and only one whose checksum is
+# not 0, which the sender uses to say it computed none. `head` is the pseudo-header and the UDP header, summed. The
+# payload's words come to at most 1472 / 2 times 0xFFFF, and the headers' to 9 more of them: below 2^26, so one fold
+# gives at most 0x103FE, and a second at most 0xFFFF.
+fn verified(body: Payload, checkable: Bool, total: Int16, ulen: Int16, head: Int64) : (Payload, Check) =
+  if !(checkable) then (body, Fine)
+  else if ||(<(ulen, 8), !=(ulen, -(total, 20))) then (body, Broken)
+  else if <(len(body), -(ulen, 8)) then (body, Broken)
+  else let (rest, data) = payload_sum(body, -(ulen, 8)) in
+    (rest, if ==(fold(fold(+(head, data))), 0xFFFF) then Fine else Wrong);
+
+# As in ipv4.lfpl.
+fn patched(sum: Int16, ttl: Int8, proto: Int8) : Int16 =
+  let m = pack<8,8>(ttl, proto) in
+  low16(^(fold(+(^(pack<16>(sum), 0xFFFF), +(^(m, 0xFFFF), -(m, 0x100)))), 0xFFFF));
+
+fn next_hop(destination: Int32) : Int8 = low8(>>(destination, 30));
+
+handler udp_verify(f: Frame, free: Free) : (Verdict, Frame, Free) =
+  match f with Frame(d, dst_hi, dst_lo, src_hi, src_lo, ethertype, version, tos, total, id, frag,
+                     ttl, proto, sum, source, destination, src_port, dst_port, ulen, usum, length, body) =>
+    let words = +(pack<8,8>(version, tos), +(pack<16>(total), +(pack<16>(id), +(pack<16>(frag),
+                +(pack<8,8>(ttl, proto), +(pack<16>(sum), +(halves(source), halves(destination)))))))) in
+    # UDP is protocol 17. 0x3FFF is the fragment offset and the bit that says more fragments follow.
+    let checkable = &&(==(proto, 17), &&(==(&(frag, 0x3FFF), 0), !=(usum, 0))) in
+    # The pseudo-header: the addresses, the protocol and the UDP length. Then the UDP header, its checksum in it.
+    let head = +(halves(source), +(halves(destination), +(17, +(pack<16>(ulen),
+               +(pack<16>(src_port), +(pack<16>(dst_port), +(pack<16>(ulen), pack<16>(usum)))))))) in
+    if !(well_formed(ethertype, version, total, length, words)) then (Malformed, Frame@d {}, free)
+    else
+      let (rest, check) = verified(body, checkable, total, ulen, head) in
+      match check with
+      | Broken => (Malformed, Frame@d { body = rest }, free)
+      | Wrong => (Corrupt, Frame@d { body = rest }, free)
+      | Fine =>
+          if <=(ttl, 1) then (Expired, Frame@d { body = rest }, free)
+          else
+            let hop = next_hop(destination) in
+            (Send(hop), Frame@d { dst_hi = 0x02000000, dst_lo = low16(+(pack<8>(hop), 0x10)),
+                                  src_hi = 0x02000000, src_lo = low16(+(pack<8>(hop), 0x110)),
+                                  ttl = -(ttl, 1), sum = patched(sum, ttl, proto), body = rest }, free)
+      end
+  end;
