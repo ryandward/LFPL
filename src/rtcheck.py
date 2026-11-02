@@ -1315,10 +1315,9 @@ class Checker:
             fn.makes_a_free = fn.makes_a_free or callee.makes_a_free
         for row in callee.obligations:
             self.obligate(Budget(tuple(sorted((copy(u), c) for u, c in row.terms)), row.cells, row.steps))
-        if not (fn.turn and callee.handler):  # a turn hands its handler a reserve of R(n) cells: DRAW holds there
-            for row in callee.beyond_end:
-                self.obligate(Budget(tuple(sorted((copy(u), c) for u, c in row.terms)), row.cells, row.steps),
-                              beyond_end=True)
+        for row in callee.beyond_end:
+            self.obligate(Budget(tuple(sorted((copy(u), c) for u, c in row.terms)), row.cells, row.steps),
+                          beyond_end=True)
         return replace(callee, entry=copy(callee.entry),
                        param_pots=[copy_pot(pot) for pot in callee.param_pots],
                        result_pots=[copy_pot(pot) for pot in callee.result_pots])

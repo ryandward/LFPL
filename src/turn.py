@@ -44,15 +44,16 @@ class Shape:
     parts: int                # the cells of the record itself
     wire: int                 # bytes of it on the wire
     capacity: int             # the most bytes a frame in ingress can have: what N_max cells hold
-    n_max: int
-    k_out: int
+    n_max: int                # the most cells a frame takes in
+    n_out: int                # and the most an output can hold going out
+    k_out: int                # outputs the queue holds: its head and the places after it
     verdicts: tuple           # (name, tag, the port's offset in the register, or None)
 
 
 def turn_source(program: bytes, *, n_max: int, k_out: int = 4) -> tuple[str, Shape]:
     """The handler's program with the turn appended, and what the machine needs to know about it."""
-    if k_out < 1:
-        raise TurnRefused(f"section 8.2: K_out of {k_out}: the queue has at least one place")
+    if k_out < 2:
+        raise TurnRefused(f"section 8.2: K_out of {k_out}: the queue has its head and at least one place after it")
     checker = Checker()
     for line in rt_lines(io.BytesIO(program)):
         checker.feed(line)
@@ -88,11 +89,13 @@ def turn_source(program: bytes, *, n_max: int, k_out: int = 4) -> tuple[str, Sha
     _no_clash(checker, {last, chunk} if definition else set())
     verdicts = _verdicts(checker, checker.types[verdict_type[1]])
     capacity = walk.wire_bytes + BODY_PAYLOAD * (n_max - parts)
-    if capacity >= 1 << 16:
-        raise TurnRefused(f"section 8.2: N_max of {n_max} holds {capacity} bytes, past what a 16-bit length counts")
+    if capacity + 1 >= 1 << 16:  # ingress counts a frame up to one byte past what it holds
+        raise TurnRefused(f"section 8.2: N_max of {n_max} holds {capacity} bytes, and one more is past what a 16-bit "
+                          f"length counts")
     text = _fill(handler.name, decl.name, fields, chain[0], chain_decl.name, last, chunk, definition, parts,
                  walk.wire_bytes, capacity, k_out, checker.types[verdict_type[1]])
-    shape = Shape(handler.name, decl.name, walk, parts, walk.wire_bytes, capacity, n_max, k_out, verdicts)
+    # The handler draws nothing, so what it sends is made of the cells it was given: no more than N_max.
+    shape = Shape(handler.name, decl.name, walk, parts, walk.wire_bytes, capacity, n_max, n_max, k_out, verdicts)
     return program.decode() + "\n" + text, shape
 
 
@@ -150,7 +153,7 @@ def _fill(handler: str, item: str, fields: list, chain: int, chain_type: str, la
           parts: int, wire: int, capacity: int, k_out: int, verdict: TypeDecl) -> str:
     binders = [f"x{index}" for index in range(len(fields))]
     cells = [f"c{index}" for index in range(parts)]
-    places = [f"q{index}" for index in range(k_out)]
+    places = [f"q{index}" for index in range(1, k_out)]  # after the head
 
     def nest(names: list, inner: str) -> str:
         for name in reversed(names):
@@ -165,33 +168,34 @@ def _fill(handler: str, item: str, fields: list, chain: int, chain_type: str, la
     taken = cells + ["e"]
     take, pools = [], ["pool0"] + [f"p{index}" for index in range(len(taken))]
     for index, name in enumerate(taken):
-        take.append(f"  match {pools[index]} with Dry => ({nest(taken[:index], 'Dry')}, slot, queue0, Short) "
+        take.append(f"  match {pools[index]} with Dry => ({nest(taken[:index], 'Dry')}, slot, head0, queue0, Short) "
                     f"| Cell({name}, {pools[index + 1]}) =>")
     zeros = []
     for index, (_name, ty) in enumerate(fields):
         zeros.append("refill(fresh, rest)" if index == chain else "false" if ty == "bool" else "0")
     built = cells[0] if parts == 1 else "(" + ", ".join(cells) + ")"
-    enqueue = []
+    enqueue, head = [], "Pending@h(port, frame)"
     for index, place in enumerate(places):
         kept = [f"{places[j]} = Pending@e{j}(p{j}, f{j})" for j in range(index)]
-        enqueue.append(f"  match {place} with None => (Queue@d {{ {', '.join(kept + [f'{place} = out'])} }}, None) "
-                       f"| Pending(e{index}, p{index}, f{index}) =>")
-    full = [f"{places[j]} = Pending@e{j}(p{j}, f{j})" for j in range(k_out)]
-    enqueue.append(f"    (Queue@d {{ {', '.join(full)} }}, out)" + " end" * (k_out + 1))
-    shifted = [f"{places[j]} = {places[j + 1]}" for j in range(k_out - 1)] + [f"{places[-1]} = None"]
+        enqueue.append(f"  match {place} with None => ({head}, Queue@d {{ {', '.join(kept + [f'{place} = out'])} }}, "
+                       f"None) | Pending(e{index}, p{index}, f{index}) =>")
+    full = [f"{places[j]} = Pending@e{j}(p{j}, f{j})" for j in range(len(places))]
+    enqueue.append(f"    ({head}, Queue@d {{ {', '.join(full)} }}, out)" + " end" * (len(places) + 2))
+    shifted = [f"{places[j]} = {places[j + 1]}" for j in range(len(places) - 1)] + [f"{places[-1]} = None"]
     arms = []
     for ctor in verdict.ctors:
         if ctor.fields:
-            arms.append(f"      | {ctor.name}(port) => let (queue2, extra) = enqueue(queue1, Pending@e(port, out)) in "
-                        f"(give_out(extra, pool2), slot1, queue2, Queued)")
+            arms.append(f"      | {ctor.name}(port) => let (head1, queue2, extra) = enqueue(head0, queue1, "
+                        f"Pending@e(port, out)) in (give_out(extra, pool2), slot1, head1, queue2, Queued)")
         else:
-            arms.append(f"      | {ctor.name} => (give_frame(out, Cell@e(pool2)), slot1, queue1, Dropped)")
+            arms.append(f"      | {ctor.name} => (give_frame(out, Cell@e(pool2)), slot1, head0, queue1, Dropped)")
     with open(TEMPLATE) as handle:
         template = string.Template(handle.read())
     return template.substitute(
         chain_definition=definition, item=item, k_out=k_out, chain_type=chain_type, last=last, chunk=chunk,
         queue_fields=", ".join(f"{place}: Out" for place in places),
-        queue_pattern=f"Queue(d, {', '.join(places)})", last_place=places[-1], shifted=", ".join(shifted),
+        queue_pattern=f"Queue(d, {', '.join(places)})", first_place=places[0], last_place=places[-1],
+        shifted=", ".join(shifted),
         enqueue_body="\n".join(enqueue), pattern=f"{item}(d, {', '.join(binders)})", chain_binder=binders[chain],
         chain_field=fields[chain][0], peel_cells=peel, cells_to_pool=nest(cells, "pool") if parts > 1 else "Cell@d(pool)",
         take="\n".join(take), take_end=" end" * len(taken), after_take=pools[-1], taken_back=nest(taken, "pool1"),

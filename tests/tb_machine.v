@@ -5,7 +5,8 @@
 //
 // frames.txt has a frame to a line: `hold length byte byte ...`, in hex bytes. With hold set, egress is held still
 // while the frame goes in, which is how a queue fills. Afterwards egress is let go, and once the machine has been
-// idle with nothing queued for a while, it prints where the pool, ingress and the queue are, and every cell.
+// idle with nothing queued for a while, it prints where the pool, ingress and the queue are, what the machine
+// counted, and every cell.
 `timescale 1ns/1ns
 `default_nettype none
 
@@ -30,21 +31,42 @@ module tb;
     wire turn_done;
     wire [31:0] turn_cycles;
     wire [7:0] turn_outcome;
+    wire [31:0] overruns, faults, cuts;
 
     machine dut (.clk(clk), .rst(rst), .in_valid(in_valid), .in_data(in_data), .in_last(in_last),
                  .in_ready(in_ready), .out_valid(out_valid), .out_data(out_data), .out_last(out_last),
                  .out_port(out_port), .out_ready(out_ready), .turn_done(turn_done), .turn_cycles(turn_cycles),
-                 .turn_outcome(turn_outcome));
+                 .turn_outcome(turn_outcome), .overruns(overruns), .faults(faults), .cuts(cuts));
 
-    integer out_bytes = 0;
+    // The machine stops what would hang. These are for when one of its stops is broken, so that a test says so at
+    // once rather than at a timeout: nothing moving for long, a frame with no end, more frames out than in.
+    integer still = 0;
+    always @(posedge clk) begin
+        still = (turn_done || (out_valid && out_ready) || (in_valid && in_ready)) ? 0 : still + 1;
+        if (still > 100000) begin
+            $display("FAIL: nothing has moved for 100000 cycles, in state %0d", dut.state);
+            $finish(0);
+        end
+    end
+
+    integer out_bytes = 0, frames_in = 0, frames_out = 0;
     always @(posedge clk) begin
         if (out_valid && out_ready) begin
             if (out_bytes == 0) $write("OUT %0d ", out_port);
             $write("%02x", out_data);
             out_bytes = out_bytes + 1;
+            if (out_bytes > 65535) begin
+                $display("\nFAIL: a frame going out has passed 65535 bytes");
+                $finish(0);
+            end
             if (out_last) begin
                 $write("\n");
                 out_bytes = 0;
+                frames_out = frames_out + 1;
+                if (frames_out > frames_in) begin
+                    $display("FAIL: more frames have gone out than came in");
+                    $finish(0);
+                end
             end
         end
         if (turn_done) $display("TURN %0d %0d", turn_outcome, turn_cycles);
@@ -74,14 +96,15 @@ module tb;
             end
             in_valid = 1'b0;
             in_last = 1'b0;
+            frames_in = frames_in + 1;
         end
         out_ready = 1'b1;
         idle = 0;
         while (idle < 50) begin
             @(negedge clk);
-            idle = (dut.state == 5'd0 && dut.head == 0 && !out_valid) ? idle + 1 : 0;
+            idle = (dut.state == 5'd0 && dut.head == 0 && !out_valid && !dut.draining) ? idle + 1 : 0;
         end
-        $display("FINAL %0d %0d %0d", dut.pool, dut.slot, dut.queue);
+        $display("FINAL %0d %0d %0d %0d %0d %0d %0d", dut.pool, dut.slot, dut.head, dut.queue, overruns, faults, cuts);
         for (index = 1; index <= `CELLS; index = index + 1)
             $display("WORD %0d %032x", index, dut.core.cells[index]);
         $display("DONE");

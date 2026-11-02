@@ -9,7 +9,9 @@ data Pool = Dry | Cell(next: Pool);
 # An output waiting to be sent: the port its verdict named, and the record. It takes a cell of its own.
 data Out = None | Pending(port: Int8, frame: $item);
 
-# The queue: $k_out places, oldest first. Full is the last place being taken, read from that place and from no count.
+# The queue holds $k_out outputs, oldest first: its head, which is the turn's own parameter, and the places after it.
+# The head is the only output a turn can release, so the bound pays for releasing one frame, and nothing for the
+# frames behind it. Full is the last place being taken, read from that place and from no count.
 record Queue { $queue_fields };
 
 # What became of a turn, for the machine's counters.
@@ -59,31 +61,34 @@ fn is_full(queue: Queue) : (Queue, Bool) = match queue with $queue_pattern =>
   | None => (Queue@d { $last_place = None }, false)
   | Pending(e, port, frame) => (Queue@d { $last_place = Pending@e(port, frame) }, true) end end;
 
-# What egress has sent leaves the queue, and its cells go back to the pool.
-fn release(queue: Queue, pool: Pool) : (Queue, Pool) = match queue with $queue_pattern =>
-  match q0 with
-  | None => (Queue@d { q0 = None }, pool)
-  | Pending(e, port, frame) => (Queue@d { $shifted }, give_frame(frame, Cell@e(pool))) end end;
+# What egress has sent leaves the queue, its cells go back to the pool, and the place after it is the new head.
+fn release(head: Out, queue: Queue, pool: Pool) : (Out, Queue, Pool) = match head with
+  | None => (None, queue, pool)
+  | Pending(e, port, frame) => match queue with $queue_pattern =>
+      ($first_place, Queue@d { $shifted }, give_frame(frame, Cell@e(pool))) end end;
 
-# Into the first free place. What comes back is the output, if there was none, which is_full has ruled out.
-fn enqueue(queue: Queue, out: Out) : (Queue, Out) = match queue with $queue_pattern =>
+# Into the first free place, the head first. What comes back is the output, if there was none, which is_full has
+# ruled out.
+fn enqueue(head: Out, queue: Queue, out: Out) : (Out, Queue, Out) = match head with
+  | None => (out, queue, None)
+  | Pending(h, port, frame) => match queue with $queue_pattern =>
 $enqueue_body;
 
 # One turn. What egress has sent goes back first. Then the frame ingress holds, if there is one, is refused or
 # admitted: ADMIT, the handler, then DONE. The cells come out of the pool by matching it, one for each the item
 # takes out of ingress and one for the output's place in the queue, and running dry gives back what was taken.
-turn serve(pool: Pool, slot: $item, queue: Queue, length: Int16, sent: Bool) : (Pool, $item, Queue, Turned) =
-  let (queue0, pool0) = if sent then release(queue, pool) else (queue, pool) in
-  if ==(length, 0) then (pool0, slot, queue0, Idle)
-  else if <(length, $wire) then (pool0, slot, queue0, Runt)
-  else if >(length, $capacity) then (pool0, slot, queue0, TooLarge)
+turn serve(pool: Pool, slot: $item, head: Out, queue: Queue, length: Int16, sent: Bool) : (Pool, $item, Out, Queue, Turned) =
+  let (head0, queue0, pool0) = if sent then release(head, queue, pool) else (head, queue, pool) in
+  if ==(length, 0) then (pool0, slot, head0, queue0, Idle)
+  else if <(length, $wire) then (pool0, slot, head0, queue0, Runt)
+  else if >(length, $capacity) then (pool0, slot, head0, queue0, TooLarge)
   else
 $take
   match slot with $pattern =>
     let (rest, item, fresh, pool1, ok) = split($chain_binder, -(length, $wire), $last, Dry, $after_take) in
-    if !(ok) then (give(fresh, $taken_back), $item@d { $chain_field = unsplit(item, rest) }, queue0, Short)
+    if !(ok) then (give(fresh, $taken_back), $item@d { $chain_field = unsplit(item, rest) }, head0, queue0, Short)
     else let (queue1, full) = is_full(queue0) in
-    if full then (give(fresh, $taken_back), $item@d { $chain_field = unsplit(item, rest) }, queue1, Full)
+    if full then (give(fresh, $taken_back), $item@d { $chain_field = unsplit(item, rest) }, head0, queue1, Full)
     else
       let (verdict, out, free) = $handler($item@d { $chain_field = unsplit(item, $last) }, End) in
       let pool2 = give_free(free, pool1) in

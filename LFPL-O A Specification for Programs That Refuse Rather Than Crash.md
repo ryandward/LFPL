@@ -421,7 +421,7 @@ The judgment reads: with context Γ and q units free beforehand, e evaluates to 
 Two things differ from Hofmann and Jost:
 
 - **There is no sharing rule.** Linear data are never duplicated, so potential never has to be split between two uses of one value.
-- **DRAW types only the `More` arm against the budget.** The `End` arm must still type-check, but Theorem 5.1 shows it is unreachable when the reserve is large enough. Its cost therefore never enters the bound. This rests on every Free a program holds being that reserve, and the certificate checks it: linearity keeps there from being two of one, so a handler that makes a Free on a path that can run gets no bound. A compiled handler should never reach that refusal, because it could not get rid of a second one: a `More` arm leaves as many as it found, R3 does not count a Free anywhere a handler can reach, an output cannot hold one, and a handler returns exactly one. The inequalities of an `End` arm are kept apart, not thrown away. A handler's bound leaves them out by DRAW, and the runtime's turn (section 9.6) counts them for every Free it walks itself, since those are what a handler gave back, and they do run out. The turn leaves them out only for the handler it calls, whose reserve it has filled.
+- **DRAW types only the `More` arm against the budget.** The `End` arm must still type-check, but Theorem 5.1 shows it is unreachable when the reserve is large enough. Its cost therefore never enters the bound. This rests on every Free a program holds being that reserve, and the certificate checks it: linearity keeps there from being two of one, so a handler that makes a Free on a path that can run gets no bound. A compiled handler should never reach that refusal, because it could not get rid of a second one: a `More` arm leaves as many as it found, R3 does not count a Free anywhere a handler can reach, an output cannot hold one, and a handler returns exactly one. The inequalities of an `End` arm are kept apart, not thrown away. A handler's bound leaves them out by DRAW, and the runtime's turn (section 9.6) counts them, since the Frees it walks are what a handler gave back, and they do run out. That counts the handler's own too, which costs nothing for a handler the turn serves: it draws nothing, so it never matches its reserve.
 
 ### 5.4 Soundness
 
@@ -600,7 +600,8 @@ With exact last uses, a scalar is moved out before its location is overwritten, 
 | a constructor of an enum fits one register with its tag | 8 bytes | checker |
 | storing an enum in a cell | refused until built | checker |
 | a handler the turn serves: no state slots, R(n) = 0, a record with one chain, and a verdict of `port: Int8` or nothing beside that record | — | src/turn.py |
-| places in the hardware target's output queue, K\_out | declared, 4 by default | src/turn.py |
+| places in the hardware target's output queue, K\_out | declared, 4 by default, and at least 2: the head and a place after it | src/turn.py |
+| the bytes N\_max cells hold on the hardware target, and one more | below 2^16, since ingress counts a frame to one byte past what it holds, in a 16-bit length | src/turn.py |
 | arguments per function | 6 | checker |
 | the members of a tuple, a handler's results among them, so a handler with a verdict has at most 3 state slots | 6 | checker |
 | frame slots per function F\_max | declared | lowerer |
@@ -719,14 +720,21 @@ Two checks follow, and both are available in the current workspace:
 
 On this target the serving loop's rules of section 3.3 are LFPL, not a runtime written in something else. `src/turn.lfpl` is one turn: it releases what egress has sent, then refuses or admits the frame ingress holds, calls the handler, and puts what it returns in the queue or gives its cells back. `src/turn.py` fills in what depends on the handler and appends it to the handler's program, so the turn goes through every stage the handler does, and its bound is certified with it. A `turn` declaration is the only thing that may call a handler.
 
-- **State.** The turn holds the pool, the ingress slot and the queue, and returns them for the next turn. The machine keeps them in registers between turns, and does nothing else with them.
+- **State.** The turn holds the pool, the ingress slot, the queue's head and the rest of the queue, and returns them for the next turn. The machine keeps them in registers between turns, and does nothing else with them.
 - **The pool** is a type of its own, laid out as a Free is. Running out of it is Short, which happens, so its `End` arm is charged, where a reserve's is not.
 - **Ingress** is a value of the item's type, N\_max cells: the record and a chain as long as the slot holds. The hardware writes a frame's bytes into the record's scalar fields and then the chain's chunks, with a used count, the length field, and zeros after the last byte. It never writes a link, so whatever it is given, no cell can come to point at another.
 - **Admission** finds n by walking ingress's chain while it counts the frame's bytes down, since there is no division, and TooLarge compares the length with what N\_max cells hold. It takes the cells it needs out of the pool by matching it, one for each the item takes out of ingress and one for the output's place in the queue, and running dry gives back what was taken, in order: Short. No count is trusted, because none is kept.
-- **The queue** is K\_out places in a record, oldest first, shifted when egress has sent the first. Full is the last place being taken. A list kept in arrival order could not be certified: appending walks entries whose potential has already been spent.
-- **The bound** is for a whole turn: ingress counted at N\_max cells and the queue at its fullest, every other linear parameter given nothing. So it holds of every turn on its own, whatever came before. It is loose, since it charges for releasing the whole queue and a turn releases one output.
+- **The queue** is K\_out outputs, oldest first: its head, a parameter of the turn's own, and K\_out - 1 places in a record after it, shifted up when egress has sent the head. Full is the last place being taken. A list kept in arrival order could not be certified: appending walks entries whose potential has already been spent.
+- **The bound** is for a whole turn: ingress counted at N\_max cells and the head at its own cell and N\_out more, every other linear parameter given nothing. So it holds of every turn on its own, whatever came before, and it pays for releasing one output, which is all a turn releases. Were the head a place in the queue's record, it would pay for every frame the queue holds, since the potential of a value is per cell of it and does not tell one place from another.
 
-The hardware around the turn, `src/machine.py`, is a writer, a reader and a controller that runs turns forever. They take a number of cycles that grows with the frame, outside the turn's bound, and they move no cell between owners: conservation is the turn's.
+The hardware around the turn, `src/machine.py`, is a writer, a reader and a controller that runs turns forever. They move no cell between owners, so conservation is the turn's. The writer stores at most the bytes N\_max cells hold: the byte past them ends the frame, which the turn refuses as TooLarge, and the rest of it is read and thrown away between turns. The reader follows no more of a chain than N\_out cells hold, and cuts and counts a frame with more. So each takes a number of cycles that grows with the frame up to a constant, outside the turn's bound, whatever any turn did.
+
+What would hang is stopped in the design, not by a test:
+
+- **A turn past its bound** is stopped at k*W + c cycles, and counted, and every cell is written back as it was before the first turn, which is also what a reset does. The frame it held is lost, and so is the queue.
+- **A head no outcome accounts for.** The controller counts outputs the turns' outcomes say the queue holds, one more for Queued and one fewer for a release. The count decides nothing a turn does. When a turn returns an output at the head with the count at none, or none with the count above it, its results are not taken: the machine counts a fault and writes every cell back. Without this, a turn that keeps an output at the head without queuing it has egress send that output again after every release, each turn within its bound and none of them ending it.
+
+So no more frames go out than turns said they queued: once frames stop coming in, egress sends at most what is queued, a release follows each, and the machine is idle.
 
 ## 10. Theorems and proof sketches
 
@@ -870,7 +878,7 @@ The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and 
 | heap-flatness test | present, and it holds when run on its own | nothing |
 | cell conservation in the compiler ring | present, with Theorem 7.2's bound checked at every step | nothing |
 | RTL backend | the handler and everything it calls, for every RT instruction: `src/rtverilog.py`, which needed no change to anything before it. Its bound in cycles is derived by the emitter and held to in simulation, its outputs are compared with the x86 binary's on the same bytes, and yosys maps its cell store to block RAM. | `swap` |
-| the runtime's turn (section 9.6) | present on the RTL target: admission, ADMIT, DONE and the output queue are LFPL, lowered with `examples/ipv4.lfpl` by `src/machine.py`, with frames in and out as bytes. The emitter states one bound for a whole turn before anything runs, every turn of the corpus is held to it, every frame out is the x86 build's, and every cell is in one place afterwards. x86 keeps its runtime. | the turn on x86; handlers with state slots, draws or outputs built in a cell; several frames in ingress at once |
+| the runtime's turn (section 9.6) | present on the RTL target: admission, ADMIT, DONE and the output queue are LFPL, lowered with `examples/ipv4.lfpl` by `src/machine.py`, with frames in and out as bytes. The emitter states one bound for a whole turn before anything runs, every turn of the corpus is held to it, every frame out is the x86 build's, and every cell is in one place afterwards. The design stops a turn past its bound and a head of the queue no outcome accounts for, and writes every cell back; ingress and egress stop at N\_max and N\_out cells. x86 keeps its runtime. | the turn on x86; handlers with state slots, draws or outputs built in a cell; several frames in ingress at once |
 | enum matching | present: an arm binds the fields, out of the register | storing an enum in a cell |
 
 The implementation decides some things this text leaves open, or does not mention:

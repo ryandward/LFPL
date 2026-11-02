@@ -477,6 +477,21 @@ fn main() : Int64 = f(3, Send(9));
 """
         self.assertEqual(answer(self, source), 9)
 
+    def test_an_arm_does_not_see_what_another_did(self):
+        """Each arm starts from the state at the match. One has rebuilt the cell, and the next still reads its field."""
+        source = PRE + VERDICT + ONE + READ_ONE + """fn f(x: P, v: Verdict) : P = match x with P(d, a, b) => match v with
+  | Malformed => P@d(1, b) | Expired => P@d(2, b) | Send(p) => P@d(pack<8>(p), b) end end;
+""" + main_with(1, "rd(f(f(f(P@c0(9, 4), Expired), Send(5)), Malformed), REST)")
+        self.assertEqual(answer(self, source), 14)
+
+    def test_a_field_is_only_its_own_bytes(self):
+        """Nothing above it: the fields after it in the register are not part of it."""
+        source = """enum Wide = A(x: Int8, y: Int16, z: Int32) | B(w: Int32) | C;
+fn first(v: Wide) : Int8 = match v with A(x, y, z) => x | B(w) => 0 | C => 0 end;
+fn main() : Int64 = pack<8>(first(A(0x12, 0x3456, 0x789A)));
+"""
+        self.assertEqual(answer(self, source), 0x12)
+
     def test_its_tag_is_read_once_and_each_field_where_it_is(self):
         lines = rt(self.CODE)
         body = [line.strip() for line in lines[next(i for i, l in enumerate(lines) if l.startswith("fn")):]]

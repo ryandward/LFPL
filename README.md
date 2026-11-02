@@ -375,16 +375,31 @@ count of free cells to trust, because there is none at all.
 
 ```
 $ python3 -m src.machine examples/ipv4.lfpl -o machine --n-max 217
-turn serve for handler ipv4: W = 8572 steps for any frame of up to 217 cells, with 4 places in the queue; cycles <= 2*W + 46 = 17190 a turn; 1310 cells of 128 bits, 11-bit pointers
+turn serve for handler ipv4: W = 5958 steps for any frame of up to 217 cells in and 217 out, with 4 places in the queue; cycles <= 2*W + 40 = 11956 a turn; 1309 cells of 128 bits, 11-bit pointers
 ```
 
-That is said before anything runs, and it holds of every turn, whatever the frame and whatever came before. What
-runs is `machine.v`, with `serve_core.v` inside it. A frame comes in as bytes, with valid and ready, and goes into
-the scalar fields of the record ingress holds and then into its chain, and a frame leaves the same way, read out of
-the cells of the record at the head of the queue. The writer never stores a link, so the hardware cannot make one
+That is said before anything runs, and it holds of every turn, whatever the frame and whatever came before. A turn
+walks two things it is given, the frame in ingress and the output at the head of the queue, and the bound pays for
+both at their largest. The head is a parameter of its own, so the frames queued behind it cost the bound nothing: a
+turn releases one output, and that is what it pays for. The longest admission measured took 5190 cycles, and the
+longest release 886, against the bound of 11956. The admission was of a frame of 1518 bytes, all 217 cells. The bound
+pays for a release and an admission in one turn, which the machine never asks of one, and it charges every step of
+a walk two cycles, which most of them do not take.
+
+What runs is `machine.v`, with `serve_core.v` inside it. A frame comes in as bytes, with valid and ready, and goes
+into the scalar fields of the record ingress holds and then into its chain, and a frame leaves the same way, read out
+of the cells of the output at the head of the queue. The writer never stores a link, so the hardware cannot make one
 cell point at another: every link is the turn's to make. `tests/test_machine.py` sends the whole corpus through it
 and through the x86 build. Every frame comes out the same, to the same port, every turn stays under its bound, and
 afterwards every cell is in exactly one place.
+
+A hang is stopped by the design, not caught by a test. The writer stores no byte past what 217 cells hold, and the
+reader follows no more of a chain than that. A turn that runs past its bound is stopped, and a turn whose results
+put an output at the head of the queue that no outcome accounts for is not taken: the machine counts it and writes
+every cell back as it was before the first turn, which is what a reset does. That second stop exists because a
+deliberately broken build, with every argument of the turn wired to its first, never ran a turn past its bound: its
+first turn ended in 47 cycles and every one after it in 5, and egress sent the same head forever. `tests/test_machine.py` breaks the generated
+Verilog that way and others, and each time the machine stops, counts it and goes on.
 
 ## How the compiler holds itself to the same rules
 

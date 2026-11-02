@@ -74,7 +74,7 @@ ordinal the callers use, the name, and the types:
 
     fn f3 inc(r0 : t30) : t30 @0
     handler f4 forward(r0 : t32768, r1 : t17, r2 : t30) : t32770
-    turn f9 serve(r0 : t40, r1 : t17, r2 : t45, r3 : i16, r4 : bool) : t32771
+    turn f17 serve(r0 : t92, r1 : t25, r2 : t96, r3 : t102, r4 : i16, r5 : bool) : t57350
 
 A `turn` is the runtime's own entry point on the hardware target, the one function that may call a handler. Its
 bound is certified for any item: each parameter the backend names a size for gets an amount per cell, at that size,

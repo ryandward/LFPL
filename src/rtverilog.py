@@ -237,7 +237,6 @@ class Translation:
     pointer_bits: int
     memories: dict  # state slot -> hex text for $readmemh, to go beside the Verilog
     verdict: bool = False  # the handler returns an enum beside its record, on a port of its own
-    image: str = ""        # a turn's: the cell store's first contents, as cells.mem for $readmemh
 
     def report(self) -> str:
         lines = [f"handler {self.module}: R(n) = {_linear(self.bound.a, self.bound.b)} cells, "
@@ -1071,7 +1070,7 @@ class Emitter:
         return (loop[0] or Span(0, 0), leave[0] or Span(0, 0))
 
     def render(self, handler: Function, module: str, bound: Bound, cells: int,
-               initial: dict[str, str], image: str = "") -> Translation:
+               initial: dict[str, str]) -> Translation:
         functions = self._reachable(handler)
         kept = {fn.ordinal for fn in functions}
         for fn in functions:  # a function the handler never reaches is not in the machine
@@ -1099,11 +1098,11 @@ class Emitter:
                     raise RTError(f"{state.name} ({state.comment}) both reads and writes the cell store")
         memories = {name: _hex_lines(data, self._array_of(ty)) for (name, ty), data in
                     ((slot, initial[slot[0]]) for slot in self.slots if slot[0] in initial)}
-        text = self._text(handler, functions, module, cells, timing, memories, bound, bool(image))
-        return Translation(text, module, bound, timing, cells, self.pointer_bits, memories, self.verdict, image)
+        text = self._text(handler, functions, module, cells, timing, memories, bound)
+        return Translation(text, module, bound, timing, cells, self.pointer_bits, memories, self.verdict)
 
     def _text(self, handler: Function, functions: list[Function], module: str, cells: int,
-              timing: Timing, memories: dict, bound: Bound, loaded: bool = False) -> str:
+              timing: Timing, memories: dict, bound: Bound) -> str:
         p = self.pointer_bits
         states = [state.name for fn in functions for state in fn.states]
         state_bits = _bits_for(len(states) + 1)
@@ -1187,8 +1186,6 @@ class Emitter:
         add(f"    reg [{p - 1}:0] b_addr;")
         add(f"    reg [{CELL_BITS - 1}:0] b_din;")
         add("    assign host_dout = a_dout;")
-        if loaded:  # a turn's cells start as src/machine.py laid them out: the pool, ingress and the queue
-            add('    initial $readmemh("cells.mem", cells);')
         add("    integer lane;")
         add("    always @(posedge clk) begin")
         add("        if (a_en) a_dout <= cells[a_addr];")
