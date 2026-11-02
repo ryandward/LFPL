@@ -738,9 +738,9 @@ The compiler and the LP solver are deliberately not on this list. A wrong output
 
 ## 12. Status against the repository
 
-The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and serves UDP sockets on the loopback address, and `examples/checksum.lfpl` walks its item under a certified bound, through the whole of the pipeline below except the parts this table marks as missing. This is `ryandward/LFPL` main at commit `dbe8305`, where all 523 tests pass with Python 3.14.8. 39 of them need root and skip without it, and they pass with it.
+The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and serves UDP sockets on the loopback address, and `examples/checksum.lfpl` walks its item under a certified bound, through the whole of the pipeline below except the parts this table marks as missing. This is `ryandward/LFPL` main at commit `b5078db`, where all 454 tests pass with Python 3.14.8.
 
-| Requirement | Status at `dbe8305` | Needed |
+| Requirement | Status at `b5078db` | Needed |
 | --- | --- | --- |
 | exactly-once linear typing | present in Check, and repeated one level down by `src/rtcheck.py` | nothing |
 | exhaustive matching | present | nothing |
