@@ -384,7 +384,7 @@ both at their largest. The head is a parameter of its own, so the frames queued 
 turn releases one output, and that is what it pays for. The longest admission measured took 5190 cycles, and the
 longest release 886, against the bound of 11956. The admission was of a frame of 1518 bytes, all 217 cells. The bound
 pays for a release and an admission in one turn, which the machine never asks of one, and it charges every step of
-a walk two cycles, which most of them do not take.
+a walk two cycles, the most any of them takes.
 
 What runs is `machine.v`, with `serve_core.v` inside it. A frame comes in as bytes, with valid and ready, and goes
 into the scalar fields of the record ingress holds and then into its chain, and a frame leaves the same way, read out
