@@ -235,6 +235,29 @@ turn t(l: L, pool: L) : (L, Int16) = count(l, pool, 0);
             certify_turn(checker, "t", {})
         self.assertGreater(certify_turn(checker, "t", {0: 10}).d, 0)
 
+    def test_a_free_given_back_costs_what_the_pool_does(self):
+        """DRAW leaves a reserve's End arm out of a handler's bound, since a reserve of R(n) cells never reaches it.
+        A turn walks the Free a handler gave back, which does end, so the walk costs what the same walk over the pool
+        costs, End arm and all."""
+        head = b"""data Pool = Dry | Cell(next: Pool);
+data L = Nil | Cons(next: L);
+handler h(l: L, free: Free) : (L, Free) = (l, free);
+"""
+        walks = (b"fn give_free(free: Free, pool: Pool) : Pool = match free with End => pool "
+                 b"| More(c, rest) => give_free(rest, Cell@c(pool)) end;\n"
+                 b"turn t(free: Free, pool: Pool) : Pool = give_free(free, pool);\n",
+                 b"fn give(cells: Pool, pool: Pool) : Pool = match cells with Dry => pool "
+                 b"| Cell(c, rest) => give(rest, Cell@c(pool)) end;\n"
+                 b"turn t(cells: Pool, pool: Pool) : Pool = give(cells, pool);\n")
+        bounds = []
+        for walk in walks:
+            checker = Checker()
+            for line in rt_lines(io.BytesIO(head + walk)):
+                checker.feed(line)
+            checker.finish()
+            bounds.append(certify_turn(checker, "t", {0: 10}))
+        self.assertEqual(bounds[0], bounds[1])
+
     def test_a_longer_queue_costs_more_and_is_still_bounded(self):
         self.assertGreater(machine(k_out=8).bound.d, machine().bound.d)
 
