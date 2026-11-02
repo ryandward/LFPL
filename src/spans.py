@@ -1,4 +1,4 @@
-"""A record that spans cells: LFPL-O section 4.8.
+"""A record that spans cells, and a record updated: LFPL-O sections 4.8 and 4.10.
 
 The source declares one record, and a cell has 16 bytes. So this lays the fields out across as many cells as they
 take, in declaration order and at their natural alignment, and every cell but the last gives its second 8 bytes to
@@ -35,6 +35,20 @@ which is where R(n) counts it:
     R@(a, b, c)(...)            builds it in those, in that order
 
 A record that fits one cell is left exactly as it was written.
+
+An update is the same rewrite, for a record of any size, with its arguments filled in from the pattern its cell came from:
+
+    match f with R(d, a, b, c) =>                      match f with R(d, a, b, c) =>
+      R@d { b = +(b, 1) }                                R@d(<a>, +(b, 1), <c>)
+
+So Lower is given what it is always given, and writes `=` for what stays where it is. `<a>` is leaf(VARAT, position): the
+pattern's own binding of the field, by where it is in scope and not by what it is called, since a name bound since then
+has nothing to say about a field that was not named. The position is worked out from the layout. Part j's fields come
+after its cell and every earlier part's cell and link, so field i is 1 + i + 2j past the pattern's diamond.
+
+The fields have to be named in the order the record declares them. This stage sees each expression once as it goes by,
+and the order they are written in is the order they are evaluated in, so naming them out of order would mean holding an
+expression of any size back. It is refused, with that reason.
 """
 from __future__ import annotations
 
@@ -43,7 +57,7 @@ from dataclasses import astuple, dataclass
 from typing import Iterator, Optional
 
 from .dyck import (CLOSE, K_ARM, K_BINDER, K_CALL, K_CTOR, K_DATA, K_DIAMOND, K_FIELD, K_LET, K_MATCH, K_RECORD,
-                   K_TUPLE, K_TYPE, K_VAR, LEAF, OPEN, SEP, ev_kind, ev_tag)
+                   K_TUPLE, K_TYPE, K_UPDATE, K_VAR, K_VARAT, LEAF, OPEN, SEP, VARAT, ev_kind, ev_tag)
 from .tokens import PAYLOAD_BYTES
 
 CELL = 16
@@ -62,8 +76,9 @@ NO_RECORD = 0xFFFF     # what is open is a `More@d(free)`, which is cells and no
 NO_GROUP = 0xFFFF      # its cells are named one by one
 PEEL = b"peel"
 EVENT = tuple[int, bytes]
-_RECORD_HEAD = struct.Struct("<HBB")  # its number, its parts and its fields, after the name
-_GROUP = struct.Struct("<HHBB")       # the name's position in scope, where its cells were numbered, the first, how many
+_RECORD_HEAD = struct.Struct("<HBBH")  # its number, its parts, its fields, and where their names start, after the name
+# The name's position in scope, where its cells were numbered, the first, how many, and the record whose pattern bound it.
+_GROUP = struct.Struct("<HHBBH")
 
 
 def parts_of(sizes: list[int]) -> list[int]:
@@ -93,8 +108,9 @@ def _fitting(sizes: list[int], room: int) -> int:
 
 @dataclass
 class _Rewriting:
-    """A spanning match arm or constructor, or a `More@d`, that is open. `depth` is how many frames the pass will have
-    open when its deepest part is on top, which is how an event is known to belong to it."""
+    """A match arm of a record, a constructor of one that spans or is being updated, or a `More@d`, that is open. `depth`
+    is how many frames the pass will have open when its deepest part is on top, which is how an event is known to
+    belong to it."""
     kind: int
     depth: int
     record: int = NO_RECORD
@@ -104,8 +120,10 @@ class _Rewriting:
     group: int = NO_GROUP  # the position in scope of the group that names its cells
     listed: int = 0      # or how many cells it named
     mark: int = 0        # and where those names start
+    update: int = 0      # an update: the arguments nothing names are for this to fill in
+    filled: int = 0      # and argument `seen` has been named
 
-    _PACKED = struct.Struct("<BHHBBBHBH")
+    _PACKED = struct.Struct("<BHHBBBHBHBB")
 
     def pack(self) -> bytes:
         return self._PACKED.pack(*astuple(self))
@@ -122,6 +140,7 @@ class _Group:
     first: int
     cells: int
     prefix: bytes
+    record: int = NO_RECORD  # a pattern's diamond: which record's. What peel leaves is cells and no record
 
     def cell(self, index: int) -> bytes:
         """The name, downstream, of one cell of the group after its first."""
@@ -148,6 +167,7 @@ class Spans:
     def __init__(self, stage) -> None:
         self.stage = stage
         self.ctor = b""            # the constructor just opened, whose diamond comes next
+        self.diamond = b""         # and the cell it named last
         self.peeling = 0         # after `peel(`: 1 wants the name, 2 wants the `)`, and 3 waits for the `in`
         self.rest: Optional[_Group] = None  # what the second name of that let will stand for
         self.holding = False
@@ -155,14 +175,15 @@ class Spans:
         self.after_diamond = False  # the last event named a constructor's cell, and another may follow
 
     def attach(self) -> None:
-        self.S = self.stage.stack()  # for all time: each record that spans
+        self.S = self.stage.stack()  # for all time: each record
+        self.N = self.stage.stack()  # for all time: the name of each of its fields, in order
         self.A = self.stage.stack()  # the groups in scope, in order of position
         self.O = self.stage.stack()  # what is open and being rewritten
         self.D = self.stage.stack()  # the record being held, one event per frame, with its tag
         self.Q = self.stage.stack()  # the cells listed by the constructors open now, after each one's first
 
     def table_cells(self) -> int:
-        return len(self.S.cells)
+        return len(self.S.cells) + len(self.N.cells)
 
     def unbind_to(self, mark: int) -> None:
         while len(self.A) and self._group_at(len(self.A) - 1).position >= mark:
@@ -193,12 +214,14 @@ class Spans:
         name = self.D.at(0)[1]
         fields = (len(self.D) - 2) // 2
         counts = parts_of([self._size(1 + 2 * index) for index in range(fields)])
+        span = _Span(name, len(self.S) + 1, bytes(counts))
+        self.S.push(0, name + _RECORD_HEAD.pack(span.number, len(counts), fields, len(self.N)) + span.counts)
+        for index in range(fields):
+            self.N.push(0, self.D.at(1 + 2 * index)[1])
         if len(counts) == 1:
             for index in range(len(self.D)):
                 yield self.D.at(index)
             return
-        span = _Span(name, len(self.S) + 1, bytes(counts))
-        self.S.push(0, name + _RECORD_HEAD.pack(span.number, len(counts), fields) + span.counts)
         for part in range(1, len(counts)):
             yield ev_tag(OPEN, K_DATA), span.part_name(part)
             yield ev_tag(CLOSE, K_DATA), b""
@@ -221,7 +244,7 @@ class Spans:
 
     def _span_at(self, index: int) -> _Span:
         data = self.S.at(index)[1]
-        number, parts, _fields = _RECORD_HEAD.unpack_from(data, PAYLOAD_BYTES)
+        number, parts, _fields, _names = _RECORD_HEAD.unpack_from(data, PAYLOAD_BYTES)
         at = PAYLOAD_BYTES + _RECORD_HEAD.size
         return _Span(data[:PAYLOAD_BYTES], number, data[at:at + parts])
 
@@ -231,10 +254,17 @@ class Spans:
                 return index
         return None
 
+    def _field_named(self, record: int, name: bytes) -> Optional[int]:
+        _number, _parts, fields, names = _RECORD_HEAD.unpack_from(self.S.at(record)[1], PAYLOAD_BYTES)
+        for index in range(fields):
+            if self.N.at(names + index)[1] == name:
+                return index
+        return None
+
     def _group_at(self, index: int) -> _Group:
         data = self.A.at(index)[1]
-        position, origin, first, cells = _GROUP.unpack_from(data)
-        return _Group(position, origin, first, cells, data[_GROUP.size:].rstrip(b"\0"))
+        position, origin, first, cells, record = _GROUP.unpack_from(data)
+        return _Group(position, origin, first, cells, data[_GROUP.size:].rstrip(b"\0"), record)
 
     def _group_of(self, name: bytes) -> Optional[_Group]:
         position = self.stage._lookup(name)[0]
@@ -244,8 +274,13 @@ class Spans:
                 return group
         return None
 
+    def _spanning_group_of(self, name: bytes) -> Optional[_Group]:
+        """What the name stands for, if that is more than the one cell it is itself."""
+        group = self._group_of(name)
+        return group if group is not None and group.cells > 1 else None
+
     def _note_group(self, group: _Group) -> None:
-        self.A.push(0, _GROUP.pack(group.position, group.origin, group.first, group.cells) + group.prefix)
+        self.A.push(0, _GROUP.pack(group.position, group.origin, group.first, group.cells, group.record) + group.prefix)
 
     def _open(self) -> Optional[_Rewriting]:
         return _Rewriting.unpack(self.O.peek()[1]) if len(self.O) else None
@@ -274,7 +309,7 @@ class Spans:
                 self.ctor = payload
             if kind in (K_ARM, K_CTOR):
                 record = self._span_named(payload)
-                if record is not None:
+                if record is not None and (kind == K_ARM or len(self._span_at(record).counts) > 1):
                     self.O.push(0, _Rewriting(kind, len(self.stage.K) + 1, record).pack())
             return same
         if cls == LEAF:
@@ -282,6 +317,12 @@ class Spans:
                 return self._binder(payload)
             if kind == K_DIAMOND:
                 return self._diamond(payload)
+            if kind == K_UPDATE:
+                return self._open_update()
+            if kind == K_FIELD:
+                what = self._here(K_CTOR)
+                if what is not None and what.update:
+                    return self._field_of_update(what, payload)
             if kind == K_VAR:
                 self._refuse_a_group(payload)
             return same
@@ -316,7 +357,8 @@ class Spans:
         out = [(ev_tag(LEAF, K_BINDER), name)]
         if what.seen == 0:  # its diamond, which stands for every cell. It is bound next, at this position
             what.group = len(self.stage.B)
-            self._note_group(_Group(what.group, what.group, 0, len(span.counts), name.rstrip(b"\0")[:PREFIX_ROOM]))
+            self._note_group(_Group(what.group, what.group, 0, len(span.counts), name.rstrip(b"\0")[:PREFIX_ROOM],
+                                    what.record))
         elif what.seen > span.total:
             raise self.stage._reject(f"pattern has too many binders: expected {span.total + 1}")
         else:
@@ -352,7 +394,8 @@ class Spans:
     # --- a constructor
 
     def _diamond(self, name: bytes) -> list[EVENT]:
-        group = self._group_of(name)
+        self.diamond = name
+        group = self._spanning_group_of(name)
         cells = group.cells if group is not None else 1
         same = [(ev_tag(LEAF, K_DIAMOND), name)]
         what = self._here(K_CTOR)
@@ -421,20 +464,81 @@ class Spans:
         return out
 
     def _close_constructor(self, what: _Rewriting) -> list[EVENT]:
-        self.O.pop()
         if what.record == NO_RECORD:
+            self.O.pop()
             return [(ev_tag(CLOSE, K_CTOR), b"")] * (what.in_part + 1)
         span = self._span_at(what.record)
+        out = self._last_of_update(what, span) if what.update else []
+        self.O.pop()
         if what.seen + 1 != span.total:
             raise self.stage._reject(f"wrong argument count: expected {span.total}")
         for _ in range(what.listed - 1):
             self.Q.pop()
-        return [(ev_tag(CLOSE, K_CTOR), b"")] * (what.part + 1)
+        return out + [(ev_tag(CLOSE, K_CTOR), b"")] * (what.part + 1)
+
+    # --- an update
+
+    def _open_update(self) -> list[EVENT]:
+        ctor = self.ctor.rstrip(b"\0").decode()
+        record = self._span_named(self.ctor)
+        if record is None:
+            raise self.stage._reject(f"{ctor} is not a record, and only a record's fields can be left where they are")
+        what = self._here(K_CTOR)
+        if what is not None and what.group == NO_GROUP:
+            raise self.stage._reject(f"{ctor}@d {{ }} leaves fields where a pattern found them, so it takes the cells "
+                                     f"of a pattern, by the name of the pattern's diamond")
+        group = self._group_of(self.diamond)
+        if group is None or group.record != record:
+            shown = self.diamond.rstrip(b"\0").decode()
+            raise self.stage._reject(f"{ctor}@{shown} {{ }} leaves fields where a pattern found them, and {shown} is "
+                                     f"not the cell of a {ctor} that a pattern took apart")
+        if what is None:
+            what = _Rewriting(K_CTOR, len(self.stage.K), record, group=group.position)
+            self.O.push(0, what.pack())
+        what.update = 1
+        self._save(what)
+        return []
+
+    def _field_of_update(self, what: _Rewriting, name: bytes) -> list[EVENT]:
+        record = self._span_at(what.record).name.rstrip(b"\0").decode()
+        shown = name.rstrip(b"\0").decode()
+        target = self._field_named(what.record, name)
+        if target is None:
+            raise self.stage._reject(f"no field {shown} in {record}")
+        if target == what.seen and what.filled:
+            raise self.stage._reject(f"{shown} is named twice")
+        if target < what.seen:
+            raise self.stage._reject(f"{shown} is named after a field declared later than it. Fields are evaluated in "
+                                     f"the order they are written, so name them in the order {record} declares them")
+        out = self._left_up_to(what, target)
+        what.filled = 1
+        self._save(what)
+        return out
+
+    def _left_up_to(self, what: _Rewriting, target: int) -> list[EVENT]:
+        """Every argument ahead of this one that nothing named is the field where it is."""
+        out: list[EVENT] = []
+        while what.seen < target:
+            if not what.filled:
+                out.append(self._left(what))
+            out += self._next_argument(what)
+            what.filled = 0
+        return out
+
+    def _last_of_update(self, what: _Rewriting, span: _Span) -> list[EVENT]:
+        out = self._left_up_to(what, span.total - 1)
+        if not what.filled:
+            out.append(self._left(what))
+        return out
+
+    @staticmethod
+    def _left(what: _Rewriting) -> EVENT:
+        return ev_tag(LEAF, K_VARAT), VARAT.pack(what.group + 1 + what.seen + 2 * what.part, 0)
 
     # --- peel, and what else a group cannot be
 
     def _refuse_a_group(self, name: bytes) -> None:
-        group = self._group_of(name)
+        group = self._spanning_group_of(name)
         if group is not None:
             raise self.stage._reject(f"{name.rstrip(bytes(1)).decode()} is {group.cells} cells, and only a constructor "
                                      f"or peel can take them")
@@ -450,7 +554,7 @@ class Spans:
         if self.peeling == 1:
             if cls != LEAF or kind != K_VAR:
                 raise self.stage._reject("peel takes the name of a record's diamond")
-            group = self._group_of(payload)
+            group = self._spanning_group_of(payload)
             if group is None:
                 raise self.stage._reject(f"{payload.rstrip(bytes(1)).decode()} is one cell, and peel takes "
                                          f"the diamond of a record that spans")

@@ -47,7 +47,9 @@ Types `t` are `Int w`, `Bool`, a named type `D`, `Cap`, which is a cell's capabi
 source language's diamond, `Array[N] t`, which is linear, and `Fin N`, which is scalar. A literal
 whose width nothing has fixed yet has type `lit`, and it unifies with any `Int w`. `Be w` is `w` bits
 in network byte order: a scalar, which can be read, moved, copied and stored in a field of that type,
-and which is no integer, so that nothing can do arithmetic on it or compare it until `bswap` says what it is.
+and which is no integer, so that nothing can do arithmetic on it or compare it until `bswap` says what it is. An
+enum `E` is a sum held in one register: its tag in the low byte, and its constructor's fields above it, where Check
+laid them out. It is a scalar too, which only `enum` makes, and which nothing compares or computes with.
 
 ## The text format
 
@@ -58,6 +60,7 @@ gave them, and declarations come first:
     type t17 record Hdr
     type t16 abstract Bytes
     type t22 tagged Verdict
+    type t53270 enum Way            an enum: its constructors give their tag, and fields fit bytes 1 to 7
     alias t16 t40                   a forward declaration t16 turned out to mean t40
     array t32768 1024 i8            Array[1024] Int8
     fin t32769 1024                 Fin 1024
@@ -97,6 +100,8 @@ Each rule reads: tokens required `-->` tokens left. Tokens not named are untouch
                         a : Int W or lit, free d -->  d = fresh : Be W      a is a register or a location, W is
                                                                             16, 32 or 64
     pack d, <W...>, a...  a_i scalar, free d    -->  d = fresh : Int 64
+    enum d, c, a...     c a constructor of an enum E, each a_i : Int W at its field's width, free d
+                                                -->  d = fresh : E
 
 `f` is add, sub, mul, and, or, xor, shl or shr, with the meaning LFPL-O section 4.4 gives
 them at width W, so `shl` and `shr` are 0 when the count reaches W. No instruction has a
@@ -313,7 +318,11 @@ partial result is ever special. All the failures Phase 1 reports about registers
     build                  parallel move over the fields that are not `=` or `r!`, with cycles
                            broken through the scratch registers. f([l], b) with l = l_i is one
                            read-modify-write instruction. A 64-bit literal goes through scratch.
-                           `write` is mov byte [p], tag, after every source has been read.
+                           `write` is mov byte [p], tag, after every source has been read. A build
+                           that stores nothing is no instruction at all: not even its cell's pointer
+                           comes into a register
+    enum                   the tag and every literal field, as one immediate; then each other field,
+                           which is zero extended already, shifted into place through scratch and or'd in
     idx                    mov d, a; and d, N - 1
     aget                   a sized mov through [a + i * s]
     br                     cmp; jcc, with the fall-through chosen by the next label. On two literals, a
@@ -363,8 +372,8 @@ byte. No state uses both.
     move               no state: the move happens in the next clock, as one more <=
     const, copy, op,   one state, one <=. Verilog's << and >> are already 0 past the width, and a
       cmp, trunc,      literal is written at the width it meets. bswap is nothing but wires: a
-      pack, idx,       concatenation of the same bytes the other way round
-      bswap
+      pack, idx,       concatenation of the same bytes the other way round, and so is enum: the tag,
+      bswap, enum      each field at its bytes, and zeros between
     read, take         one state: a slice of port A's output, latched
     build              one state: one write, whose byte enables cover exactly the sources that are
                        not `=`, `r!` or `*`, and the tag on `write`. RTL-3 is then a property of this

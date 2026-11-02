@@ -1,5 +1,6 @@
 """Random handlers with a reference meaning: state arrays, helpers, tuples, spills, several outputs.
-Every datagram's expected output is computed by lang.Interp from the same AST the source is printed from."""
+Every datagram's expected output is computed by lang.Interp from the same AST the source is printed from.
+Some return a verdict beside their item's record, updated, instead of an output built in a cell."""
 import random
 import struct
 
@@ -9,6 +10,7 @@ from .gen import Gen, SCAL, INTS, BITS, SRC, parse_helpers, params_text, ret_tex
 FMT = {'i8': 'B', 'i16': 'H', 'i32': 'I', 'i64': 'Q', 'bool': 'B'}
 WIRE = {'i16': 'Be16', 'i32': 'Be32', 'i64': 'Be64'}  # the same integer, in network order on the wire
 SIZE = {'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8, 'bool': 1}
+VERDICTS = 0.4  # of handlers, how many return a verdict and their record
 PRELUDE = """data Fuel = Zed | Suc(prev: Fuel);
 fn id8(x: Int8) : Int8 = x;
 fn id16(x: Int16) : Int16 = x;
@@ -76,6 +78,8 @@ class H:
         self.g = Gen(r, spill=0.2)
         self.defs = []
         self.nsel = 0
+        # Drawn on its own, so that every handler without one is the handler it was before verdicts existed.
+        self.verdict = random.Random(f"verdict {seed}").random() < VERDICTS
 
     def helper_fns(self):
         p = Program(self.r)
@@ -127,7 +131,7 @@ class H:
         body = self.decide(env, lin_names, d, r.randrange(0, 3))
         for head in reversed(lets):
             body = (head[0], head[1], head[2], body)
-        if self.spans:  # one of its cells for the output, and the others go back
+        if self.spans and not self.verdict:  # one of its cells for the output, and the others go back
             body = ('lett', ['dc', 'dr'], ('call', 'peel', [('var', d)]), body)
         pattern = [d] + binder_names + (['bd'] if self.has_body else [])
         self.body = ('match', ('var', 'm'), [('Hd', pattern, body)])
@@ -142,11 +146,15 @@ class H:
         args = []
         if sends:
             args.append(('lit', r.randrange(8)) if r.random() < 0.7 else ('bin', '&', g.scalar('i8', env, 0, typed=True)[0], ('lit', 7), 8))
+        state = [('var', lin_names[n]) for n, _l, _e in self.states]
+        if self.verdict:  # the record goes back out, with some of its fields changed and the rest where they are
+            changed = [(name, g.scalar(t, env, r.randrange(0, 2), big=True)[0]) for name, t in self.item
+                       if r.random() < 0.4]
+            return ('tup', state + [('enum', ctor, args), ('upd', 'Hd', d, changed), ('var', 'fr')])
         for _n, t in fields:
             args.append(g.scalar(t, env, r.randrange(0, 2), big=True)[0])
         if self.has_body:
             args.append(('var', 'bd'))
-        state = [('var', lin_names[n]) for n, _l, _e in self.states]
         if self.spans:
             return ('tup', state + [('ctor', ctor, 'dc', args), ('ctor', 'More', 'dr', [('var', 'fr')])])
         return ('tup', state + [('ctor', ctor, d, args), ('var', 'fr')])
@@ -168,14 +176,17 @@ class H:
         ctors = []
         for ctor, sends, fs in self.outs:
             parts = (['port: Int8'] if sends else []) + [f"{n}: {self.source_type(n, t)}" for n, t in fs] + (['bd: Bytes'] if self.has_body else [])
+            if self.verdict:
+                parts = ['port: Int8'] if sends else []
             ctors.append(f"{ctor}({', '.join(parts)})" if parts else ctor)
-        out.append("data Out = " + " | ".join(ctors) + ";")
+        out.append(("enum V = " if self.verdict else "data Out = ") + " | ".join(ctors) + ";")
         for name, length, element in self.states:
             out.append(f"state {name} : Array[{length}] {SRC[element]};")
         for name, params, ret, at, body in self.defs:
             out.append(f"fn {name}({params_text(params)}) : {ret_text(ret)} = {show(body)};")
         params = [f"{n}: Array[{l}] {SRC[e]}" for n, l, e in self.states] + ["m: Hd", "fr: Free"]
-        rets = [f"Array[{l}] {SRC[e]}" for _n, l, e in self.states] + ["Out", "Free"]
+        rets = [f"Array[{l}] {SRC[e]}" for _n, l, e in self.states] + (["V", "Hd", "Free"] if self.verdict
+                                                                         else ["Out", "Free"])
         out.append(f"handler hh0({', '.join(params)}) : ({', '.join(rets)}) = {show(self.body)};")
         return "\n".join(out) + "\n"
 
@@ -188,7 +199,7 @@ class H:
     def interp(self):
         fns = {name: ([n for n, _t in params], body) for name, params, _r, _a, body in self.defs}
         fns['hh0'] = ([n for n, _l, _e in self.states] + ['m', 'fr'], self.body)
-        interp = Interp(fns, {})
+        interp = Interp(fns, {'Hd': [n for n, _t in self.item] + (['bd'] if self.has_body else [])})
         native = parse_helpers()
         native['peel'] = lambda _cells: [('#',), ('#',)]
         orig = interp.call
@@ -218,6 +229,13 @@ class H:
         item = ('Hd',) + tuple(vals) + ((('Body', body),) if self.has_body else ())
         result = interp.call('hh0', arrs + [item, ('Fr',)])
         out = result[len(self.states)]
+        if self.verdict:  # the record is what goes, and the verdict says where
+            if not next(o for o in self.outs if o[0] == out[0])[1]:
+                return None, None
+            wire = b''
+            for (name, t), v in zip(self.item, result[len(self.states) + 1][1:]):
+                wire += self.packed(name, t, (1 if v else 0) if t == 'bool' else v & MASK[8 * SIZE[t]])
+            return out[1], wire + body
         ctor = out[0]
         spec = next(o for o in self.outs if o[0] == ctor)
         _c, sends, fields = spec

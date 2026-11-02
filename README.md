@@ -322,40 +322,44 @@ record Frame {
   length: Int16,
   body: Bytes
 };
-data Out = Malformed(body: Bytes) | Expired(body: Bytes) | Send(port: Int8, frame: Frame);
+enum Verdict = Malformed | Expired | Send(port: Int8);
 ```
 
 The compiler lays that across five cells, each keeping 8 bytes for a link to the next unless what is left fits, and
-nothing after the first stage of it knows: a match on `Frame` is five matches by the time Check sees it, and `Frame@d(...)` is five
-builds, so what stays in a cell stays there and is not written. What a pattern binds from a `Be16` is the integer, so the code says
-`!=(ethertype, 2048)` and `+(pack<16>(total), 14)` and nobody swaps a constant or a byte. The fields leave and arrive as
-they lie, so the runtime scatters and gathers them without looking, and the only swaps that happen are the ones a read or
-a store of a changed value needs.
+nothing after the first stage of it knows: a match on `Frame` is five matches by the time Check sees it, and building a
+`Frame` is five builds, so what stays in a cell stays there and is not written. What a pattern binds from a `Be16` is the
+integer, so the code says `!=(ethertype, 0x0800)` and `+(pack<16>(total), 14)` and nobody swaps a constant or a byte. The
+fields leave and arrive as they lie, so the runtime scatters and gathers them without looking, and the only swaps that
+happen are the ones a read or a store of a changed value needs.
 
-`d`, from a pattern on `Frame`, stands for all five cells, and each still has to go somewhere. `Frame@d(...)` builds in them,
-`More@d(free)` gives them back, and a constructor that needs one takes it with `let (c, rest) = peel(d) in`:
+The handler decides where the frame goes and hands the frame back. `Verdict` is an `enum`, a sum whose every value fits
+one register, with its tag in the low byte and its fields above it, so the decision costs no cell. `Frame@d { ... }` is the
+frame rebuilt in its own five cells with the fields it names changed and every other field left where it is:
 
 ```
-    if !(well_formed(ethertype, version, total, length, words)) then
-      let (c, rest) = peel(d) in (Malformed@c(body), More@rest(free))
-    ...
-      | More(c, rest) =>
-          let hop = next_hop(destination) in
-          (Send@c(hop, Frame@d(33554432, low16(+(pack<8>(hop), 16)), 33554432, low16(+(pack<8>(hop), 272)),
-                               ethertype, version, tos, total, id, frag,
-                               -(ttl, 1), proto, patched(sum, ttl, proto), source, destination,
-                               length, body)), rest)
+    if !(well_formed(ethertype, version, total, length, words)) then (Malformed, Frame@d {}, free)
+    else if <=(ttl, 1) then (Expired, Frame@d {}, free)
+    else
+      let hop = next_hop(destination) in
+      (Send(hop), Frame@d { dst_hi = 0x02000000, dst_lo = low16(+(pack<8>(hop), 0x10)),
+                            src_hi = 0x02000000, src_lo = low16(+(pack<8>(hop), 0x110)),
+                            ttl = -(ttl, 1), sum = patched(sum, ttl, proto) }, free)
 ```
 
-The cells count wherever they came from. The five that arrived are in `n`, so a frame of 1514 bytes is 217 cells, and the
-one this draws for its verdict is `R(n)`:
+A refusal is one line, and it writes nothing: `Frame@d {}` is five builds in which every field stays and every link goes
+back where it was, and x86 makes no instruction of any of them. Forwarding stores the six fields it names, and the runtime
+sends the frame to the port the verdict says. The five cells that arrived are in `n`, so a frame of 1514 bytes is 217
+cells, and nothing is drawn from the reserve:
 
 ```
 $ python3 -m src.lfplo examples/ipv4.lfpl -o ipv4 --in-port 9000 --out-port 9100 --ctl-port 9001 --n-max 217
-handler ipv4: R(n) = 1 cells, W(n) = 96 steps, stack 88 bytes, 14387 cells, image 234288 bytes
+handler ipv4: R(n) = 0 cells, W(n) = 94 steps, stack 96 bytes, 14322 cells, image 233248 bytes
 ```
 
-A record built from nothing names its cells, each of which came from a draw on the reserve, as `Frame@(a, b, c, d, e)(...)`. `length`
+`d`, from a pattern on `Frame`, stands for all five cells, and each still has to go somewhere. `Frame@d(...)` and
+`Frame@d { ... }` build in them, `More@d(free)` gives them back, and a constructor of another type that needs one takes it
+with `let (c, rest) = peel(d) in`. A record built from nothing names its cells, each of which came from a draw on the
+reserve, as `Frame@(a, b, c, d, e)(...)`. `length`
 is not on the wire: admission fills it in from how long the datagram was, because a program that does not walk its body
 has no other way to find out. `tests/test_ipv4.py` runs every kind of frame through a binary on live sockets, against a model
 that shares nothing with it, and `tests/test_rtverilog.py` holds the hardware target to the binary's bytes on a sample of them.
@@ -579,7 +583,8 @@ trees: it runs after the compiler has finished, so the memory bound is the compi
 its own.
 
 The code has lost a few things to the simpler Lower, none of them about what a program means. A
-constructor bound by `let` and then matched is built before it is taken apart, a `match` on a known
+constructor bound by `let` and then matched is built before it is taken apart, which section 12 of the
+specification lists against Theorem 7.4, a `match` on a known
 null still tests it, a value with arms joins in a register and is stored from there, where it used to be
 stored in each arm, and a value computed for a `ret` is computed elsewhere and moved. Every function also
 adjusts its frame even when the frame is empty, because the backend writes its prologue before it knows
@@ -589,9 +594,9 @@ A diamond that passes through a join counts as handed over, so a scalar of that 
 moves out, even when all that happens to it is that it is stored back where it was.
 
 A record's headers still get copied, by the kernel, into cells. Reading a field in place from the frame would save that, but
-it changes the resource model, so it comes later. Other things show in `examples/ipv4.lfpl`: rebuilding a record means
-writing all of its fields out even when two of them change, `{ e with f = v }` reaches only its first cell, a literal has to be
-written in decimal, and a 48-bit address is two fields.
+it changes the resource model, so it comes later. Other things show in `examples/ipv4.lfpl`: an update names its fields in
+the order the record declares them, an enum can be built and returned but not yet matched or stored in a cell, so only the
+runtime reads a verdict, and a 48-bit address is two fields.
 
 The largest gap in the language itself is non-tail recursion over a structure, the model's DESCEND
 and ASCEND, which is rejected for now. A tree therefore cannot be walked by recursing into both

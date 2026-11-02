@@ -65,9 +65,10 @@ class TheExample(unittest.TestCase):
                 port.recv(4096)
         self.assertIsNone(router.process.poll())
 
-    def test_its_bound_counts_the_cell_it_draws_and_nothing_else(self):
+    def test_it_draws_no_cell(self):
+        """The verdict is a register, and the frame goes out in its own cells: nothing is drawn from the reserve."""
         router = serve(self)
-        self.assertRegex(router.report, r"R\(n\) = 1 cells, W\(n\) = \d+ steps")
+        self.assertRegex(router.report, r"R\(n\) = 0 cells, W\(n\) = \d+ steps")
 
     def test_the_readme_quotes_what_the_compiler_says(self):
         router = serve(self)
@@ -99,20 +100,25 @@ class TheExample(unittest.TestCase):
         self.assertEqual(len([line for line in lines if re.match(r"type t\d+ record", line)]), 5)
 
     def test_what_stays_in_the_frame_is_not_written(self):
-        """Each cell's build, innermost first. Only the addresses, the TTL and the checksum are stored, and a
-        link is the value it was. So forwarding touches 6 fields of 15, and the verdict is a cell of its own."""
+        """Each arm's builds, innermost cell first. A refusal writes nothing: every field is where it was, and each
+        link is the value it was. Forwarding stores only the addresses, the TTL and the checksum: 6 fields of 15."""
         with open(os.path.join(ROOT, SOURCE), "rb") as handle:
             lines = list(rt_lines(handle))
         at = next(i for i, line in enumerate(lines) if line.startswith("handler"))
-        builds = [line.strip() for line in lines[at:] if line.strip().startswith("build")]
-        built = {}
-        for line in lines[:at]:
-            parts = line.split()
-            if parts and parts[0] == "ctor":
-                built[parts[1]] = parts[-1]
-        frame = [line for line in builds if built[line.split()[2].rstrip(",")].startswith(("$", "Frame"))]
-        self.assertEqual(len(frame), 5, builds)
-        last, ip2, ip1, ethernet, first = frame
+        arms: list[list[str]] = [[]]
+        for line in lines[at:]:
+            if line.strip().startswith("build"):
+                arms[-1].append(line.strip())
+            elif line.strip().startswith("ret"):
+                arms.append([])
+        malformed, expired, forwarded, after = arms
+        self.assertEqual(after, [])
+        for refusal in (malformed, expired):
+            self.assertEqual(len(refusal), 5, refusal)
+            for build in refusal:
+                self.assertRegex(build, r"^build r\d+, c\d+, none(, (=|r\d+!))+$")
+        self.assertEqual(len(forwarded), 5, forwarded)
+        last, ip2, ip1, ethernet, first = forwarded
         self.assertRegex(last, r", =, =, =$")
         self.assertRegex(ip2, r", sub\(\[0:1\], #1\), =, r\d+, =, r\d+!$")
         self.assertRegex(ip1, r", =, =, =, =, =, r\d+!$")
@@ -143,6 +149,15 @@ handler h(m: F, free: Free) : (Out, Free) = match free with
   | More(p, rest) => match m with F(d, a, b, c, e, g, h, body) =>
       if ==(c, 0) then (Gone@p(body), More@d(rest))
       else (Send@p(3, F@d(h, g, e, c, b, a, body)), rest) end end;
+"""
+
+VERDICT = """data Bytes;
+record Hdr { a: Be16, b: Int8, length: Int16, body: Bytes };
+enum V = Drop | Send(port: Int8) | Stop;
+handler h(m: Hdr, free: Free) : (V, Hdr, Free) = match m with Hdr(d, a, b, length, body) =>
+  if ==(b, 0) then (Drop, Hdr@d {}, free)
+  else if ==(b, 0xFF) then (Stop, Hdr@d { a = 0 }, free)
+  else (Send(b), Hdr@d { a = +(a, 1) }, free) end;
 """
 
 
@@ -193,6 +208,19 @@ class TheWire(unittest.TestCase):
         # 5 cells of record, and however many of body, for each item. Admission worked it out from each length.
         cells = sum(5 + (size + 6) // 7 for size in (0, 1, 7, 8, 700))
         self.assertEqual(now["admitted_cells"] - before["admitted_cells"], cells)
+
+    def test_a_verdict_in_a_register_sends_the_record_or_gives_it_back(self):
+        router = serve(self, VERDICT, ())
+        self.assertRegex(router.report, r"R\(n\) = 0 cells")
+        for size, b in ((0, 0), (5, 3), (0, 1), (700, 2), (9, 0), (1, 0xFF)):
+            body = bytes((i * 7) & 255 for i in range(size))
+            router.raw(struct.pack(">HB", 0x01FF, b) + body)
+            if b in (0, 0xFF):
+                continue
+            self.assertEqual(router.outputs[b].recv(4096).hex(), (struct.pack(">HB", 0x0200, b) + body).hex())
+        now = router.settle(6)
+        self.assertEqual((now["forwarded"], now["dropped"]), (3, 3))
+        self.assertEqual(now["pool"], now["capacity"])
 
     def test_a_verdict_that_keeps_only_some_of_the_cells_gives_the_rest_back(self):
         router = serve(self, ALL_THE_WAY, ())

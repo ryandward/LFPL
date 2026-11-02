@@ -13,11 +13,13 @@ already begins with a keyword or a name, so one token of lookahead decides it.
     program ::= decl*
     decl    ::= ('fn'|'handler') id '(' [id ':' ty {',' id ':' ty}] ')' ':' res ['@' id] '=' e ';'
               | 'data' Name ['=' ctor {'|' ctor}] ';'
+              | 'enum' Name '=' ctor {'|' ctor} ';'
               | 'record' Name '{' id ':' ty {',' id ':' ty} '}' ';'
               | 'state' id ':' ty ';'
     ctor    ::= Name ['(' id ':' ty {',' id ':' ty} ')']
     ty      ::= Name | 'Array' '[' int ']' Name | 'Fin' int
     res     ::= ty | '(' ty ',' ty {',' ty} ')'
+    int     ::= digit {digit} | '0x' hex {hex}
     e       ::= id | int | 'true' | 'false'
               | ('+'|'-'|'*'|'&'|'|'|'^'|'<<'|'>>') '(' e ',' e ')'
               | ('<'|'<='|'>'|'>='|'=='|'!=') '(' e ',' e ')'
@@ -26,7 +28,8 @@ already begins with a keyword or a name, so one token of lookahead decides it.
               | 'let' '(' id ',' id {',' id} ')' '=' e 'in' e
               | '(' e ',' e {',' e} ')' | 'idx' '(' e ',' int ')' | 'get' '(' e ',' e ')'
               | ('low8'|'low16'|'low32') '(' e ')'
-              | Name | Name '@' cells '(' [e {',' e}] ')'
+              | Name | Name '(' [e {',' e}] ')' | Name '@' cells '(' [e {',' e}] ')'
+              | Name '@' cells '{' [id '=' e {',' id '=' e}] '}'
               | 'match' e 'with' ['|'] arm {'|' arm} 'end'
               | '{' e 'with' id '=' e '}'
               | id '(' [e {',' e}] ')'
@@ -51,7 +54,7 @@ _TOKENS = tuple((
     "EOF IDENT NAME INT LET IN IF THEN ELSE MATCH WITH END TRUE FALSE FN DATA "
     "RECORD PACK LPAREN RPAREN LBRACE RBRACE COMMA COLON SEMI AT EQ ARROW BAR "
     "PLUS MINUS STAR AMP CARET SHL SHR LT LE GT GE EQEQ NE ANDAND OROR BANG "
-    "HANDLER STATE LBRACKET RBRACKET "
+    "HANDLER STATE LBRACKET RBRACKET ENUM "
 ).split())
 (
     T_EOF, T_IDENT, T_NAME, T_INT, T_LET, T_IN, T_IF, T_THEN,
@@ -60,13 +63,14 @@ _TOKENS = tuple((
     T_SEMI, T_AT, T_EQ, T_ARROW, T_BAR, T_PLUS, T_MINUS, T_STAR,
     T_AMP, T_CARET, T_SHL, T_SHR, T_LT, T_LE, T_GT, T_GE,
     T_EQEQ, T_NE, T_ANDAND, T_OROR, T_BANG,
-    T_HANDLER, T_STATE, T_LBRACKET, T_RBRACKET,
+    T_HANDLER, T_STATE, T_LBRACKET, T_RBRACKET, T_ENUM,
 ) = range(len(_TOKENS))
 
 _KEYWORDS = {b"let": T_LET, b"in": T_IN, b"if": T_IF, b"then": T_THEN,
              b"else": T_ELSE, b"match": T_MATCH, b"with": T_WITH, b"end": T_END,
              b"true": T_TRUE, b"false": T_FALSE, b"fn": T_FN, b"data": T_DATA,
-             b"record": T_RECORD, b"pack": T_PACK, b"handler": T_HANDLER, b"state": T_STATE}
+             b"record": T_RECORD, b"pack": T_PACK, b"handler": T_HANDLER, b"state": T_STATE,
+             b"enum": T_ENUM}
 _ONE = {ord("("): T_LPAREN, ord(")"): T_RPAREN, ord("{"): T_LBRACE,
         ord("}"): T_RBRACE, ord(","): T_COMMA, ord(":"): T_COLON,
         ord(";"): T_SEMI, ord("@"): T_AT, ord("="): T_EQ, ord("|"): T_BAR,
@@ -90,7 +94,7 @@ _KINDS = tuple((
     "FN PARAM TYPE RESWORD DATA CTORDECL FIELD RECORD LET BINDER IF MATCH ARM "
     "WITH BINOP CMP AND OR NOT CALL CTOR DIAMOND PACK VAR INT BOOL NULLCTOR "
     "EOF HANDLER STATE TARRAY TFIN TTUPLE TUPLE IDX GET RTDECL RTDECLMORE LOW "
-    "VARLAST LIVE "
+    "VARLAST LIVE UPDATE VARAT ENUM VALUE "
 ).split())
 (
     K_FN, K_PARAM, K_TYPE, K_RESWORD, K_DATA, K_CTORDECL, K_FIELD, K_RECORD,
@@ -100,7 +104,13 @@ _KINDS = tuple((
     K_HANDLER, K_STATE, K_TARRAY, K_TFIN, K_TTUPLE, K_TUPLE, K_IDX, K_GET, K_RTDECL, K_RTDECLMORE,
     K_LOW,
     K_VARLAST, K_LIVE,  # what src/righttoleft.py adds, which no parser ever writes
+    K_UPDATE,           # `R@d {`, which src/spans.py rewrites away
+    K_VARAT,            # and what it leaves in its place: a name by its position in scope, whatever it is called by then
+    K_ENUM,             # a declaration of a sum held in a register
+    K_VALUE,            # and one of its values: open(VALUE) `C(`, or from Check, leaf(VALUE) for a C with no fields
 ) = range(len(_KINDS))
+VARAT = struct.Struct("<HB")  # the position, and whether the right-to-left pass found this to be its last use
+VALUE = struct.Struct("<HB")  # the constructor, as Check numbers it, and how many fields it has
 
 # What an array's element can be, as Check and the payload of leaf(TARRAY) name it.
 ELEMENT_CODES = {b"Int8": 1, b"Int16": 2, b"Int32": 3, b"Int64": 4, b"Bool": 5}
@@ -130,7 +140,9 @@ def show_event(tag: int, payload: bytes) -> str:
 
 # -------------------------------------------------------------------- Lex
 
-_M_NONE, _M_WORD, _M_NUMBER, _M_SYMBOL, _M_COMMENT = range(5)
+_M_NONE, _M_WORD, _M_NUMBER, _M_HEX, _M_SYMBOL, _M_COMMENT = range(6)
+_X = ord("x")
+_HEX_DIGITS = {byte: int(chr(byte), 16) for byte in b"0123456789abcdefABCDEF"}
 
 
 class Lexer(Stage):
@@ -143,6 +155,7 @@ class Lexer(Stage):
         self.mode = _M_NONE
         self.chain: list[int] = []  # the pending lexeme's cells, in sigma
         self.value = 0
+        self.digits = 0  # of the number being read, not counting a 0x
         self.first = 0
         self.held: Optional[int] = None
         self.line = 1
@@ -157,7 +170,7 @@ class Lexer(Stage):
         assert cell is not None
         ring = self.ring
         if ring.store.tag(cell) == BYTE_EOF:
-            if self.mode in (_M_WORD, _M_NUMBER, _M_SYMBOL):
+            if self.mode in (_M_WORD, _M_NUMBER, _M_HEX, _M_SYMBOL):
                 self._complete()
                 self.held = cell
             else:
@@ -179,10 +192,18 @@ class Lexer(Stage):
                 self.held = cell
         elif self.mode == _M_NUMBER:
             if 48 <= byte <= 57:
-                self.value = self.value * 10 + byte - 48
-                if self.value >= 1 << 64:
-                    raise Reject(f"line {self.line}: integer exceeds 64 bits")
+                self._digit(cell, 10, byte - 48)
+            elif byte == _X and self.digits == 1 and self.value == 0:
+                self.mode, self.digits = _M_HEX, 0
                 ring.drop(self, cell)
+            elif _is_word(byte):
+                raise Reject(f"line {self.line}: malformed number")
+            else:
+                self._complete()
+                self.held = cell
+        elif self.mode == _M_HEX:
+            if byte in _HEX_DIGITS:
+                self._digit(cell, 16, _HEX_DIGITS[byte])
             elif _is_word(byte):
                 raise Reject(f"line {self.line}: malformed number")
             else:
@@ -201,6 +222,13 @@ class Lexer(Stage):
         else:
             self._begin(cell, byte)
 
+    def _digit(self, cell: int, base: int, digit: int) -> None:
+        self.value = self.value * base + digit
+        self.digits += 1
+        if self.value >= 1 << 64:
+            raise Reject(f"line {self.line}: integer exceeds 64 bits")
+        self.ring.drop(self, cell)
+
     def _begin(self, cell: int, byte: int) -> None:
         ring = self.ring
         if byte in b" \t\r\n":
@@ -211,7 +239,7 @@ class Lexer(Stage):
             self.mode = _M_COMMENT
             ring.drop(self, cell)
         elif 48 <= byte <= 57:
-            self.mode, self.value = _M_NUMBER, byte - 48
+            self.mode, self.value, self.digits = _M_NUMBER, byte - 48, 1
             self.chain = [cell]
         elif _is_word(byte):
             self.mode = _M_WORD
@@ -228,7 +256,9 @@ class Lexer(Stage):
         """Pack the lexeme into its head cell and DROP the rest of the chain."""
         ring = self.ring
         head, rest = self.chain[0], self.chain[1:]
-        if self.mode == _M_NUMBER:
+        if self.mode in (_M_NUMBER, _M_HEX):
+            if not self.digits:
+                raise Reject(f"line {self.line}: malformed number")
             ring.pass_(self, head, T_INT, struct.pack("<Q", self.value))
         elif self.mode == _M_SYMBOL:
             ring.pass_(self, head, _ONE[self.first])
@@ -270,12 +300,13 @@ S_PACK_LT, S_PACK_W, S_PACK_NEXT, S_PACK_LP = range(66, 70)
 S_TA_LB, S_TA_N, S_TA_RB, S_TA_ELEM, S_TF_N, S_TT_TYPE, S_TT_NEXT = range(70, 77)
 S_LTB, S_LTB_NEXT, S_ST_COLON, S_ST_TYPE, S_ST_SEMI = range(77, 82)
 S_CTOR_DL, S_CTOR_DN = range(82, 84)
+S_UP_FIRST, S_UP_FIELD, S_UP_EQ, S_UP_E, S_UP_NEXT = range(84, 89)
 
 # Expression-expecting states, and what follows the expression.
 _AFTER = {S_BODY: S_SEMI, S_LET_E1: S_LET_IN, S_IF_COND: S_IF_THEN_KW,
           S_IF_THEN: S_IF_ELSE_KW, S_M_SCRUT: S_M_WITH, S_W_E: S_W_KW,
           S_W_V: S_W_END, S_OP_E1: S_OP_COMMA, S_OP_E2: S_OP_END,
-          S_NOT_E: S_NOT_END, S_ARG: S_ARGS_NEXT, S_ARGS_FIRST: S_ARGS_NEXT}
+          S_NOT_E: S_NOT_END, S_ARG: S_ARGS_NEXT, S_ARGS_FIRST: S_ARGS_NEXT, S_UP_E: S_UP_NEXT}
 # Expression-expecting states whose construct has no closing token: when the
 # child completes, the frame's own cell carries the close event.
 _IMPLICIT_CLOSE = {S_LET_BODY: K_LET, S_IF_ELSE: K_IF, S_ARM_BODY: K_ARM}
@@ -393,6 +424,9 @@ class Parser(Stage):
         elif name_tag == T_NAME and tag == T_AT:
             self._push(K_CTOR, S_CTOR_D, cell)
             self._emit(name_cell, OPEN, K_CTOR, text)
+        elif name_tag == T_NAME and tag == T_LPAREN:
+            self._push(K_VALUE, S_ARGS_FIRST, cell)
+            self._emit(name_cell, OPEN, K_VALUE, text)
         else:
             kind = K_VAR if name_tag == T_IDENT else K_NULLCTOR
             self._emit(name_cell, LEAF, kind, text)
@@ -410,6 +444,8 @@ class Parser(Stage):
             self._push(K_STATE, S_NAME, cell)
         elif tag == T_DATA:
             self._push(K_DATA, S_NAME, cell)
+        elif tag == T_ENUM:
+            self._push(K_ENUM, S_NAME, cell)
         elif tag == T_RECORD:
             self._push(K_RECORD, S_NAME, cell)
         else:
@@ -491,7 +527,7 @@ class Parser(Stage):
                 self._emit(cell, OPEN, K_STATE, payload)
             else:
                 require(T_NAME, "a type name")
-                self._set(S_DATA_EQ if kind == K_DATA else S_REC_LBRACE)
+                self._set(S_DATA_EQ if kind in (K_DATA, K_ENUM) else S_REC_LBRACE)
                 self._emit(cell, OPEN, kind, payload)
         elif state == S_LPAREN:
             next_state(S_PARAM_OR_END, "'('", T_LPAREN)
@@ -593,7 +629,7 @@ class Parser(Stage):
             self.frames.pop()
             self._emit(cell, CLOSE, kind)
         elif state == S_DATA_EQ:
-            if tag == T_SEMI:  # a forward declaration, for mutually recursive types
+            if tag == T_SEMI and kind == K_DATA:  # a forward declaration, for mutually recursive types
                 self.frames.pop()
                 self._emit(cell, CLOSE, K_DATA)
             else:
@@ -610,7 +646,7 @@ class Parser(Stage):
             else:
                 require(T_SEMI, "'|' or ';'")
                 self.frames.pop()
-                self._emit(cell, CLOSE, K_DATA)
+                self._emit(cell, CLOSE, kind)
         elif state == S_CD_NEXT:
             if tag == T_LPAREN:
                 self._set(S_CD_FIELD)
@@ -783,7 +819,27 @@ class Parser(Stage):
             else:
                 next_state(S_CTOR_LP, "',' or ')'", T_RPAREN)
         elif state == S_CTOR_LP:
-            next_state(S_ARGS_FIRST, "'('", T_LPAREN)
+            if tag == T_LBRACE:
+                self._set(S_UP_FIRST)
+                self._emit(cell, LEAF, K_UPDATE)
+            else:
+                next_state(S_ARGS_FIRST, "'(' or '{'", T_LPAREN)
+        elif state in (S_UP_FIRST, S_UP_FIELD):
+            if tag == T_RBRACE and state == S_UP_FIRST:
+                self._close_args(cell)
+                return
+            require(T_IDENT, "a field name")
+            self._set(S_UP_EQ)
+            self._emit(cell, LEAF, K_FIELD, payload)
+        elif state == S_UP_EQ:
+            next_state(S_UP_E, "'='", T_EQ)
+        elif state == S_UP_NEXT:
+            if tag == T_COMMA:
+                self._set(S_UP_FIELD)
+                ring.drop(self, cell)
+            else:
+                require(T_RBRACE, "',' or '}'")
+                self._close_args(cell)
         elif state == S_PACK_LT:
             next_state(S_PACK_W, "'<'", T_LT)
         elif state == S_PACK_W:

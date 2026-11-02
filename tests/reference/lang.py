@@ -40,6 +40,10 @@ def show(e):
         return f"{e[1]}({', '.join(show(x) for x in e[2])})"
     if k == 'ctor':
         return f"{e[1]}@{e[2]}({', '.join(show(x) for x in e[3])})"
+    if k == 'upd':
+        return f"{e[1]}@{e[2]} {{ {', '.join(f'{name} = {show(x)}' for name, x in e[3])} }}"
+    if k == 'enum':
+        return f"{e[1]}({', '.join(show(x) for x in e[2])})" if e[2] else e[1]
     if k == 'null':
         return e[1]
     if k == 'match':
@@ -121,6 +125,11 @@ class Interp:
             return self.call(e[1], [self.ev(x, env) for x in e[2]])
         if k == 'ctor':
             return (e[1],) + tuple(self.ev(x, env) for x in e[3])
+        if k == 'upd':  # the fields it names, and what the pattern found for the others, by their names
+            given = {name: self.ev(x, env) for name, x in e[3]}
+            return (e[1],) + tuple(given[name] if name in given else env[name] for name in self.fields[e[1]])
+        if k == 'enum':
+            return (e[1],) + tuple(self.ev(x, env) for x in e[2])
         if k == 'null':
             return (e[1],)
         if k == 'match':

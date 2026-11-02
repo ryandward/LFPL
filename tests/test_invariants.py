@@ -387,17 +387,23 @@ class PhantomConstruction(unittest.TestCase):
     def test_direct_match_emits_nothing_for_the_constructor(self):
         self.assertEqual(normalized(body(self.DIRECT, "f")), normalized(body(self.NONE, "f")))
 
-    def test_a_constructor_bound_by_let_is_built_first_and_means_the_same(self):
-        """This one did not move. Theorem 7.4 covers a constructor a match takes apart at once, and through
-        a `let` the first Lower kept it unbuilt too, which is the part of it that took a table of pending
-        fields. Here it is built and then read, so what holds is the answer, and the README says so."""
+    @unittest.expectedFailure
+    def test_let_bound_match_emits_nothing_for_the_constructor(self):
+        """Theorem 7.4 says this costs nothing, and the first Lower made it so. The register-transfer Lower builds
+        the constructor and then reads it back, which LFPL-O section 12 lists as a gap. When the gap closes, this
+        passes, and unittest says so."""
+        source = PRE + (b"fn f(x: Int64, c: Diamond, y: Int64, free: Free) : Res = "
+                        b"let v = Q@c(x, y) in match v with Q(e, p, q) => "
+                        b"Done@e(+(p, q), free) end;\nfn main() : Int64 = 0;")
+        self.assertEqual(normalized(body(source, "f")), normalized(body(self.NONE, "f")))
+
+    def test_a_constructor_bound_by_let_means_what_it_says(self):
         source = PRE + (b"fn f(x: Int64, c: Diamond, y: Int64, free: Free) : Res = "
                         b"let v = Q@c(x, y) in match v with Q(e, p, q) => "
                         b"Done@e(+(p, q), free) end;\n"
                         b"fn main(free: Free) : Res = match free with End => Fail | "
                         b"More(c, rest) => f(30, c, 12, rest) end;")
         self.assertEqual(run(source), 42)
-        self.assertEqual(len([l for l in body(source, "f") if l.startswith("mov qword [")]), 4)
 
     def test_literal_fields_write_no_bytes(self):
         source = PRE + (

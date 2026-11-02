@@ -6,7 +6,8 @@
 //   vvp sim +images=images.txt
 //
 // images.txt, in hex: for each item, `item_in free_in loads words`, then that many `address enables
-// data`. Then `words` is how many cells to print back. An item_in of 0 ends the file.
+// data`. Then `words` is how many cells to print back. An item_in of 0 ends the file. -DVERDICT is for
+// a handler that returns an enum beside its record, which it prints as well.
 `timescale 1ns/1ns
 `default_nettype none
 
@@ -38,9 +39,17 @@ module tb;
     reg [127:0] host_din = 128'd0;
     wire [127:0] host_dout;
 
+`ifdef VERDICT
+    wire [63:0] verdict_out;
+    `TOP dut (.clk(clk), .rst(rst), .start(start), .item_in(item_in), .free_in(free_in), .done(done),
+              .busy(busy), .out_item(out_item), .free_out(free_out), .verdict_out(verdict_out),
+              .host_en(host_en), .host_we(host_we), .host_addr(host_addr), .host_din(host_din),
+              .host_dout(host_dout));
+`else
     `TOP dut (.clk(clk), .rst(rst), .start(start), .item_in(item_in), .free_in(free_in), .done(done),
               .busy(busy), .out_item(out_item), .free_out(free_out), .host_en(host_en),
               .host_we(host_we), .host_addr(host_addr), .host_din(host_din), .host_dout(host_dout));
+`endif
 
     integer both_ports = 0;
     integer same_address = 0;
@@ -96,7 +105,12 @@ module tb;
                         $finish(0);
                     end
                 end
+`ifdef VERDICT
+                $display("ITEM %0d cycles=%0d out=%0d free=%0d verdict=%0d", items, cycles, out_item, free_out,
+                         verdict_out);
+`else
                 $display("ITEM %0d cycles=%0d out=%0d free=%0d", items, cycles, out_item, free_out);
+`endif
                 for (each = 1; each <= words; each = each + 1) begin
                     @(negedge clk);
                     host_addr = each[P-1:0];

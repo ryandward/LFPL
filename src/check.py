@@ -29,7 +29,9 @@ format, one event at a time, so they reach every reader of the stream:
     in the middle of a parameter list and G's entries for one function must stay consecutive;
   * idx, get and the narrowing low8, low16 and low32, which are primitives;
   * a built-in Free, and a type declared but never defined, which is the runtime's own to build.
-    A program with a main has no runtime, so there it is refused.
+    A program with a main has no runtime, so there it is refused;
+  * an enum, a sum whose every value fits one register: its tag in the low byte and its fields above it.
+    It is a scalar, so it has ids of its own, and making one costs no cell.
 """
 from __future__ import annotations
 
@@ -37,11 +39,11 @@ import struct
 from typing import NamedTuple, Optional
 
 from .dyck import (CLOSE, ELEMENT_CODES, OP_NAMES, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP,
-                   K_CTOR, K_CTORDECL, K_DATA, K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER,
+                   K_CTOR, K_CTORDECL, K_DATA, K_DIAMOND, K_ENUM, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER,
                    K_IDX, K_IF, K_INT, K_LET, K_LIVE, K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR,
                    K_PACK, K_PARAM, K_RECORD, K_RESWORD, K_RTDECL, K_RTDECLMORE, K_STATE, K_TARRAY, K_TFIN,
-                   K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_VARLAST, K_WITH, LEAF, OPEN, SEP,
-                   ev_class, ev_kind, ev_tag)
+                   K_TTUPLE, K_TUPLE, K_TYPE, K_VALUE, K_VAR, K_VARAT, K_VARLAST, K_WITH, LEAF, OPEN, SEP, VALUE,
+                   VARAT, ev_class, ev_kind, ev_tag)
 from .ring import FrameStack, Reject, Ring, Stage
 from .tokens import PAYLOAD_BYTES
 
@@ -59,9 +61,11 @@ _WIRE = {T_BE16: T_I16, T_BE32: T_I32, T_BE64: T_I64}
 _LITERALS = {T_LIT8: 1, T_LIT16: 2, T_LIT32: 4, T_LIT: 8}
 _NARROWING = {b"low8": T_I8, b"low16": T_I16, b"low32": T_I32}
 _PRIMITIVES = {b"idx", b"get", b"peel", *_NARROWING}
-# Types with no entry in G. A range of ids per kind, so whether a type is linear can be read from
-# its id alone, as it already can for every other type.
-FIRST_ARRAY, FIRST_FIN, FIRST_TUPLE = 0x8000, 0xC000, 0xE000
+# Types with no entry in G, and enums. A range of ids per kind, so whether a type is linear can be read from
+# its id alone, as it already can for every other type. An enum's id is its G position past FIRST_ENUM.
+FIRST_ARRAY, FIRST_FIN, FIRST_ENUM, FIRST_TUPLE = 0x8000, 0xC000, 0xD000, 0xE000
+ENUM_BYTES = 8  # one register: the tag, then the fields
+_ENUM_FIELDS = (T_I8, T_I16, T_I32, T_I64)
 TUPLE_MAX = 6  # as many results as x86 has registers for: section 4.1's pairs, at most six wide
 _ELEMENT_TYPES = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4}  # dyck's element codes, as the ids just below
 _BUILTIN = {b"Int8": T_I8, b"Int16": T_I16, b"Int32": T_I32, b"Int64": T_I64,
@@ -128,6 +132,10 @@ def is_composite(ty: int) -> bool:
     return ty >= FIRST_ARRAY
 
 
+def is_enum(ty: int) -> bool:
+    return FIRST_ENUM <= ty < FIRST_TUPLE
+
+
 def size_of(ty: int) -> int:
     return _SIZES.get(ty, 8)
 
@@ -191,6 +199,7 @@ class CheckStage(Stage):
         self._finish_ctor()
         self._finish_data()
         self.decl_from, self.decl_to = 0, len(self.G)
+        self.seeded = len(self.G)  # what is in G before the program says anything
 
     def has_work(self) -> bool:
         return bool(self.decl_text or self.decl_queue or self.decl_from < self.decl_to)
@@ -210,14 +219,16 @@ class CheckStage(Stage):
             ctors = self._ctors(index)
             if a == K_RECORD:
                 shape = "record"
+            elif a == K_ENUM:
+                shape = "enum"
             elif not ctors:
                 shape = "abstract"
             else:
                 shape = "tagged" if self._g(ctors[0])[4] else "tagless"
-            return f"type t{index + FIRST_NAMED} {shape} {name}".encode()
+            return f"type t{self._type_id(index)} {shape} {name}".encode()
         if kind == E_CTOR:
-            tag = "null" if b else (str(a) if d else "-")
-            return f"ctor c{index} t{x + FIRST_NAMED} {tag} {name}".encode()
+            tag = str(a) if self._g(x)[1] == K_ENUM else "null" if b else (str(a) if d else "-")
+            return f"ctor c{index} t{self._type_id(x)} {tag} {name}".encode()
         if kind == E_FIELD:
             return f"field c{x} {a} {b} {self._rt_type(z)} {name}".encode()
         return b""
@@ -301,7 +312,7 @@ class CheckStage(Stage):
 
     def _tuple_type(self, members: list[int], declared: bool = False) -> int:
         if len(members) > TUPLE_MAX:
-            raise self._reject(f"a tuple of {len(members)}: at most {TUPLE_MAX}")
+            raise self._reject(f"section 8.2: a tuple of {len(members)}: at most {TUPLE_MAX}, which is as many registers as a result comes back in")
         if any(m >= FIRST_TUPLE for m in members):
             raise self._reject("a tuple cannot hold a tuple: tuples are flat, because they are "
                                "only ever registers")
@@ -348,7 +359,10 @@ class CheckStage(Stage):
         found = self._g_find(E_TYPE, name)
         if found is None:
             raise self._reject(f"unknown type {key.decode()}")
-        return found + FIRST_NAMED
+        return self._type_id(found)
+
+    def _type_id(self, index: int) -> int:
+        return index + (FIRST_ENUM if self._g(index)[1] == K_ENUM else FIRST_NAMED)
 
     def _bind(self, name: bytes, ty: int, form: Optional[Cells] = None) -> int:
         """A new binder. By default its cell count is an unknown of its own, except that
@@ -403,11 +417,15 @@ class CheckStage(Stage):
         return Cells(constant, unknowns, bool(opaque))
 
     def _use(self, name: bytes) -> tuple[int, int, int]:
-        index, ty, linear = self._lookup(name)
+        return self._use_at(self._lookup(name)[0])
+
+    def _use_at(self, index: int) -> tuple[int, int, int]:
+        data = self.B.at(index)[1]
+        ty, linear, *_form = _BINDER.unpack_from(data, PAYLOAD_BYTES)
         if linear != 255:
             if self.used >> linear & 1:
                 raise self._reject(
-                    f"linear variable {name.rstrip(bytes(1)).decode()} used twice")
+                    f"linear variable {data[:PAYLOAD_BYTES].rstrip(bytes(1)).decode()} used twice")
             self.used |= 1 << linear
         return index, ty, linear
 
@@ -441,6 +459,8 @@ class CheckStage(Stage):
             return "integer literal"
         if ty >= FIRST_TUPLE:
             return "(" + ", ".join(self._show(m) for m in self._tuple_of(ty)) + ")"
+        if is_enum(ty):
+            return self.G.at(ty - FIRST_ENUM)[1][:PAYLOAD_BYTES].rstrip(b"\0").decode()
         if ty >= FIRST_FIN:
             return f"Fin {self._fin_of(ty)}"
         if ty >= FIRST_ARRAY:
@@ -473,8 +493,8 @@ class CheckStage(Stage):
         store = self.ring.store
         tag, payload = store.tag(cell), store.payload(cell)
         cls, kind = ev_class(tag), ev_kind(tag)
-        if kind in (K_DATA, K_CTORDECL, K_RECORD, K_STATE) or (
-                len(self.K) and self.K.peek()[0] in (K_DATA, K_CTORDECL, K_RECORD, K_STATE)):
+        if kind in (K_DATA, K_CTORDECL, K_RECORD, K_STATE, K_ENUM) or (
+                len(self.K) and self.K.peek()[0] in (K_DATA, K_CTORDECL, K_RECORD, K_STATE, K_ENUM)):
             self._declaration(cls, kind, payload)
             self.ring.drop(self, cell)
             return
@@ -511,21 +531,23 @@ class CheckStage(Stage):
             self.decl_queue.append(f"state {name} {self._rt_type(ty)}".encode())
         elif cls == CLOSE and kind == K_STATE:
             self.K.pop()
-        elif cls == OPEN and kind in (K_DATA, K_RECORD):
+        elif cls == OPEN and kind in (K_DATA, K_RECORD, K_ENUM):
             found = self._g_find(E_TYPE, payload)
             self.decl_forward = -1
             if found is not None:
                 # G's first entry is the built-in Free, which a Phase 1 program declares for
                 # itself. The runtime still checks the shape of what a handler is given.
-                if self._g(found)[1] != _FORWARD and found != 0:
+                if kind == K_ENUM or (self._g(found)[1] != _FORWARD and found != 0):
                     raise self._reject("duplicate type name")
                 self.decl_forward = found
             self.decl_type = self._g_push(E_TYPE, payload, a=kind)
             self._frame(kind, c1=len(self.G))
             self.decl_field_count = 0
             if kind == K_RECORD:
+                self._refuse_a_second(payload, record=True)
                 self.decl_ctor = self._g_push(E_CTOR, payload, x=self.decl_type)
         elif cls == OPEN and kind == K_CTORDECL:
+            self._refuse_a_second(payload)
             self.decl_ctor = self._g_push(E_CTOR, payload, x=self.decl_type)
             self._frame(kind)
             self.decl_field_count = 0
@@ -537,6 +559,11 @@ class CheckStage(Stage):
                 raise self._reject("section 4.5: an array lives in its own region of the image, "
                                    "so it cannot be stored in a cell")
             field_ty = self._type_token(kind, payload)
+            if self._g(self.decl_type)[1] == K_ENUM and field_ty not in _ENUM_FIELDS:
+                raise self._reject(f"an enum's fields are integers for now, and this is {self._show(field_ty)}")
+            if is_enum(field_ty):
+                raise self._reject(f"an enum cannot be stored in a cell yet: {self._show(field_ty)} is held in a "
+                                   f"register (section 12)")
             if field_ty == T_DIAMOND:
                 raise self._reject("a diamond cannot be stored in a field")
             _, a, b, c, d, x, y, _z = self._g(field)
@@ -551,6 +578,10 @@ class CheckStage(Stage):
             self._layout(self.decl_type, tagged=False, tagless=False)
             self._write_out_declaration()
             self._resolve_forward()
+        elif cls == CLOSE and kind == K_ENUM:
+            self.K.pop()
+            self._finish_enum()
+            self._write_out_declaration()
         elif cls == CLOSE and kind == K_DATA:
             self.K.pop()
             if self._ctors(self.decl_type):
@@ -565,6 +596,14 @@ class CheckStage(Stage):
                 self._g_set(self.decl_type, _FORWARD, b, c, d, x, y, z)
         else:
             raise self._reject("malformed declaration")
+
+    def _refuse_a_second(self, name: bytes, record: bool = False) -> None:
+        """A constructor's name means one thing: src/spans.py knows a record by it. The built-in Free's End and
+        More may be declared again, by a program that spells Free out or gives the names to a type of its own, as
+        Phase 1 programs do, but not as a record, which would take every pattern on the reserve for its own."""
+        found = self._g_find(E_CTOR, name)
+        if found is not None and (record or found >= self.seeded):
+            raise self._reject(f"duplicate constructor name {name.rstrip(bytes(1)).decode()}")
 
     def _write_out_declaration(self) -> None:
         self.decl_from, self.decl_to = self.decl_type, len(self.G)
@@ -629,15 +668,37 @@ class CheckStage(Stage):
         if not self._is_tuple(self.ret_ty):
             raise self._reject("section 3.1: a handler returns a tuple")
         results = self._tuple_of(self.ret_ty)
-        if len(results) != len(states) + 2 or results[-1] != reserve or any(
+        verdict = len(results) == len(states) + 3 and is_enum(results[len(states)])
+        if len(results) != len(states) + 2 + verdict or results[-1] != reserve or any(
                 results[i] != states[i][1] for i in range(len(states))):
-            raise self._reject("section 3.1: a handler returns each state slot, an output and a Free")
+            raise self._reject("section 3.1: a handler returns each state slot, an output and a Free, or each "
+                               "state slot, a verdict, the record it is about and a Free")
 
     def _finish_data(self) -> None:
         ctors = self._ctors(self.decl_type)
         fields = [self._g(c)[3] for c in ctors]
         tagless = (len(ctors) == 2 and sorted(fields)[0] == 0 and sorted(fields)[1] > 0)
         self._layout(self.decl_type, tagged=not tagless, tagless=tagless)
+
+    def _finish_enum(self) -> None:
+        """Section 4.11: the tag in the register's low byte, and each field after it at its natural alignment."""
+        ctors = self._ctors(self.decl_type)
+        if len(ctors) > LINEAR_BINDERS_MAX:
+            raise self._reject(f"more than {LINEAR_BINDERS_MAX} constructors")
+        for tag, ctor in enumerate(ctors):
+            count = self._g(ctor)[3]
+            offset = 1
+            for position in range(ctor + 1, ctor + 1 + count):
+                _kind, _a, _b, c, d, x, y, field_ty = self._g(position)
+                size = size_of(field_ty)
+                offset = (offset + size - 1) // size * size
+                if offset + size > ENUM_BYTES:
+                    name = self.G.at(ctor)[1][:PAYLOAD_BYTES].rstrip(b"\0").decode()
+                    raise self._reject(f"constructor {name} does not fit a register ({ENUM_BYTES} bytes) with its tag")
+                self._g_set(position, offset, size, c, d, x, y, field_ty)
+                offset += size
+            _, _a, _b, c, _d, x, y, z = self._g(ctor)
+            self._g_set(ctor, tag, count == 0, count, 1, x, y, z)
 
     def _layout(self, type_index: int, tagged: bool, tagless: bool) -> None:
         """Place fields in the 16-byte cell, or reject. Section 3.1's ceiling."""
@@ -718,11 +779,27 @@ class CheckStage(Stage):
             if found is None:
                 raise self._reject(f"unknown constructor {payload.rstrip(bytes(1)).decode()}")
             _, _tag, is_null, count, _tagged, type_index, _y, _z = self._g(found)
+            if self._g(type_index)[1] == K_ENUM:
+                name = payload.rstrip(bytes(1)).decode()
+                raise self._reject(f"{name} is a constructor of the enum {self._show(FIRST_ENUM + type_index)}, and "
+                                   f"takes no cell: {name}(...) is one")
             if is_null:
                 raise self._reject("a null constructor takes no cell")
             self._frame(K_CTOR, a=count, t1=type_index + FIRST_NAMED, c1=found)
             self.child_seen = False
             return kind, bytes((count,))
+        elif kind == K_VALUE:
+            found = self._g_find(E_CTOR, payload)
+            name = payload.rstrip(bytes(1)).decode()
+            if found is None:
+                raise self._reject(f"unknown constructor {name}")
+            _, _tag, _null, count, _tagged, type_index, _y, _z = self._g(found)
+            if self._g(type_index)[1] != K_ENUM:
+                raise self._reject(f"{name} is a constructor of {self._show(type_index + FIRST_NAMED)}, which is "
+                                   f"built in a cell: {name}@d(...)")
+            self._frame(K_VALUE, a=count, t1=FIRST_ENUM + type_index, c1=found)
+            self.child_seen = False
+            return kind, VALUE.pack(found, count)
         elif kind == K_PACK:
             self._frame(K_PACK, a=len(payload.rstrip(bytes(1))))
             self.child_seen = False
@@ -795,7 +872,7 @@ class CheckStage(Stage):
             return kind, P_LET_RT.pack(1, is_linear(ty), size_of(ty), 1)
         if kind == K_TUPLE:
             if len(self.TM) - frame[4] >= TUPLE_MAX:
-                raise self._reject(f"a tuple of more than {TUPLE_MAX}")
+                raise self._reject(f"section 8.2: a tuple of more than {TUPLE_MAX}, which is as many registers as a result comes back in")
             self.TM.push(0, struct.pack("<H", self.ty))
             return kind, payload
         if kind == K_LOW:
@@ -822,6 +899,9 @@ class CheckStage(Stage):
                 self.used = frame[6]
             self._store(frame)
         elif kind == K_MATCH:
+            if is_enum(self.ty):
+                raise self._reject(f"{self._show(self.ty)} is an enum, held in a register, and matching one is "
+                                   f"not built yet: section 12")
             if self.ty < FIRST_NAMED or is_composite(self.ty):
                 raise self._reject(f"cannot match on {self._show(self.ty)}")
             frame[2] = self.ty
@@ -856,6 +936,8 @@ class CheckStage(Stage):
             self._arg(frame)
             field = self._g(frame[4] + 1 + frame[5])
             return kind, P_FIELD.pack(frame[5], field[1], field[2], attributes(field[7]))
+        elif kind == K_VALUE:
+            self._arg(frame)
         elif kind == K_PACK:
             self._need_int(self.ty, "a pack field")
             frame[5] += 1
@@ -907,7 +989,7 @@ class CheckStage(Stage):
         position = frame[5]
         if position >= frame[0]:
             raise self._reject(f"too many arguments: expected {frame[0]}")
-        if self.K.peek()[0] == K_CTOR:
+        if self.K.peek()[0] in (K_CTOR, K_VALUE):
             wanted = value_of(self._g(frame[4] + 1 + position)[7])
         else:
             wanted = self._g(frame[4] + position)[5]
@@ -1000,7 +1082,7 @@ class CheckStage(Stage):
                                    f"is an integer: {self._show(_WIRE[ty])} here")
             if self.K.peek()[0] == K_TTUPLE:
                 if len(self.TM) - frame[4] >= TUPLE_MAX:
-                    raise self._reject(f"a tuple of more than {TUPLE_MAX}")
+                    raise self._reject(f"section 8.2: a tuple of more than {TUPLE_MAX}, which is as many registers as a result comes back in")
                 self.TM.push(0, struct.pack("<H", ty))
                 return None
             if frame[0] == 1:
@@ -1014,6 +1096,9 @@ class CheckStage(Stage):
             return K_PARAM, P_PARAM_RT.pack(src, size_of(ty), is_linear(ty), ty)
         if kind == K_RESWORD:
             src, ty, _ = self._lookup(payload)
+            if not is_linear(self.ret_ty):
+                raise self._reject(f"'@' names the cell a function gives back, and {self._show(self.ret_ty)} is "
+                                   f"no cell")
             if ty != self.ret_ty:
                 raise self._reject("'@' must name a parameter of the result type")
             self.fn_at = src + 1
@@ -1053,6 +1138,11 @@ class CheckStage(Stage):
             self.ty = ty
             self.form = self._form_of(src)
             return kind, P_VAR.pack(src, linear != 255, size_of(ty))
+        if kind == K_VARAT:
+            position, last = VARAT.unpack_from(payload)
+            src, self.ty, linear = self._use_at(position)
+            self.form = self._form_of(src)
+            return K_VARLAST if last else K_VAR, P_VAR.pack(src, linear != 255, size_of(self.ty))
         if kind == K_INT:
             value = struct.unpack_from("<Q", payload)[0]
             self.ty = (T_LIT8 if value < 1 << 8 else T_LIT16 if value < 1 << 16
@@ -1064,7 +1154,9 @@ class CheckStage(Stage):
             if found is None or not self._g(found)[2]:
                 raise self._reject(
                     f"{payload.rstrip(bytes(1)).decode()} is not a null constructor")
-            self.ty = self._g(found)[5] + FIRST_NAMED
+            self.ty = self._type_id(self._g(found)[5])
+            if is_enum(self.ty):  # a value with no fields, which is its tag
+                return K_VALUE, VALUE.pack(found, 0)
             return kind, P_TYPE_RT.pack(self.ty)
         return kind, payload
 
@@ -1072,7 +1164,7 @@ class CheckStage(Stage):
         frame = self._top()
         if self.K.peek()[0] == K_LET:
             if len(self.N) - frame[5] >= TUPLE_MAX:
-                raise self._reject(f"more than {TUPLE_MAX} names in one let")
+                raise self._reject(f"section 8.2: more than {TUPLE_MAX} names in one let")
             self.N.push(0, payload)
             return K_BINDER, b""
         position = frame[1]
@@ -1103,7 +1195,8 @@ class CheckStage(Stage):
                                                position - ctor - 1, count)
         if count and self.G.at(ctor + count)[1][:PAYLOAD_BYTES].rstrip(b"\0") == LINK_NAME:
             raise self._reject(f"{{ with }} reaches the first cell of {self._show(frame[2])}, and "
-                               f"{payload.rstrip(bytes(1)).decode()} is not there: rebuild it with a match")
+                               f"{payload.rstrip(bytes(1)).decode()} is not there: take it apart with a match, "
+                               f"and write {self._show(frame[2])}@d {{ {payload.rstrip(bytes(1)).decode()} = ... }}")
         raise self._reject(f"no field {payload.rstrip(bytes(1)).decode()} in {self._show(frame[2])}")
 
     # --- close
@@ -1142,7 +1235,7 @@ class CheckStage(Stage):
             if not FIRST_ARRAY <= array < FIRST_FIN:
                 raise self._reject("get takes an array and an index")
             length, element = self._array_of(array)
-            if not FIRST_FIN <= self.ty < FIRST_TUPLE or self._fin_of(self.ty) != length:
+            if not FIRST_FIN <= self.ty < FIRST_ENUM or self._fin_of(self.ty) != length:
                 raise self._reject(f"get's index must be Fin {length}, got {self._show(self.ty)}")
             self.ty = self._tuple_type([array, element])
             self.K.pop()
@@ -1205,7 +1298,7 @@ class CheckStage(Stage):
         elif kind in (K_AND, K_OR, K_NOT):
             if self.ty != T_BOOL:
                 raise self._reject("a logical operand must be Bool")
-        elif kind in (K_CALL, K_CTOR):
+        elif kind in (K_CALL, K_CTOR, K_VALUE):
             if self.child_seen:
                 self._arg(frame)
                 frame = self._top()

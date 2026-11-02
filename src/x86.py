@@ -145,6 +145,7 @@ class Backend:
         self.tagged: dict[str, bool] = {}
         self.tuples: dict[str, list[str]] = {}
         self.fins: set[str] = set()
+        self.enums: set[str] = set()  # types whose values are one register: scalars, whatever their name
         self.aliases: dict[str, str] = {}
         self.functions: dict[str, Function] = {}
         self.fn: Optional[Function] = None
@@ -207,7 +208,7 @@ class Backend:
     # --- homes
 
     def _is_linear(self, ty: str) -> bool:
-        return ty not in SCALAR_TYPES and self._resolve(ty) not in self.fins
+        return ty not in SCALAR_TYPES and self._resolve(ty) not in self.fins and self._resolve(ty) not in self.enums
 
     def _resolve(self, name: str) -> str:
         while name in self.aliases:
@@ -505,6 +506,8 @@ class Backend:
         elif head == "type":
             parts = rest.split()
             self.tagged[parts[0]] = parts[1] == "tagged"
+            if parts[1] == "enum":
+                self.enums.add(parts[0])
         elif head == "alias":
             parts = rest.split()
             self.aliases[parts[0]] = parts[1]
@@ -877,6 +880,30 @@ class Backend:
             self._or_into(register, bits // 8, place)
         self._define(a[0], register)
 
+    def i_enum(self, a: list[str]) -> None:
+        """The tag and every literal field are one immediate. A field in a register is zero extended already,
+        and goes to its bytes by a shift, through r11."""
+        tag, fields = self.ctors[a[1]]
+        pins: frozenset = frozenset()
+        places = []
+        for operand in a[2:]:
+            place, pins = self._operand(operand, pins)
+            places.append(place)
+        register = self._take(pins)
+        known = int(tag)
+        for (off, size), place in zip(fields, places):
+            if isinstance(place, Imm):
+                known |= _masked(place.value, size) << 8 * off
+        self._load(register, Imm(known))
+        for (off, _size), place in zip(fields, places):
+            if isinstance(place, Imm):
+                continue
+            self._load(TRANSIT, place)
+            self.ins("shl", TRANSIT, str(8 * off))
+            self.ins("or", register, TRANSIT)
+            self.clobbered.add(TRANSIT)
+        self._define(a[0], register)
+
     def i_bswap(self, a: list[str]) -> None:
         """`rol` on the 16-bit register leaves the upper bits, which are zero, as they are, and a 32-bit `bswap`
         clears them. Nothing here reads `movbe`, which an older x86-64 does not have."""
@@ -991,6 +1018,13 @@ class Backend:
         return moves, consumed, pins
 
     def i_build(self, a: list[str]) -> None:
+        if a[2] != "write" and all(source in ("=", "*") or source.endswith("!") for source in a[3:]):
+            # Every field holds what it should already, so nothing is stored, and the cell need not be in a register.
+            for source in a[3:]:
+                if source.endswith("!"):
+                    self._free(self.reg(source[:-1]))
+            self.linear.add(self.reg(a[0]))
+            return
         base = self._phys(self.reg(a[0]))
         pins = self._settle(a[3:], frozenset((base,)))
         moves, consumed, _pins = self._field_moves(base, a[1], a[2], a[3:], pins)

@@ -105,6 +105,7 @@ h \;:\; \Sigma \otimes \mathsf{Item} \otimes \mathsf{Free} \;\multimap\; \Sigma 
 - **Σ** is the persistent state: fixed-size linear arrays plus a fixed set of cell slots. It never grows (section 4.5).
 - **Free** is the reserve of R(n) cells handed to this item at admission. The handler returns whatever it did not use.
 - **Out** is a bounded list of at most O\_max messages, each of at most N\_out cells.
+- Or the handler returns a **verdict** beside a record, Σ ⊗ V ⊗ R ⊗ Free, where V is a sum held in a register (section 4.11). The verdict says where the record goes, so deciding costs no cell.
 
 The compiler derives W(n) and R(n) for every handler (section 5) and writes them into the image as an admission table.
 
@@ -172,7 +173,7 @@ C \;\ge\; K_{\mathsf{in}} N_{\max} \;+\; \big(R(N_{\max}) + N_{\max}\big) \;+\; 
 
 ## 4. The language
 
-LFPL-O is the first specification's LFPL with seven additions:
+LFPL-O is the first specification's LFPL with nine additions:
 
 - recursion restricted to structural recursion, so every function terminates;
 - every primitive total;
@@ -180,7 +181,9 @@ LFPL-O is the first specification's LFPL with seven additions:
 - unboxed pairs, so a function can return two things without a cell;
 - handlers as the only entry points;
 - records that span cells;
-- fields in network byte order.
+- fields in network byte order;
+- record update, which names only the fields that change;
+- sums held in a register, so that a decision costs no cell.
 
 Everything else, including ◇, exactly-once linearity and in-place construction, is unchanged.
 
@@ -192,14 +195,16 @@ Everything else, including ◇, exactly-once linearity and in-place construction
 \mathit{field} &::=& \tau \mid \mathsf{Be}_w \ (w \in \{16,32,64\})\\[4pt]
 e &::=& \cdots \text{(first specification §1)} \mid \langle e_1, e_2 \rangle \mid \mathsf{let}\ \langle x, y \rangle = e_1\ \mathsf{in}\ e_2\\
 &\mid& \mathsf{idx}(e, N) \mid \mathsf{get}(a, i) \mid \mathsf{swap}(a, i, e) \mid e_1 \,/\, e_2 \mid e_1 \,\%\, e_2\\
-&\mid& R@(d_1, \ldots, d_m)(\bar e) \mid \mathsf{let}\ \langle c, r \rangle = \mathsf{peel}(d)\ \mathsf{in}\ e\\[4pt]
-\mathit{prog} &::=& \overline{\mathit{data}} \;\; \overline{\mathsf{state}\ x : \tau} \;\; \overline{\mathsf{fn}} \;\; \overline{\mathsf{handler}}
+&\mid& R@(d_1, \ldots, d_m)(\bar e) \mid \mathsf{let}\ \langle c, r \rangle = \mathsf{peel}(d)\ \mathsf{in}\ e\\
+&\mid& R@d\,\{f_1 = e_1, \ldots, f_k = e_k\} \mid C(\bar e)\\[4pt]
+\mathit{prog} &::=& \overline{\mathit{data}} \;\; \overline{\mathsf{enum}} \;\; \overline{\mathsf{state}\ x : \tau} \;\; \overline{\mathsf{fn}} \;\; \overline{\mathsf{handler}}
 \end{array}
 ```
 
 - D is a data type and R a record. Each constructor of a data type must fit one cell of B bytes: 1 tag byte plus B − 1 payload bytes. A record is B payload bytes per cell, and takes as many cells as its fields need (section 4.8). B is a link-time constant: 16 in Phase 1, and 64 matches a cache line and most packet headers.
 - τ ⊗ τ is an **unboxed** pair. It can be returned and bound, but never stored in a cell, so it costs registers, not memory. This fills the gap the Phase 1 implementation found: the first specification's types had ⊗ but no term for it.
 - A program has no `main`. Its entry points are `handler` declarations of the type in section 3.1.
+- An integer literal is decimal, or hexadecimal after a lowercase `0x`, with digits of either case: `0x0800`, `0x45`, `0xFFFF`. Either way it is the value it says, and its type is decided by that value, as for any literal.
 
 ### 4.2 Linearity
 
@@ -306,7 +311,7 @@ record Frame { dst_hi: Be32, dst_lo: Be16, src_hi: Be32, src_lo: Be16, ethertype
 
 **Resources.** Every cell is a cell. A record that arrives with an item is part of that item: n counts its m cells, so admission's R(n) + n covers them and they are replaced in ingress. A record built from cells drawn from the reserve costs one draw per cell, so R(n) counts them there. μ counts every cell for rule R3, and each cell carries potential and releases it when it is opened, as any other does.
 
-**Limits,** which section 8.2 lists: a record has at most 64 fields, and each cell after its first counts as two open constructs toward D\_max, because a match on it opens the next. `{ e with f = v }` reaches only the first cell, because a pattern is what opens the others. A group is not a value, so it cannot go to a function or through a join. A record that spans cannot be the `*` of tail recursion modulo cons, since the recursive call is then not in tail position. A tagged constructor still has to fit one cell.
+**Limits,** which section 8.2 lists: a record has at most 64 fields, and each cell after its first counts as two open constructs toward D\_max, because a match on it opens the next. `{ e with f = v }` reaches only the first cell, because a pattern is what opens the others; the update of section 4.10 reaches them all. A group is not a value, so it cannot go to a function or through a join. A record that spans cannot be the `*` of tail recursion modulo cons, since the recursive call is then not in tail position. A tagged constructor still has to fit one cell.
 
 ### 4.9 Fields in network byte order
 
@@ -324,6 +329,37 @@ At the register-transfer level the two are different types, and `bswap` is the o
 | a literal | a Be field | swapped by the compiler, then a store |
 
 A read-modify-write in place is not available on a Be field, because the carry would go the wrong way. `+(total, 1)` swaps, adds, swaps and stores.
+
+### 4.10 Record update
+
+`R@d { f = e, ... }` builds R in the cells d stands for, with the fields it names changed and every other field where it is, in every cell:
+
+```
+match f with Frame(d, dst_hi, ..., ttl, proto, sum, ...) =>
+  Frame@d { ttl = -(ttl, 1), sum = patched(sum, ttl, proto) }
+```
+
+**Meaning.** It is the constructor with every argument written out, each field it does not name given what the pattern found there. The rewrite of section 4.8 writes exactly that, so it is all that is new: Lower writes `=` for each field not named, and `=` stores nothing. With nothing named, `R@d {}` gives the record back as it came, and stores nothing at all.
+
+**A field not named is the pattern's field.** A name bound since, by a `let` or by another pattern, has nothing to say about a field that was not named, so the rewrite refers to each one by where the pattern bound it, not by its name. A linear field that is not named is used by the update, so one already used cannot be left behind: that is a type error.
+
+**d is the diamond of a pattern on R.** Only a pattern says what is in the fields, so d must be the diamond of a match on R that is still in scope under that name. A cell drawn from a reserve, one a function was given, one under another name, and what `peel` leaves are refused with that reason, and so is a constructor that is not a record's.
+
+**Limits,** which section 8.2 lists: the fields are named in the order R declares them, each at most once. The rewrite sees each expression once, as it goes by, and fields are evaluated in the order they are written, so naming them out of order would mean holding back an expression of any size.
+
+### 4.11 Sums held in a register
+
+```
+enum Verdict = Malformed | Expired | Send(port: Int8);
+```
+
+An enum is a sum whose every value fits one register of 8 bytes: its tag in the low byte, and each constructor's fields after it, at their natural alignment. It is a scalar, so it is not linear, and making one costs no cell. `Expired` and `Send(hop)` are its values. A constructor of an enum takes no cell, and one of a data type still takes one.
+
+A handler can return one beside a record, `(Verdict, Frame, Free)`, instead of an output built in a cell (section 3.1). The runtime reads where the record goes from the tag: a constructor with a field `port: Int8` sends the record to that port, and one with no fields gives every cell of the record back. Any other shape is refused at link time. In `examples/ipv4.lfpl` that makes a refusal one line, `(Malformed, Frame@d {}, free)`, which stores nothing and draws nothing, so R(n) = 0.
+
+At the register-transfer level, `enum d, c, a...` makes one, and nothing else can: `const` cannot, and no instruction compares one or computes with it.
+
+**Limits,** which section 8.2 lists: an enum can be built, bound, passed and returned, and not yet matched, so a handler's verdict is read only by the runtime. It cannot be stored in a cell. Its fields are integers, and each constructor has to fit the register with its tag.
 
 ## 5. Resource typing
 
@@ -557,7 +593,11 @@ With exact last uses, a scalar is moved out before its location is overwritten, 
 | pivots to solve one linear program | 10,240, about ten times what the largest has needed | resource analysis |
 | a constructor of a data type fits one cell | B bytes | checker |
 | the fields of one record | 64 | right-to-left pass |
+| the fields an update names | in the order the record declares them, each at most once | right-to-left pass |
+| a constructor of an enum fits one register with its tag | 8 bytes | checker |
+| matching an enum, or storing one in a cell | refused until built | checker |
 | arguments per function | 6 | checker |
+| the members of a tuple, a handler's results among them, so a handler with a verdict has at most 3 state slots | 6 | checker |
 | frame slots per function F\_max | declared | lowerer |
 | stack S\_max | declared | lowerer |
 | N\_max, K\_in, K\_out, O\_max, N\_out, S\_cap | declared per program | linker |
@@ -797,7 +837,10 @@ The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and 
 | non-tail recursion | refused, as a declared limit | DESCEND and ASCEND |
 | arrays and Fin N | `Array[N] t` of scalars, read with `idx` and `get`. N must be a power of two. A Fin N may live in a cell. | `swap`, linear elements, and any N once division exists |
 | unboxed pairs | present, as flat tuples of at most six, returned and bound and never stored | nothing |
-| records that span cells, and fields in network order | present, for records: `src/spans.py` rewrites one record into its chain of cells ahead of Check, and `examples/ipv4.lfpl` is one record of five cells. A field is still read from its cell, which the runtime copied it into. | reading a field in place from the frame, which changes the resource model; `{ with }` past the first cell; a record built from loose cells has to name each one |
+| records that span cells, and fields in network order | present, for records: `src/spans.py` rewrites one record into its chain of cells ahead of Check, and `examples/ipv4.lfpl` is one record of five cells. A field is still read from its cell, which the runtime copied it into. | reading a field in place from the frame, which changes the resource model; a record built from loose cells has to name each one |
+| record update and hex literals | present: `src/spans.py` rewrites `R@d { f = e }` into the constructor written out, for a record of any size, and `src/symcheck.py` does it again on its own | naming the fields in any order |
+| sums held in a register | present: an `enum` can be built, bound, passed and returned, and a handler can return one as its verdict beside a record. `examples/ipv4.lfpl` refuses a frame in one line, with R(n) = 0. | matching one, and storing one in a cell |
+| phantom construction (Theorem 7.4) | a constructor that a match takes apart at once is never built. One bound by `let` and then matched is built, stored and read back: the register-transfer Lower does not keep it pending across the `let`, which the first Lower did with a table of pending fields. `tests/test_invariants.py` keeps the theorem's own test for it, as a known failure. | keeping a constructor bound by `let` unbuilt until its match |
 | handlers, serving loop, admission | one handler and one ingress, over UDP on the loopback address, one datagram per turn. Admission works out n from the datagram's length, then checks TooLarge, Short and Full. Late, Behind and Policy cannot be declared yet, so W(n) is only added to a counter, and every source refuses by Drop. | several handlers, recvmmsg or AF_XDP, Hold, deadlines, the admission predicate, and state slots of cells |
 | resource analysis and certificates | present on every build. `src/rtcheck.py` writes section 5's inequalities as it types each function, `src/simplex.py` proposes numbers, and the checker evaluates every inequality with them, so the solver is not trusted. A handler can walk its body. | polynomial bounds, and k\_x86 of section 8.3, which has not been computed, so W(n) counts steps and is not yet a time |
 | stack in the image | present: S_max comes from the call graph, the stack is in the image with a guard page below it, and the depth is recomputed from the assembly | nothing |
@@ -812,10 +855,10 @@ The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and 
 
 The implementation decides some things this text leaves open, or does not mention:
 
-- **Literals.** A literal must be a value of the type it meets, or the program is refused. A shift count is the exception, because section 4.4 gives every count a meaning.
+- **Literals.** A literal must be a value of the type it meets, or the program is refused. A shift count is the exception, because section 4.4 gives every count a meaning. A hexadecimal literal is the same value as the decimal one, and gets the same type.
 - **The wire format.** An item is a record, whose fields are scalars, other records, and at most one field of a type declared and never defined. On the wire it is those scalars in declaration order, going into a record where one is met, packed, followed by the bytes of that last field, which the runtime holds as a chain of cells. An IntN is little endian and a BeN is in network order. So n is the record's cells and the chain's. A Fin N cannot be a field of an item, because a sender could then choose an address.
 - **Length.** A field named `length` of type Int16 is on the wire neither way. Admission fills it in with how long the datagram was, because a program that does not walk its body has no other way to find out.
-- **Output.** A constructor with a field `port: Int8` is sent to a base port plus that number, as its other scalars followed by its chain, going into a record where one is met. Any other constructor sends nothing, and all of its cells return to the pool.
+- **Output.** A constructor with a field `port: Int8` is sent to a base port plus that number, as its other scalars followed by its chain, going into a record where one is met. Any other constructor sends nothing, and all of its cells return to the pool. A handler that returns a verdict instead has its record sent the same way, to the port the verdict's `port: Int8` says, or returned to the pool when the verdict has no fields. The port waits in a byte of its own beside the queued record, since the register it came in does not wait.
 - **Free.** A program may declare its own, for Phase 1's sake, but a handler's must be exactly `End | More(next: Free)`, because the pool is threaded through that field.
 - **Malformed.** A datagram shorter than an item's scalars is counted as malformed. That is a fifth reason at ingress, beside those of section 6.1, because it never was an item.
 - **The control port.** It is one more ingress source, bound to the loopback address. `S` answers with the counters, `P` pauses egress, `R` resumes it and `Q` shuts down. Pausing exists because loopback sends never block, so without it nothing could show that a full queue refuses.
@@ -824,7 +867,7 @@ The implementation decides some things this text leaves open, or does not mentio
 - **Link-time options.** `--state` gives a state array its initial contents, and `--cells` can make the image smaller than section 3.4's C, which is what makes Short reachable. `--count-steps` validates the build without its counters and then rebuilds with one at each step the checker charged for, so that tests can hold running code to W(n). That rebuild is for measuring, and is not itself validated.
 - **The chain.** An item's chain may be abstract, like `data Bytes;`, or declared with the exact layout the runtime builds, `Last | Chunk(used, b0, ..., b6: Int8, next)`, which lets a handler walk it. Cells are reused, so admission clears what follows the used bytes of a chain's last cell, and a program can read nothing an earlier item left. A program can now also write the used count and grow the chain, so egress clamps each count to 7. N\_out is not declared: it is N\_max + R(N\_max), because an output can hold every cell of its item and of its reserve. One message gathers at most 1,024 chain entries, which is what `sendmsg` takes, and a longer chain counts as a send error, with its cells returned.
 - **The right-to-left pass.** It works one function at a time, in source order, and not on the whole file: what a function returns can depend on what its callees return, and a callee always comes first. It goes forward as well as backward, because a let's name comes before the expression it is bound to, so reading backward a use cannot yet be told from a use of an outer name. Going forward it writes the events to the file and resolves names, and works out each value's word. Going backward, it holds the set of names with a use still to come, and two sets per open branch. The annotation is two things in the event word Check and Lower already read: `leaf(VARLAST)` in place of `leaf(VAR)` at a last use, and `leaf(LIVE, mask)` after each separator that starts an arm or a scope. A name past the 120th in scope is taken to be wanted, which costs a read and is right.
-- **The inferred cell.** It is conservative, and exact about nothing but what `rtcheck` will accept: the rule is at the head of `src/righttoleft.py`, and `src/symcheck.py` works it out again without sharing any code, so a disagreement refuses the build. Where it finds nothing, the function simply has no `@`, as if none were written. A `@` that is written is held to every exit as before, and what the pass finds is held to the same.
+- **The inferred cell.** It is conservative, and exact about nothing but what `rtcheck` will accept: the rule is at the head of `src/righttoleft.py`, and `src/symcheck.py` works it out again without sharing any code, so a disagreement refuses the build. Where it finds nothing, the function simply has no `@`, as if none were written. A `@` that is written is held to every exit as before, and what the pass finds is held to the same. Nothing is inferred for a result that is no cell, such as an integer or an enum, and a `@` written on one is refused.
 - **Narrowing.** `low8`, `low16` and `low32` keep the low bits of an integer. `pack` only widens, and without these a sum worked out in Int64 could not be stored in a narrower field.
 - **Steps.** A step is one instruction of the register-transfer stream, except `move`, `drop` and `open`, which lower to nothing on x86. On the RTL target `open` can take a clock, and so can the read in front of `br.tag`, because a block RAM returns a word a clock after it is asked. `docs/rt-layer.md` lists what else in the stream came from x86.
 - **k\_rtl.** It is not a constant of the translation. The emitter derives k and c for each program from the states it wrote, and section 9.3's bound becomes cycles(n) <= k * W(n) + c, counted from the edge that samples `start` to the edge that raises `done`. For `examples/checksum.lfpl`, k = 1 and c = 1.

@@ -25,8 +25,8 @@ from .check import (ATTR_LINEAR, ATTR_WIRE, P_ARM_RT, P_BINDER, P_CALL_RT, P_DIA
 from .dyck import (CC_NAMES, CLOSE, DEFAULT_D_MAX, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP, K_CTOR,
                    K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER, K_IDX, K_IF, K_INT, K_LET, K_LIVE,
                    K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
-                   K_RTDECLMORE, K_TUPLE, K_TYPE, K_VAR, K_VARLAST, K_WITH, LEAF, OP_NAMES, OPEN, SEP, Lexer,
-                   Parser, ev_class, ev_kind)
+                   K_RTDECLMORE, K_TUPLE, K_TYPE, K_VALUE, K_VAR, K_VARLAST, K_WITH, LEAF, OP_NAMES, OPEN, SEP,
+                   VALUE, Lexer, Parser, ev_class, ev_kind)
 from .righttoleft import CELLS_PER_DEPTH, MASK_BITS, RightToLeft
 from .spans import HELD_CELLS
 from .ring import FrameStack, Reject, Ring, Stage
@@ -581,6 +581,10 @@ class RTLower(Stage):
         elif kind == K_CTOR:
             self.F.push(Frame(K_CTOR, dest=dest.kind, d=dest.d, count=dest.count, t=dest.t, f=dest.f,
                               aux=payload[0], vmark=len(self.V), l1=len(self.L)))
+        elif kind == K_VALUE:
+            ctor, count = VALUE.unpack_from(payload)
+            self.F.push(Frame(K_VALUE, dest=dest.kind, d=dest.d, count=dest.count, t=dest.t, f=dest.f,
+                              aux=count, word=ctor, vmark=len(self.V)))
         elif kind == K_PACK:
             widths = payload.rstrip(b"\0")
             self.F.push(Frame(K_PACK, dest=dest.kind, d=dest.d, count=dest.count, t=dest.t, f=dest.f,
@@ -641,6 +645,8 @@ class RTLower(Stage):
             self._with_field(payload)
         elif kind == K_LIVE:
             self.live_now = int.from_bytes(payload, "little")
+        elif kind == K_VALUE:
+            self._value_with_no_fields(VALUE.unpack_from(payload)[0])
         elif kind == K_EOF:
             pass
         else:
@@ -1042,6 +1048,29 @@ class RTLower(Stage):
             self._release(value)
         self._finish(top, register)
 
+    def _close_value(self) -> None:
+        """An enum's value: its tag and its fields, in one register."""
+        top = self.F.pop()
+        values = [self.V.pop() for _ in range(top.aux)]
+        values.reverse()
+        values = [self._native(v) for v in values]
+        register = self._result(top)
+        operands = "".join(f", {self._operand(v)}" for v in values)
+        self.i(f"enum r{register}, c{top.word}{operands}")
+        for value in values:
+            self._release(value)
+        self._finish(top, register)
+
+    def _value_with_no_fields(self, ctor: int) -> None:
+        dest = self._dest()
+        register = dest.d if dest.kind == D_REG else self.fresh()
+        self.i(f"enum r{register}, c{ctor}")
+        word = self.new_word()
+        if dest.kind == D_REG:
+            self.last_into = [Delivered(word)]
+        else:
+            self._deliver(Value(V_REG, register, word=word, flags=OWNED), dest)
+
     def _close_idx(self, payload: bytes) -> None:
         top = self.F.pop()
         value = self._native(self.V.pop())
@@ -1384,7 +1413,7 @@ class RTLower(Stage):
             self._sep_logical(top)
         elif kind == K_CTOR:
             self._sep_ctor(payload)
-        elif kind in (K_BINOP, K_CMP, K_CALL, K_TUPLE, K_GET, K_PACK):
+        elif kind in (K_BINOP, K_CMP, K_CALL, K_TUPLE, K_GET, K_PACK, K_VALUE):
             pass
         else:
             raise AssertionError(f"sep of kind {kind}")
@@ -1432,6 +1461,8 @@ class RTLower(Stage):
             self._close_call(payload)
         elif kind == K_CTOR:
             self._close_ctor()
+        elif kind == K_VALUE:
+            self._close_value()
         elif kind == K_PACK:
             self._close_pack()
         elif kind == K_IDX:
@@ -1480,8 +1511,9 @@ def occupancy_bound(depth: int, g_cells: int, l_max: int = PAYLOAD_BYTES, w: int
 
 
 def required_cells(d_max: int, g_max: int = DEFAULT_G_MAX) -> int:
-    # G, the type tables, and one cell per function for what it returns.
-    return occupancy_bound(d_max, 2 * G_CELLS_PER_ENTRY * g_max + g_max) + 1
+    # G; the three type tables, of a cell per type and at most g_max types each; one cell per function for what it
+    # returns; and each record and its fields' names, which take no more cells than that record has entries in G.
+    return occupancy_bound(d_max, (G_CELLS_PER_ENTRY + 3 + 1 + 1) * g_max) + 1
 
 
 def file_bytes(handle: BinaryIO, chunk: int = 4096) -> Iterator[int]:

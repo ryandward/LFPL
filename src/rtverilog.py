@@ -48,6 +48,7 @@ CELL_BYTES = CELL_BITS // 8
 K_IN = 1
 O_MAX = 1
 SCALAR_BITS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "bool": 1, "lit": 64, "be16": 16, "be32": 32, "be64": 64}
+ENUM_BITS = 64  # an enum is one register: LFPL-O section 4.11
 OPERATORS = {"add": "+", "sub": "-", "mul": "*", "and": "&", "or": "|", "xor": "^", "shl": "<<", "shr": ">>"}
 COMPARISONS = {"b": "<", "be": "<=", "a": ">", "ae": ">=", "e": "==", "ne": "!="}
 KEYWORDS = frozenset(("always", "and", "assign", "begin", "buf", "case", "default", "edge", "else", "end",
@@ -234,6 +235,7 @@ class Translation:
     cells: int
     pointer_bits: int
     memories: dict  # state slot -> hex text for $readmemh, to go beside the Verilog
+    verdict: bool = False  # the handler returns an enum beside its record, on a port of its own
 
     def report(self) -> str:
         lines = [f"handler {self.module}: R(n) = {_linear(self.bound.a, self.bound.b)} cells, "
@@ -272,6 +274,7 @@ class Emitter:
         self.composite: dict[str, tuple] = {}
         self.tuples: dict[str, list[str]] = {}
         self.ctors: dict[str, Ctor] = {}
+        self.enums: set[str] = set()  # types whose values are one register of ENUM_BITS
         self.slots: list[tuple[str, str]] = []
         self.functions: dict[str, Function] = {}
         self.current: list[str] = []
@@ -310,6 +313,8 @@ class Emitter:
             self.composite[parts[0]] = ("fin", int(parts[1]))
         elif head == "tuple":
             self.tuples[parts[0]] = parts[1:]
+        elif head == "type" and parts[1] == "enum":
+            self.enums.add(parts[0])
         elif head == "ctor":
             self.ctors[parts[0]] = Ctor(parts[2])
         elif head == "field":
@@ -335,6 +340,8 @@ class Emitter:
         name = self._resolve(type_text)
         if name in SCALAR_BITS:
             return SCALAR_BITS[name]
+        if name in self.enums:
+            return ENUM_BITS
         entry = self.composite.get(name)
         if entry is None:
             return self.pointer_bits  # a capability, or any value made of cells
@@ -400,7 +407,7 @@ class Emitter:
                 define(a[0], 1)
             elif head in ("trunc", "bswap"):
                 define(a[0], int(a[1]))
-            elif head == "pack":
+            elif head in ("pack", "enum"):
                 define(a[0], 64)
             elif head == "idx":
                 define(a[0], _bits_for(int(a[1])))
@@ -690,6 +697,24 @@ class Emitter:
             parts.insert(0, f"{padding}'d0")
         expression = parts[0] if len(parts) == 1 else "{" + ", ".join(parts) + "}"
         self._step("pack", text, clocked=[self._set(a[0], expression, 64)])
+
+    def i_enum(self, text: str, a: list[str]) -> None:
+        """Wires again: the tag in the low byte, each field at its bytes, and zeros between."""
+        ctor = self.ctors[a[1]]
+        self._locations(a[2:])
+        pieces = {0: (f"8'd{int(ctor.tag)}", 8)}
+        for (off, size, _ty), operand in zip(ctor.fields, a[2:]):
+            pieces[off] = (self._value(operand, 8 * size), 8 * size)
+        parts = []
+        top = ENUM_BITS
+        for off in sorted(pieces, reverse=True):
+            expression, width = pieces[off]
+            gap = top - (8 * off + width)
+            if gap:
+                parts.append(f"{gap}'d0")
+            parts.append(expression)
+            top = 8 * off
+        self._step("enum", text, clocked=[self._set(a[0], "{" + ", ".join(parts) + "}", ENUM_BITS)])
 
     def i_idx(self, text: str, a: list[str]) -> None:
         size = int(a[1])
@@ -1035,6 +1060,9 @@ class Emitter:
         site = Site("IDLE", finished=True, caller=handler.ordinal)
         results = self._results(handler.ret)
         names = {len(results) - 2: "out_item", len(results) - 1: "free_out"}
+        self.verdict = len(results) == len(self.slots) + 3
+        if self.verdict:
+            names[len(results) - 3] = "verdict_out"
         site.results = [(names.get(position, ""), self._width(member) if position in names else 0)
                         for position, member in enumerate(results)]
         handler.sites.append(site)
@@ -1051,7 +1079,7 @@ class Emitter:
         memories = {name: _hex_lines(data, self._array_of(ty)) for (name, ty), data in
                     ((slot, initial[slot[0]]) for slot in self.slots if slot[0] in initial)}
         text = self._text(handler, functions, module, cells, timing, memories, bound)
-        return Translation(text, module, bound, timing, cells, self.pointer_bits, memories)
+        return Translation(text, module, bound, timing, cells, self.pointer_bits, memories, self.verdict)
 
     def _text(self, handler: Function, functions: list[Function], module: str, cells: int,
               timing: Timing, memories: dict, bound: Bound) -> str:
@@ -1076,6 +1104,8 @@ class Emitter:
         add("    output wire busy,")
         add(f"    output reg  [{p - 1}:0] out_item,")
         add(f"    output reg  [{p - 1}:0] free_out,")
+        if self.verdict:
+            add(f"    output reg  [{ENUM_BITS - 1}:0] verdict_out,  // which way out_item goes: section 4.11")
         add("    // the cell store from outside, between items: ingress and egress are not built yet")
         add("    input  wire host_en,")
         add(f"    input  wire [{CELL_BYTES - 1}:0] host_we,")
@@ -1287,8 +1317,9 @@ def _written_only(declared: list, bodies: dict, entry: list, functions: list) ->
         lines = [line for body in bodies.values() for line in body] + entry
         lines += [line for fn in functions for state in fn.states for line in state.ports]
         text = "\n".join(lines)
+        # A write is a statement, so it starts a line or follows a space. `(r <= 94)` is a comparison, and a read.
         found = {name for name, _width in declared if name not in dead
-                 and len(re.findall(rf"\b{name}\b", text)) == len(re.findall(rf"\b{name} <= ", text))}
+                 and len(re.findall(rf"\b{name}\b", text)) == len(re.findall(rf"(?:^|(?<=\s)){name} <= ", text, re.M))}
         if not found:
             return dead
         dead |= found

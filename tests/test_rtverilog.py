@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Optional
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -199,6 +200,28 @@ class TheEmittersOwnArithmetic(unittest.TestCase):
         self.assertEqual(kinds["drop"], (0, 0, 0))
         self.assertEqual(kinds["open"], (0, 0, 0))
         self.assertEqual(kinds["call"], (1, 1, 2), "the first names a field of a cell that has not been read")
+
+    def test_a_register_compared_with_less_or_equal_is_read_and_so_it_is_kept(self):
+        """`(r <= 94)` is Verilog's comparison, and it looks like a write. Taking it for one left a register that
+        is only ever compared out of the design, and the design then named a register it never declared."""
+        source = """record Hd { a: Int16 };
+data Out = Send(port: Int8, a: Int16);
+fn small(x: Int16) : Bool = <=(x, 94);
+handler h(m: Hd, free: Free) : (Out, Free) = match m with Hd(d, a) => (Send@d(if small(a) then 1 else 2, a), free) end;
+"""
+        verilog = translate(list(rt_lines(io.BytesIO(source.encode())))).verilog
+        declared = set(re.findall(r"^\s*reg\s+(?:\[\d+:0\]\s+)?(\w+);", verilog, re.M))
+        used = set(re.findall(r"\b(\w+_r\d+)\b", verilog))
+        self.assertIn("small_r0", used)
+        self.assertEqual(used - declared, set())
+
+    def test_a_verdict_is_its_tag_and_its_port_in_one_register_on_a_port_of_its_own(self):
+        with open(os.path.join(ROOT, "examples", "ipv4.lfpl"), "rb") as handle:
+            verilog = translate(list(rt_lines(handle)), n_max=217).verilog
+        self.assertIn("output reg  [63:0] verdict_out,", verilog)
+        self.assertRegex(verilog, r"<= \{56'd0, 8'd1\};", "Expired is its tag alone")
+        self.assertRegex(verilog, r"<= \{48'd0, [^,]+, 8'd2\};", "Send's port is the byte above its tag")
+        self.assertRegex(verilog, r"verdict_out <= \S+;")
 
     def test_the_walks_add_up_to_the_steps_per_cell(self):
         translation = translate_file(SOURCE)
@@ -474,7 +497,11 @@ class Layout:
                 match = re.match(r"handler \S+ \w+\((.*)\) : (\S+)", line)
                 params = [part.partition(" : ")[2] for part in match.group(1).split(", ")]
                 self.item = self.by_type[self._resolve(params[-2])][0]
-                self.out_type = self._resolve(self.tuples[self._resolve(match.group(2))][-2])
+                results = self.tuples[self._resolve(match.group(2))]
+                self.out_type = self._resolve(results[-2])
+                # A verdict comes before the record it is about, and says where it goes.
+                ahead = self._resolve(results[-3]) if len(results) > 2 else None
+                self.verdict_type = ahead if self.kinds.get(ahead) == "enum" else None
 
     def _resolve(self, name: str) -> str:
         while name in self.aliases:
@@ -555,7 +582,7 @@ class Layout:
             loads.append((first_free + index, 0x00ff, following))
         return loads, 1, (first_free if reserve else 0), first_free - 1 + reserve
 
-    def gather(self, out: int, free: int, words: dict) -> tuple:
+    def gather(self, out: int, free: int, words: dict, verdict: Optional[int] = None) -> tuple:
         """What egress would do with an output: where it goes, its bytes, and how many cells came back."""
         names = self.by_type[self.out_type]
         kind = self.kinds[self.out_type]
@@ -598,6 +625,13 @@ class Layout:
                     chain = int.from_bytes(field(words[pointer], offset, size), "little")
 
         walk(ctor, out)
+        if self.verdict_type is not None:  # the record goes where the verdict's port says, or it comes back
+            assert verdict is not None
+            said = next(c for c in self.by_type[self.verdict_type] if self.ctors[c][0] == str(verdict & 0xFF))
+            port = None
+            for offset, _size, _type_text, name in self.ctors[said][1]:
+                if name == "port":
+                    port = verdict >> (8 * offset) & 0xFF
         while chain:
             word = words[chain]
             back += 1
@@ -631,7 +665,8 @@ def simulate_images(translation: Translation, layout: Layout, datagrams: list) -
             handle.write("\n".join(lines) + "\n")
         sim = os.path.join(workdir, "sim")
         compiled = subprocess.run(["iverilog", "-g2005", f"-DTOP={translation.module}",
-                                   f"-DPOINTER_BITS={translation.pointer_bits}", "-o", sim,
+                                   f"-DPOINTER_BITS={translation.pointer_bits}",
+                                   *(["-DVERDICT"] if translation.verdict else []), "-o", sim,
                                    os.path.join(ROOT, "tests", "tb_image.v"), design],
                                   capture_output=True, text=True)
         assert compiled.returncode == 0, compiled.stderr
@@ -644,7 +679,8 @@ def simulate_images(translation: Translation, layout: Layout, datagrams: list) -
             words = {}
             fields = dict(part.split("=") for part in parts[2:])
             results.append({"cycles": int(fields["cycles"]), "out": int(fields["out"]),
-                            "free": int(fields["free"]), "words": words})
+                            "free": int(fields["free"]), "words": words,
+                            "verdict": int(fields["verdict"]) if "verdict" in fields else None})
         elif parts[0] == "WORD":
             words[int(parts[1])] = parts[2]
     last = done.stdout.strip().splitlines()[-1]
@@ -670,7 +706,7 @@ class OtherHandlers(unittest.TestCase):
                 before = router.stats()
                 for number, (datagram, result, (n, reserve)) in enumerate(zip(datagrams, results, cells), 1):
                     router.raw(datagram)
-                    port, sent, back = layout.gather(result["out"], result["free"], result["words"])
+                    port, sent, back = layout.gather(result["out"], result["free"], result["words"], result["verdict"])
                     context = f"{said}, datagram {datagram.hex()}"
                     self.assertEqual(back, n + reserve, context)
                     if port is not None and port < len(router.outputs):

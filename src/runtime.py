@@ -142,6 +142,7 @@ class Image:
     bound: Bound
     depth: int
     options: Options
+    verdict: bool = False  # what goes out is a record, and which way it goes is an enum in a register beside it
 
     @property
     def largest_output(self) -> int:
@@ -191,12 +192,14 @@ class Image:
                 + sum(s.length * s.element_size for s in self.states))
 
 
-def handler_slots(checker: Checker, initial: dict[str, str]) -> tuple:
+def handler_slots(checker: Checker, initial: dict[str, str], *, verdicts: bool = False) -> tuple:
     """The handler, the type of its item and of its output, and its state slots, which are the same
-    whichever device the items come from."""
+    whichever device the items come from. With a verdict, the output is the record it is about."""
     fn = next(f for f in checker.functions.values() if f.handler)
     item_type = checker.norm(fn.params[-2])
     results = checker.tuples[checker._resolve(fn.ret)]
+    if len(results) == len(checker.states) + 3 and not verdicts:
+        raise BindingError("section 3.1: this runtime sends an output, and the handler returns a verdict")
     out_type = checker.norm(results[-2])
     states = []
     for name, ty in checker.states:
@@ -215,7 +218,7 @@ def handler_slots(checker: Checker, initial: dict[str, str]) -> tuple:
 def bind(checker: Checker, handler_name: str, depth: int, options: Options,
          initial: dict[str, str]) -> Image:
     """Read the handler's types from the checked stream, and refuse what cannot be served."""
-    fn, item_type, out_type, states = handler_slots(checker, initial)
+    fn, item_type, out_type, states = handler_slots(checker, initial, verdicts=True)
     _check_reserve(checker, fn.params[-1])
     decl = checker._decl(item_type)
     if decl is None or decl.kind != "record":
@@ -225,15 +228,43 @@ def bind(checker: Checker, handler_name: str, depth: int, options: Options,
     if options.n_max < item.cells:
         raise BindingError(f"section 8.2: N_max of {options.n_max}, and {decl.name} alone is {item.cells} cells")
     out_decl = checker._decl(out_type)
-    if out_decl is None or out_decl.kind not in ("tagged", "tagless", "record"):
+    verdict = _verdict_of(checker, fn, states)
+    if verdict is not None:
+        if out_decl is None or out_decl.kind != "record":
+            raise BindingError(f"section 3.1: a verdict goes with a record, and {out_type} is not one")
+        walk = _walk(checker, out_decl.name, out_decl.ctors[0].fields)
+        out = tuple(_verdict_ctor(checker, ctor, walk) for ctor in verdict.ctors)
+    elif out_decl is None or out_decl.kind not in ("tagged", "tagless", "record"):
         raise BindingError(f"section 3.1: the output {out_type} is not a data type")
-    out = tuple(_out_ctor(checker, ctor) for ctor in out_decl.ctors)
+    else:
+        out = tuple(_out_ctor(checker, ctor) for ctor in out_decl.ctors)
     for ctor in out:
         if len(ctor.walk.scalars) > IOV_MAX:
             raise BindingError(f"section 8.2: {ctor.name} has {len(ctor.walk.scalars)} fields to send, "
                                f"and one message gathers {IOV_MAX}")
-    return Image(handler_name, states, item, out_decl.kind == "tagged", out, checker.bounds(handler_name), depth,
-                 options)
+    return Image(handler_name, states, item, verdict is not None or out_decl.kind == "tagged", out,
+                 checker.bounds(handler_name), depth, options, verdict is not None)
+
+
+def _verdict_of(checker: Checker, fn, states: tuple) -> Optional[TypeDecl]:
+    """The enum a handler returns ahead of its record, if it returns one."""
+    results = checker.tuples[checker._resolve(fn.ret)]
+    if len(results) != len(states) + 3:
+        return None
+    ty = checker.norm(results[len(states)])
+    assert isinstance(ty, tuple) and ty[0] == "enum", ty  # rtcheck types a handler's shape
+    return checker.types[ty[1]]
+
+
+def _verdict_ctor(checker: Checker, ctor: Ctor, walk: Walk) -> OutCtor:
+    """Each value of the verdict sends the record to the port it names, or gives it back."""
+    if not ctor.fields:
+        return OutCtor(ctor.name, int(ctor.tag), None, walk)
+    (off, size, ty, name), *rest = ctor.fields
+    if rest or name != "port" or checker.norm(ty) != "i8":
+        raise BindingError(f"section 3.1: {ctor.name} says which port the record goes to, as port: Int8, or says "
+                           f"nothing and the record is given back")
+    return OutCtor(ctor.name, int(ctor.tag), (off, size), walk)
 
 
 def _check_reserve(checker: Checker, reserve: str) -> None:
@@ -614,11 +645,16 @@ def assembly(image: Image) -> str:
     for position in range(k):
         add(f"    mov {PARAMS[position]}, [state_{position}]")
     add(f"    call handler_entry")
-    add("    ; DONE: the state, the output and what is left of the reserve come back")
+    if image.verdict:
+        add("    ; DONE: the state, the verdict, the record and what is left of the reserve come back")
+    else:
+        add("    ; DONE: the state, the output and what is left of the reserve come back")
     for position in range(k):
         add(f"    mov [state_{position}], {RESULTS[position]}")
-    add(f"    mov r12, {RESULTS[k]}")
-    add(f"    mov r13, {RESULTS[k + 1]}")
+    if image.verdict:
+        add(f"    mov r15, {RESULTS[k]}")
+    add(f"    mov r12, {RESULTS[k + image.verdict]}")
+    add(f"    mov r13, {RESULTS[k + image.verdict + 1]}")
     add(".give_back:")
     add("    test r13, r13")
     add("    jz .given_back")
@@ -628,7 +664,13 @@ def assembly(image: Image) -> str:
     add("    jmp .give_back")
     add(".given_back:")
     add("    inc qword [cnt_served]")
-    _dispatch(add, image, "r12", ".out")
+    if image.verdict:  # its tag is the register's low byte
+        for position, ctor in enumerate(image.out[:-1]):
+            add(f"    cmp r15b, {ctor.tag}")
+            add(f"    je .out_{position}")
+        add(f"    jmp .out_{len(image.out) - 1}")
+    else:
+        _dispatch(add, image, "r12", ".out")
     for position, ctor in enumerate(image.out):
         add(f".out_{position}:")
         if ctor.port is not None:
@@ -637,6 +679,10 @@ def assembly(image: Image) -> str:
             add("    add rax, [q_count]")
             add(f"    and rax, {image.options.k_out - 1}")
             add("    mov [queue+rax*8], r12")
+            if image.verdict:  # the port is in the register, and the register does not wait in the queue
+                add("    mov rcx, r15")
+                add(f"    shr rcx, {8 * ctor.port[0]}")
+                add("    mov [queue_ports+rax], cl")
             add("    inc qword [q_count]")
             add("    jmp serve")
         else:
@@ -742,64 +788,19 @@ def assembly(image: Image) -> str:
     add("    je .done")
     add("    mov rax, [q_head]")
     add("    mov r12, [queue+rax*8]")
-    _dispatch(add, image, "r12", ".send")
-    for position, ctor in enumerate(image.out):
-        add(f".send_{position}:")
-        if ctor.port is None:
-            add("    jmp .sent")  # never queued: only constructors with a port are
-            continue
-        port_off, port_size = ctor.port
-        walk = ctor.walk
-        add(f"    movzx eax, {_WIDTH[port_size]} [r12+{port_off}]")
-        add(f"    add eax, {image.options.out_base}")
-        add("    xchg al, ah")
-        add("    mov word [out_addr+2], ax")
-        _read_out_cells(add, walk)
-        for index, (cell, off, size) in enumerate(walk.scalars):
-            _out_cell(add, "rax", cell)
-            add(f"    lea rax, [rax+{off}]")
-            add(f"    mov [out_iov+{16 * index}], rax")
-            add(f"    mov qword [out_iov+{16 * index + 8}], {size}")
-        add(f"    mov ecx, {len(walk.scalars)}")
-        add(f"    mov ebx, out_iov+{16 * len(walk.scalars)}")
-        if walk.chain is not None:
-            _out_cell(add, "rdi", walk.chain[0])
-            add(f"    mov rdi, [rdi+{walk.chain[1]}]")
-            add(".chain_%d:" % position)
-            add("    test rdi, rdi")
-            add(f"    jz .send_ready_{position}")
-            add(f"    cmp rcx, {out_iov}")
-            add(f"    jae .too_long_{position}")
-            add("    lea rax, [rdi+1]")
-            add("    mov [rbx], rax")
-            add("    ; a program can write this count, so it can name no byte outside the cell")
-            add("    movzx eax, byte [rdi]")
-            add(f"    cmp eax, {BODY_PAYLOAD}")
-            add(f"    jbe .counted_bytes_{position}")
-            add(f"    mov eax, {BODY_PAYLOAD}")
-            add(f".counted_bytes_{position}:")
-            add("    mov [rbx+8], rax")
-            add("    add rbx, 16")
-            add("    inc rcx")
-            add("    mov rdi, [rdi+8]")
-            add(f"    jmp .chain_{position}")
-        add(f".send_ready_{position}:")
-        add("    mov [out_msg+24], rcx")
-        add("    mov eax, 46")
-        add("    mov rdi, [out_fd]")
-        add("    mov esi, out_msg")
-        add("    mov edx, 64")
-        add("    syscall")
-        add("    cmp rax, -11")
-        add("    je .done")
-        add("    test rax, rax")
-        add(f"    jns .counted_{position}")
-        if walk.chain is not None:  # a chain a program grew past what one message can gather
-            add(f".too_long_{position}:")
-        add("    inc qword [cnt_send_errors]")
-        add(f".counted_{position}:")
-        _free_all_but_the_first(add, walk)
-        add("    jmp .sent")
+    if image.verdict:  # one record, whichever value sent it, and its port beside it in the queue
+        add("    movzx eax, byte [queue_ports+rax]")
+        _send(add, image, 0, image.out[0].walk, out_iov)
+    else:
+        _dispatch(add, image, "r12", ".send")
+        for position, ctor in enumerate(image.out):
+            add(f".send_{position}:")
+            if ctor.port is None:
+                add("    jmp .sent")  # never queued: only constructors with a port are
+                continue
+            port_off, port_size = ctor.port
+            add(f"    movzx eax, {_WIDTH[port_size]} [r12+{port_off}]")
+            _send(add, image, position, ctor.walk, out_iov)
     add(".sent:")
     add("    mov rdi, r12")
     add("    call push_cell")
@@ -812,6 +813,67 @@ def assembly(image: Image) -> str:
     add(".done:")
     add("    ret")
     add("")
+    _control_and_the_rest(add, image, item, iov_in, out_iov)
+    return "\n".join(lines) + "\n"
+
+
+def _send(add: Callable[[str], None], image: Image, position: int, walk: Walk, out_iov: int) -> None:
+    """One output in r12 to the port in eax, and then to .sent. Its cells but the first go back."""
+    add(f"    add eax, {image.options.out_base}")
+    add("    xchg al, ah")
+    add("    mov word [out_addr+2], ax")
+    _read_out_cells(add, walk)
+    for index, (cell, off, size) in enumerate(walk.scalars):
+        _out_cell(add, "rax", cell)
+        add(f"    lea rax, [rax+{off}]")
+        add(f"    mov [out_iov+{16 * index}], rax")
+        add(f"    mov qword [out_iov+{16 * index + 8}], {size}")
+    add(f"    mov ecx, {len(walk.scalars)}")
+    add(f"    mov ebx, out_iov+{16 * len(walk.scalars)}")
+    if walk.chain is not None:
+        _out_cell(add, "rdi", walk.chain[0])
+        add(f"    mov rdi, [rdi+{walk.chain[1]}]")
+        add(".chain_%d:" % position)
+        add("    test rdi, rdi")
+        add(f"    jz .send_ready_{position}")
+        add(f"    cmp rcx, {out_iov}")
+        add(f"    jae .too_long_{position}")
+        add("    lea rax, [rdi+1]")
+        add("    mov [rbx], rax")
+        add("    ; a program can write this count, so it can name no byte outside the cell")
+        add("    movzx eax, byte [rdi]")
+        add(f"    cmp eax, {BODY_PAYLOAD}")
+        add(f"    jbe .counted_bytes_{position}")
+        add(f"    mov eax, {BODY_PAYLOAD}")
+        add(f".counted_bytes_{position}:")
+        add("    mov [rbx+8], rax")
+        add("    add rbx, 16")
+        add("    inc rcx")
+        add("    mov rdi, [rdi+8]")
+        add(f"    jmp .chain_{position}")
+    add(f".send_ready_{position}:")
+    add("    mov [out_msg+24], rcx")
+    add("    mov eax, 46")
+    add("    mov rdi, [out_fd]")
+    add("    mov esi, out_msg")
+    add("    mov edx, 64")
+    add("    syscall")
+    add("    cmp rax, -11")
+    add("    je .done")
+    add("    test rax, rax")
+    add(f"    jns .counted_{position}")
+    if walk.chain is not None:  # a chain a program grew past what one message can gather
+        add(f".too_long_{position}:")
+    add("    inc qword [cnt_send_errors]")
+    add(f".counted_{position}:")
+    _free_all_but_the_first(add, walk)
+    add("    jmp .sent")
+
+
+def _control_and_the_rest(add: Callable[[str], None], image: Image, item: Walk, iov_in: int, out_iov: int) -> None:
+    """The control port, the item's scatter, the pool, and the data and bss of the image."""
+    o = image.options
+    k = len(image.states)
     add("; The control port. Never blocks, and bounded by the pool's size.")
     add("control:")
     add("    mov dword [peer_len], 16")
@@ -907,6 +969,9 @@ def assembly(image: Image) -> str:
             add("alignb 16")
             add(f"array_{state.name}: resb {state.length * state.element_size}")
     add(f"queue: resq {image.options.k_out}")
+    if image.verdict:
+        add(f"queue_ports: resb {image.options.k_out}")
+        add("alignb 8")
     add(f"in_iov: resq {2 * iov_in}")
     add(f"in_control: resq {CONTROL_BYTES // 8}")
     if o.measure_age:
@@ -934,7 +999,6 @@ def assembly(image: Image) -> str:
     add(f"bss_end_page: resb {PAGE}")
     add("bss_end:")
     add("section .note.GNU-stack noalloc noexec nowrite progbits")
-    return "\n".join(lines) + "\n"
 
 
 def fixed_image_startup(add: Callable[[str], None]) -> None:

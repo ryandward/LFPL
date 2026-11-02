@@ -29,6 +29,9 @@ Forward again, it sends the events on to Check as if Parse had just written them
     leaf(VARLAST)         in place of leaf(VAR), at a binder's last use on this path
     leaf(LIVE, mask)      after each separator that starts an arm or a scope: binders still to be used
 
+A field a record update leaves where it is comes from src/spans.py as leaf(VARAT, position), which is a use like any
+other, except that it says which binding it means instead of a name. Its last use is marked in its own payload.
+
 A declared `@k` is left alone. Either way rtcheck holds every exit to it, so an inference that was wrong
 could only ever refuse a program, and never make a wrong one.
 
@@ -55,10 +58,10 @@ from dataclasses import dataclass
 from typing import BinaryIO, Optional
 
 from .check import CELL_FIELDS_MAX, TUPLE_MAX
-from .dyck import (CLOSE, DEFAULT_D_MAX, K_ARM, K_BINDER, K_BOOL, K_CALL, K_CTOR, K_DIAMOND, K_EOF, K_FIELD, K_FN,
+from .dyck import (CLOSE, DEFAULT_D_MAX, K_ARM, K_BINDER, K_BOOL, K_CALL, K_CTOR, K_DIAMOND, K_ENUM, K_EOF, K_FIELD, K_FN,
                    K_HANDLER, K_IF, K_INT, K_LET, K_LIVE, K_MATCH, K_NULLCTOR, K_PARAM, K_RECORD, K_RESWORD, K_TARRAY,
-                   K_TFIN, K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_VARLAST, K_WITH, LEAF, OPEN, SEP, ev_class, ev_kind,
-                   ev_tag)
+                   K_TFIN, K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_VARAT, K_VARLAST, K_WITH, LEAF, OPEN, SEP, VARAT, ev_class,
+                   ev_kind, ev_tag)
 from .ring import Reject, Stage
 from .spans import CELLS_PER_DEPTH as SPAN_CELLS_PER_DEPTH, Spans
 from .tokens import PAYLOAD_BYTES
@@ -139,6 +142,7 @@ class RightToLeft(Stage):
         self.P = self.stack()  # going forward: the type of each parameter
         self.R = self.stack()  # going backward: for each open branch, the set after it, and so far before it
         self.T = self.stack()  # for all time: the name of each function, its tag holding its cell + 1
+        self.E = self.stack()  # for all time: the name of each enum, which is a scalar, whatever it is called
         self.spans.attach()
 
     def depth(self) -> int:
@@ -146,7 +150,7 @@ class RightToLeft(Stage):
 
     def table_cells(self) -> int:
         """What this stage keeps for all time: the O(G) term of Theorem 7.2."""
-        return len(self.T.cells) + self.spans.table_cells()
+        return len(self.T.cells) + len(self.E.cells) + self.spans.table_cells()
 
     def has_work(self) -> bool:
         return self.phase != SPILLING or self.spans.emitting is not None
@@ -174,6 +178,8 @@ class RightToLeft(Stage):
             return
         if not self.in_function and not (cls == OPEN and kind in (K_FN, K_HANDLER)):
             self.ring.replay_line = None
+            if cls == OPEN and kind == K_ENUM:
+                self.E.push(0, payload)
             if kind == K_EOF and self.file is not None:
                 self.file.close()
                 self.file = None
@@ -369,7 +375,7 @@ class RightToLeft(Stage):
             # Check would say this at the same member, and Parse may find something else first.
             frame.count += 1
             if frame.count == TUPLE_MAX:
-                raise self._reject(f"a tuple of more than {TUPLE_MAX}")
+                raise self._reject(f"section 8.2: a tuple of more than {TUPLE_MAX}, which is as many registers as a result comes back in")
             self._set_top(frame)
         return NO_POSITION, 0
 
@@ -377,12 +383,15 @@ class RightToLeft(Stage):
         self.allowed = 0
         if not self.inferring:
             return
-        if self.result_type.rstrip(b"\0") in _NOT_A_CELL or not self.result_type:
+        if self.result_type.rstrip(b"\0") in _NOT_A_CELL or not self.result_type or self._is_enum(self.result_type):
             self.inferring = False
             return
         for position in range(len(self.P)):
             if self.P.at(position)[1] == self.result_type:
                 self.allowed |= 1 << position
+
+    def _is_enum(self, name: bytes) -> bool:
+        return any(self.E.at(position)[1] == name for position in range(len(self.E)))
 
     def _argument(self, frame: _Open) -> None:
         if self.child:
@@ -419,6 +428,10 @@ class RightToLeft(Stage):
             position, word = self._lookup(payload)
             self._finished(word, exit_)
             return position
+        if kind == K_VARAT:
+            position = VARAT.unpack_from(payload)[0]
+            self._finished(self.B.at(position)[0] - 2, exit_)
+            return position
         if kind == K_NULLCTOR:
             self._finished(NULL, exit_)
         elif kind in (K_INT, K_BOOL):
@@ -442,7 +455,7 @@ class RightToLeft(Stage):
         top_kind, frame = self._top()
         if top_kind == K_LET:
             if frame.count == TUPLE_MAX:
-                raise self._reject(f"more than {TUPLE_MAX} names in one let")
+                raise self._reject(f"section 8.2: more than {TUPLE_MAX} names in one let")
             self.N.push(0, payload)
             frame.count += 1
             self._set_top(frame)
@@ -544,8 +557,8 @@ class RightToLeft(Stage):
         if stamp >= MASK_BITS:
             return flags
         bit = 1 << stamp
-        if kind == K_VAR or kind == K_DIAMOND:
-            if kind == K_VAR and not self.live & bit:
+        if kind in (K_VAR, K_VARAT, K_DIAMOND):
+            if kind != K_DIAMOND and not self.live & bit:
                 flags |= F_LAST
             self.live |= bit
         elif kind in (K_BINDER, K_FIELD):
@@ -590,7 +603,9 @@ class RightToLeft(Stage):
         cls, kind = ev_class(tag), ev_kind(tag)
         if cls == SEP and kind in (K_FN, K_HANDLER) and payload[0] == 1 and self.write_at:
             self.after.append((ev_tag(LEAF, K_RESWORD), self.write_at))
-        if flags & F_LAST:
+        if flags & F_LAST and kind == K_VARAT:
+            payload = VARAT.pack(VARAT.unpack_from(payload)[0], 1)
+        elif flags & F_LAST:
             tag = ev_tag(LEAF, K_VARLAST)
         self.after.append((tag, payload))
         if flags & F_LIVE:

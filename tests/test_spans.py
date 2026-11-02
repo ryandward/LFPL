@@ -446,7 +446,7 @@ class RefusedWithAReason(unittest.TestCase):
         self.refuse("peel is a primitive", "fn peel(a: Int64) : Int64 = a;\n")
 
     def test_with_on_a_field_past_the_first_cell_says_what_to_do(self):
-        self.refuse("reaches the first cell of R, and c is not there: rebuild it with a match",
+        self.refuse("reaches the first cell of R, and c is not there: take it apart with a match, and write R@d { c = ... }",
                     self.MATCHED + "fn u(x: R) : R = { x with c = 1 };\n")
         self.refuse("no field q in Q", "record Q { a: Int64 };\nfn u(x: Q) : Q = { x with q = 1 };\n")
 

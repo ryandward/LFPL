@@ -246,17 +246,36 @@ class Terms:
         return self.intern(("op", name, width, x, y))
 
     def bitop(self, name: str, x: int, y: int) -> int:
-        if self.is_const(x) and self.is_const(y):
-            a, b = self.value(x), self.value(y)
-            return self.const({"and": a & b, "or": a | b, "xor": a ^ b}[name])
-        if y < x:
-            x, y = y, x
-        if x == y:
-            return self.ZERO if name == "xor" else x
-        if self.ZERO in (x, y):
-            other = y if x == self.ZERO else x
-            return self.ZERO if name == "and" else other
-        return self.intern(("bit", name, x, y))
+        """And, or and xor are associative and commutative, so a chain of one of them is its operands in one order:
+        the same value built in any order is the same term. The constants come last, as one."""
+        known: Optional[int] = None
+        others: list[int] = []
+        for leaf in self._chain(name, x) + self._chain(name, y):
+            if self.is_const(leaf):
+                v = self.value(leaf)
+                known = v if known is None else {"and": known & v, "or": known | v, "xor": known ^ v}[name]
+            else:
+                others.append(leaf)
+        if name == "xor":
+            others = sorted(leaf for leaf in set(others) if others.count(leaf) % 2)
+        else:
+            others = sorted(set(others))
+        if known == 0 and name == "and":
+            return self.ZERO
+        if known is not None and (known or not others):
+            others.append(self.const(known))
+        if not others:
+            return self.ZERO
+        result = others[0]
+        for leaf in others[1:]:
+            result = self.intern(("bit", name, result, leaf))
+        return result
+
+    def _chain(self, name: str, x: int) -> list[int]:
+        node = self.nodes[x]
+        if node[0] == "bit" and node[1] == name:
+            return self._chain(name, node[2]) + self._chain(name, node[3])
+        return [x]
 
     def shr(self, x: int, count: int) -> int:
         if count == self.ZERO:
@@ -408,7 +427,7 @@ class Terms:
 
 # ------------------------------------------------------------- source syntax
 
-_TOKEN = re.compile(r"\s+|#[^\n]*|([A-Za-z_][A-Za-z0-9_]*|\d+|=>|==|!=|<=|>=|<<|>>|&&|\|\||"
+_TOKEN = re.compile(r"\s+|#[^\n]*|([A-Za-z_][A-Za-z0-9_]*|0x[0-9A-Fa-f]+|\d+|=>|==|!=|<=|>=|<<|>>|&&|\|\||"
                     r"[(){},:;@=|+\-*&^<>!\[\]])")
 _BINOPS = {"+": "add", "-": "sub", "*": "imul", "<<": "shl", ">>": "shr",
            "&": "and", "|": "or", "^": "xor"}
@@ -443,25 +462,29 @@ class SourceParser:
     """A plain recursive descent over the whole text."""
 
     def __init__(self, text: str):
-        self.tokens = [m.group(1) for m in _TOKEN.finditer(text) if m.group(1)]
+        self.tokens = [str(int(m.group(1), 16)) if m.group(1).startswith("0x") else m.group(1)
+                       for m in _TOKEN.finditer(text) if m.group(1)]
         self.at = 0
         self.types: dict[str, TypeInfo] = {}
         self.fns: dict[str, Fn] = {}
         self.states: list[tuple[str, str]] = []
         self.spans: dict[str, tuple[list, list]] = {}  # a record of many cells: their names, and fields in each
+        self.records: dict[str, list] = {}  # the names of a record's fields, across all its cells
+        self.enums: dict[str, tuple] = {}  # a constructor of an enum: the enum, its tag, and its fields where they go
 
     def unspan(self) -> None:
         """Every function, in terms of records of one cell."""
         for fn in self.fns.values():
-            fn.body = _Unspan(self.spans).expr(fn.body, {})
+            fn.body = _Unspan(self.spans, self.records).expr(fn.body, {})
 
     def infer_cells(self) -> None:
         """`@` is optional, and a function that does not write it may still return a parameter's own cell.
         This works out which, by section 8.1's rule as src/righttoleft.py states it, sharing no code
         with it: if the two disagree, what the compiler wrote will not check against this."""
+        scalars = {enum for enum, _tag, _fields in self.enums.values()}
         for fn in self.fns.values():
             if fn.at is None:
-                fn.at = _returned_cell(fn, self.fns)
+                fn.at = _returned_cell(fn, self.fns, scalars)
 
     def builtin_reserve(self) -> None:
         """LFPL-O's Free, if the program did not declare its own."""
@@ -488,6 +511,8 @@ class SourceParser:
                 self._data()
             elif keyword == "record":
                 self._record()
+            elif keyword == "enum":
+                self._enum()
             elif keyword in ("fn", "handler"):
                 self._fn()
             elif keyword == "state":
@@ -541,11 +566,28 @@ class SourceParser:
                               self._layout(fields, 0 if tagless else 1)))
         self.types[name] = TypeInfo(name, ctors)
 
+    def _enum(self) -> None:
+        """Section 4.11: one register, its tag in the low byte and each field after it at its natural alignment."""
+        name = self.next()
+        self.expect("=")
+        tag = 0
+        while True:
+            ctor = self.next()
+            fields = []
+            if self.peek() == "(":
+                self.next()
+                fields = self._fields(")")
+            self.enums[ctor] = (name, tag, self._layout(fields, 1))
+            tag += 1
+            if self.next() == ";":
+                return
+
     def _record(self) -> None:
         name = self.next()
         self.expect("{")
         fields = self._fields("}")
         self.expect(";")
+        self.records[name] = [field_name for field_name, _ty in fields]
         cells = _cells_of(fields)
         names = [name] + [f"{name}${index}" for index in range(1, len(cells))]
         for index, (part, fields_here) in enumerate(zip(names, cells)):
@@ -687,13 +729,33 @@ class SourceParser:
                     cell = [self.next()]
                     while self.next() == ",":
                         cell.append(self.next())
+                if self.peek() == "{":
+                    self.next()
+                    return ("update", token, cell, self._named_fields())
                 self.expect("(")
                 return ("ctor", token, cell, self._args())
+            if self.peek() == "(":
+                self.next()
+                return ("enum", token, self._args())
+            if token in self.enums:
+                return ("enum", token, [])
             return ("null", token)
         if self.peek() == "(":
             self.next()
             return ("call", token, self._args())
         return ("var", token)
+
+    def _named_fields(self) -> list:
+        named: list = []
+        if self.peek() == "}":
+            self.next()
+            return named
+        while True:
+            name = self.next()
+            self.expect("=")
+            named.append((name, self.expr()))
+            if self.next() == "}":
+                return named
 
     def _match(self) -> tuple:
         scrutinee = self.expr()
@@ -741,12 +803,27 @@ def _cells_of(fields: list) -> list:
     return cells
 
 
-class _Unspan:
-    """A syntax tree, rewritten so that each record is one cell. `groups` says what names stand for several cells:
-    a pattern's diamond, then what `peel` leaves. The first cell keeps the name, and these are the others."""
+@dataclass(frozen=True)
+class _Stands:
+    """What a name stands for: the cells after its own, if it has more. If it is the diamond of a pattern that an update
+    uses it for, then also where that pattern left the fields, under names nothing can bind again."""
+    others: list
+    fields: list = field(default_factory=list)
 
-    def __init__(self, spans: dict):
+
+def _has_update(e: object) -> bool:
+    if isinstance(e, tuple) and e and e[0] == "update":
+        return True
+    return isinstance(e, (tuple, list)) and any(_has_update(part) for part in e)
+
+
+class _Unspan:
+    """A syntax tree, rewritten so that each record is one cell and each update a constructor. `groups` says what names
+    stand for several cells: a pattern's diamond, then what `peel` leaves. The first cell keeps the name."""
+
+    def __init__(self, spans: dict, records: dict):
         self.spans = spans
+        self.records = records
         self.used = 0
 
     def fresh(self, stem: str) -> str:
@@ -769,6 +846,8 @@ class _Unspan:
             return (kind, self.expr(e[1], groups), self.expr(e[2], groups))
         if kind == "pack":
             return ("pack", e[1], [self.expr(a, groups) for a in e[2]])
+        if kind == "enum":
+            return ("enum", e[1], [self.expr(a, groups) for a in e[2]])
         if kind == "tuple":
             return ("tuple", [self.expr(m, groups) for m in e[1]])
         if kind == "call":
@@ -783,29 +862,35 @@ class _Unspan:
             return ("match", self.expr(e[1], groups), [self._arm(arm, groups) for arm in e[2]])
         if kind == "ctor":
             return self._ctor(e, groups)
+        if kind == "update":
+            return self._update(e, groups)
         raise ValueError(f"unknown expression {kind}")
 
     def _let_tuple(self, e: tuple, groups: dict) -> tuple:
         _kind, names, bound, body = e
         if bound[0] == "call" and bound[1] == "peel":
             source = bound[2][0][1]
-            cells = groups[source]
+            cells = groups[source].others
             inner = _without(groups, names)
             if len(cells) > 1:
-                inner[names[1]] = cells[1:]
+                inner[names[1]] = _Stands(cells[1:])
             return ("lettuple", names, ("tuple", [("var", source), ("var", cells[0])]), self.expr(body, inner))
         return ("lettuple", names, self.expr(bound, groups), self.expr(body, _without(groups, names)))
 
     def _arm(self, arm: tuple, groups: dict) -> tuple:
         ctor, binders, body = arm
-        if ctor not in self.spans:
+        updated = ctor in self.records and _has_update(body)
+        if ctor not in self.spans and not updated:
             return (ctor, binders, self.expr(body, _without(groups, binders)))
-        names, counts = self.spans[ctor]
+        fields = [self.fresh("$field") for _ in binders[1:]] if updated else binders[1:]
+        names, counts = self.spans.get(ctor, ([ctor], [len(fields)]))
         cells = [self.fresh(binders[0]) for _ in names[1:]]
         inner = _without(groups, binders)
-        inner[binders[0]] = cells
+        inner[binders[0]] = _Stands(cells, fields)
         inside = self.expr(body, inner)
-        fields = binders[1:]
+        if updated:
+            for name, alias in reversed(list(zip(binders[1:], fields))):
+                inside = ("let", name, ("var", alias), inside)
         at = sum(counts)
         result = None
         for index in range(len(names) - 1, -1, -1):
@@ -824,7 +909,7 @@ class _Unspan:
         args = [self.expr(a, groups) for a in args]
         if name in self.spans:
             names, counts = self.spans[name]
-            cells = cell if isinstance(cell, list) else [cell] + groups[cell]
+            cells = cell if isinstance(cell, list) else [cell] + groups[cell].others
             value = None
             at = sum(counts)
             for index in range(len(names) - 1, -1, -1):
@@ -832,12 +917,21 @@ class _Unspan:
                 here = args[at:at + counts[index]]
                 value = ("ctor", names[index], cells[index], here + ([] if value is None else [value]))
             return value
-        if cell in groups:  # More@d(free): one per cell, every one of them given back
-            value = ("ctor", name, groups[cell][-1], args)
-            for other in reversed(groups[cell][:-1]):
+        if cell in groups and groups[cell].others:  # More@d(free): one per cell, every one of them given back
+            others = groups[cell].others
+            value = ("ctor", name, others[-1], args)
+            for other in reversed(others[:-1]):
                 value = ("ctor", name, other, [value])
             return ("ctor", name, cell, [value])
         return ("ctor", name, cell, args)
+
+    def _update(self, e: tuple, groups: dict) -> tuple:
+        """The constructor with every field written out: what is not named is what the pattern found."""
+        _kind, name, cell, named = e
+        given = dict(named)
+        left = [("var", alias) for alias in groups[cell].fields]
+        args = [given.get(field_name, kept) for field_name, kept in zip(self.records[name], left)]
+        return self._ctor(("ctor", name, cell, args), groups)
 
 
 def _without(groups: dict, names: list) -> dict:
@@ -914,8 +1008,10 @@ def _allowed_by_exits(e: tuple, names: dict, nulls: frozenset, fn: "Fn", fns: di
     return set(nulls) if word == _NULL else set()
 
 
-def _returned_cell(fn: "Fn", fns: dict) -> Optional[int]:
-    if not isinstance(fn.ret, str) or fn.ret in _NOT_A_CELL or fn.ret.startswith(("Array[", "Fin ")):
+def _returned_cell(fn: "Fn", fns: dict, scalars: frozenset = frozenset()) -> Optional[int]:
+    """`scalars` are the program's enums: a value of one is no cell, whatever its name."""
+    if (not isinstance(fn.ret, str) or fn.ret in _NOT_A_CELL or fn.ret in scalars
+            or fn.ret.startswith(("Array[", "Fin "))):
         return None
     names = {name: position for position, (name, _ty) in enumerate(fn.params)}
     allowed = _allowed_by_exits(fn.body, names, frozenset(), fn, fns)
@@ -963,6 +1059,7 @@ class SourceMeaning:
         self.types = program.types
         self.fns = program.fns
         self.ctors = {c.name: (t, c) for t in program.types.values() for c in t.ctors}
+        self.enums = program.enums
         self.orig: dict[int, Optional[int]] = {}  # struct leaf -> tag its cell held
 
     def function(self, fn: Fn) -> int:
@@ -1015,6 +1112,8 @@ class SourceMeaning:
             return T.lift(built, *args, key=("call", fn.name)), result_ty, None
         if kind == "pack":
             return self._pack(e, env)
+        if kind == "enum":
+            return self._enum(e, env)
         if kind == "tuple":
             evaluated = [self.ev(m, env) for m in e[1]]
             term = T.lift(lambda *leaves: T.intern(("tuple", leaves)), *(v[0] for v in evaluated))
@@ -1116,6 +1215,19 @@ class SourceMeaning:
                 acc = T.lift(lambda x, y: T.bitop("or", x, y), shifted, term, key=("bit", "or"))
         assert acc is not None
         return acc, 8, None
+
+    def _enum(self, e: tuple, env: dict) -> tuple:
+        """The tag, with each field's own low bytes shifted to where the field is."""
+        T = self.T
+        _, name, args = e
+        enum, tag, fields = self.enums[name]
+        value = T.const(tag)
+        for (_f, _t, off, size), arg in zip(fields, args):
+            term = T.lift(lambda x, w=size: T.trunc(w, x), self.ev(arg, env)[0], key=("trunc", size))
+            count = T.const(8 * off)
+            shifted = T.lift(lambda x: T.arith("shl", 8, x, count), term, key=("shl8", 8 * off))
+            value = T.lift(lambda x, y: T.bitop("or", x, y), value, shifted, key=("bit", "or"))
+        return value, enum, None
 
     def _built(self, ctor: Ctor, cell: int, known: Optional[int], fields: tuple) -> int:
         """A cell whose fields and tag are what it already held was not built at all."""

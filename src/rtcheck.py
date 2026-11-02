@@ -46,7 +46,8 @@ RESERVE = "Free"
 NO_WORK = {"drop", "open", "move"}  # these move tokens and lower to nothing, so they cost no step
 MAX_OBLIGATIONS = 1024  # one handler's, with its callees': the size of a linear program, section 8.2
 
-Type = Union[str, tuple]  # a builtin name, ("named", id), ("array", N, t) or ("fin", N)
+Type = Union[str, tuple]  # a builtin name, ("named", id), ("enum", id), ("array", N, t) or ("fin", N)
+ENUM_BYTES = 8  # an enum is one register: its tag in byte 0, and its fields after it
 Word = tuple
 
 
@@ -109,7 +110,11 @@ class ResourceProgram:
 
 
 def is_scalar(ty: Type) -> bool:
-    return ty in SCALARS or ty in WIRE or ty in ("bool", "lit") or (isinstance(ty, tuple) and ty[0] == "fin")
+    return ty in SCALARS or ty in WIRE or ty in ("bool", "lit") or (isinstance(ty, tuple) and ty[0] in ("fin", "enum"))
+
+
+def is_enum(ty: Type) -> bool:
+    return isinstance(ty, tuple) and ty[0] == "enum"
 
 
 def is_int(ty: Type) -> bool:
@@ -358,7 +363,7 @@ class Checker:
         if name in self.composite:
             return self.composite[name]
         if name in self.types:
-            return ("named", name)
+            return ("enum" if self.types[name].kind == "enum" else "named", name)
         raise self.fail(f"unknown type {text}")
 
     def _decl(self, ty: Type) -> Optional[TypeDecl]:
@@ -595,7 +600,16 @@ class Checker:
         elif head == "field":
             if parts[3] == "cap":
                 raise self.fail(f"field {parts[4]} is a capability: one cannot be stored in a cell")
-            self.ctors[parts[0]].fields.append((int(parts[1]), int(parts[2]), parts[3], parts[4]))
+            ctor = self._ctor_of(parts[0])
+            off, size = int(parts[1]), int(parts[2])
+            if self.types[self._resolve(ctor.type)].kind == "enum":
+                if parts[3] not in SCALARS or SIZES[parts[3]] != size or off % size or not (
+                        1 <= off and off + size <= ENUM_BYTES):
+                    raise self.fail(f"field {parts[4]} of {ctor.name} is {size} bytes at {off}, and an enum's fields "
+                                    f"are integers that fit bytes 1 to {ENUM_BYTES - 1} of its register, after its tag")
+            elif self._resolve(parts[3]) in self.types and self.types[self._resolve(parts[3])].kind == "enum":
+                raise self.fail(f"field {parts[4]} is an enum: one cannot be stored in a cell yet")
+            ctor.fields.append((off, size, parts[3], parts[4]))
         else:
             assert head == "state"
             self.states.append((parts[0], parts[1]))
@@ -700,9 +714,10 @@ class Checker:
         """Section 3.1: the state, the item and the reserve, in and back out."""
         results = self.tuples.get(self._resolve(signature.ret))
         count = len(self.states)
-        if results is None or len(results) != count + 2 or len(signature.params) != count + 2:
+        verdict = results is not None and len(results) == count + 3 and is_enum(self.norm(results[count]))
+        if results is None or len(results) != count + 2 + verdict or len(signature.params) != count + 2:
             raise self.fail("a handler takes its state, an item and a Free, and returns its "
-                            "state, an output and a Free")
+                            "state, an output and a Free, or its state, a verdict, a record and a Free")
         for position, (_name, ty) in enumerate(self.states):
             if self.norm(signature.params[position]) != self.norm(ty):
                 raise self.fail(f"parameter {position} of a handler must be state slot {position}")
@@ -768,6 +783,8 @@ class Checker:
             raise self.fail(f"const of {norm}: the only way to make a Fin is idx")
         if norm in SCALARS or norm == "bool":
             self.fits(Tok("lit", ("lit", value)), norm, "const")
+        if is_enum(norm):
+            raise self.fail(f"const of {a[1]}: an enum is made by enum, from its constructor")
         if not is_scalar(norm):
             decl = self._decl(norm)
             if decl is None or decl.kind != "tagless" or value != 0:
@@ -806,6 +823,9 @@ class Checker:
 
     def _comparable(self, left: str, right: str) -> None:
         x, y = self.scalar(left, "a comparison operand"), self.scalar(right, "a comparison operand")
+        if is_enum(x.ty) or is_enum(y.ty):
+            raise self.fail(f"a comparison of {x.ty} with {y.ty}: an enum is told apart by matching it, which is "
+                            f"not built yet")
         if x.ty in WIRE or y.ty in WIRE:
             raise self.fail(f"a comparison of {x.ty} with {y.ty}: bits in network order have to be swapped first")
         if x.ty != y.ty and "lit" not in (x.ty, y.ty):
@@ -831,9 +851,24 @@ class Checker:
         if len(widths) != len(a) - 2:
             raise self.fail("pack needs one operand per width")
         for operand in a[2:]:
-            if self.scalar(operand, "a pack field").ty in WIRE:
+            ty = self.scalar(operand, "a pack field").ty
+            if ty in WIRE:
                 raise self.fail(f"a pack field {operand} is in network order, and has to be swapped first")
+            if is_enum(ty):
+                raise self.fail(f"a pack field {operand} is an enum, and a field is an integer")
         self.set(a[0], Tok("i64", self.fresh()))
+
+    def i_enum(self, a: list[str]) -> None:
+        """enum d, c, a...: a value of an enum, in a register, from its constructor and a scalar per field."""
+        ctor = self._ctor_of(a[1])
+        enum = self._resolve(ctor.type)
+        if self.types[enum].kind != "enum":
+            raise self.fail(f"enum of {ctor.name}: {enum} is not an enum")
+        if len(a) - 2 != len(ctor.fields):
+            raise self.fail(f"{ctor.name} has {len(ctor.fields)} fields, and this gives {len(a) - 2} operands")
+        for (_off, size, _ty, name), operand in zip(ctor.fields, a[2:]):
+            self.integer(operand, 8 * size, f"field {name} of {ctor.name}")
+        self.set(a[0], Tok(("enum", enum), self.fresh()))
 
     def i_bswap(self, a: list[str]) -> None:
         """bswap d, W, a. The one way between bits in network order and the integer they are, either way."""

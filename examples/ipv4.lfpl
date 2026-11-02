@@ -12,53 +12,46 @@ record Frame {
   body: Bytes
 };
 
-# What leaves. Send goes to the port it names, as the frame's scalars and then its body. The other two send nothing.
-data Out = Malformed(body: Bytes) | Expired(body: Bytes) | Send(port: Int8, frame: Frame);
+# Which way the frame goes. It is held in a register beside the frame, so deciding costs no cell. Send goes to the
+# port it names, as the frame's scalars and then its body, and the other two give the frame back.
+enum Verdict = Malformed | Expired | Send(port: Int8);
 
 # End-around carry.
-fn fold(s: Int64) : Int64 = +(&(s, 65535), >>(s, 16));
+fn fold(s: Int64) : Int64 = +(&(s, 0xFFFF), >>(s, 16));
 
-fn halves(x: Int32) : Int64 = +(>>(pack<32>(x), 16), &(pack<32>(x), 65535));
+fn halves(x: Int32) : Int64 = +(>>(pack<32>(x), 16), &(pack<32>(x), 0xFFFF));
 
 # 0x0800 is IPv4, and 0x45 is version 4 with 5 words of header. Ten 16-bit words add up to at most 0x9FFF6, so one
 # fold gives at most 0x10008. Anything above 0xFFFF would fold again to at most 9, and so could not have been
 # 0xFFFF: one fold is enough to tell.
 fn well_formed(ethertype: Int16, version: Int8, total: Int16, length: Int16, words: Int64) : Bool =
-  if !=(ethertype, 2048) then false
-  else if !=(version, 69) then false
+  if !=(ethertype, 0x0800) then false
+  else if !=(version, 0x45) then false
   else if <(total, 20) then false
   else if >(+(pack<16>(total), 14), pack<16>(length)) then false
-  else ==(fold(words), 65535);
+  else ==(fold(words), 0xFFFF);
 
 # RFC 1624, equation 3, on the word holding the TTL and the protocol: HC' = ~(~HC + ~m + m'), and m' = m - 0x100. The
 # TTL is at least 2 here, so ~m + m' is 0xFEFF whatever m is. Added to ~HC that is at most 0x1FEFE: one fold is enough.
 fn patched(sum: Int16, ttl: Int8, proto: Int8) : Int16 =
   let m = pack<8,8>(ttl, proto) in
-  low16(^(fold(+(^(pack<16>(sum), 65535), +(^(m, 65535), -(m, 256)))), 65535));
+  low16(^(fold(+(^(pack<16>(sum), 0xFFFF), +(^(m, 0xFFFF), -(m, 0x100)))), 0xFFFF));
 
 # The next hop, by the top two bits of the destination. It is also the port the frame leaves by.
 fn next_hop(destination: Int32) : Int8 = low8(>>(destination, 30));
 
-handler ipv4(f: Frame, free: Free) : (Out, Free) =
+handler ipv4(f: Frame, free: Free) : (Verdict, Frame, Free) =
   match f with Frame(d, dst_hi, dst_lo, src_hi, src_lo, ethertype, version, tos, total, id, frag,
                      ttl, proto, sum, source, destination, length, body) =>
     let words = +(pack<8,8>(version, tos), +(pack<16>(total), +(pack<16>(id), +(pack<16>(frag),
                 +(pack<8,8>(ttl, proto), +(pack<16>(sum), +(halves(source), halves(destination)))))))) in
-    if !(well_formed(ethertype, version, total, length, words)) then
-      let (c, rest) = peel(d) in (Malformed@c(body), More@rest(free))
-    else if <=(ttl, 1) then
-      let (c, rest) = peel(d) in (Expired@c(body), More@rest(free))
+    if !(well_formed(ethertype, version, total, length, words)) then (Malformed, Frame@d {}, free)
+    else if <=(ttl, 1) then (Expired, Frame@d {}, free)
     else
-      match free with
-      | End =>
-          let (c, rest) = peel(d) in (Malformed@c(body), More@rest(End))
-      | More(c, rest) =>
-          # The addresses: 02:00:00:00:00:1h and 02:00:00:00:01:1h, for hop h. A field that is not named
-          # by something new stays where it is, and the rest are stored: nothing here moves the frame.
-          let hop = next_hop(destination) in
-          (Send@c(hop, Frame@d(33554432, low16(+(pack<8>(hop), 16)), 33554432, low16(+(pack<8>(hop), 272)),
-                               ethertype, version, tos, total, id, frag,
-                               -(ttl, 1), proto, patched(sum, ttl, proto), source, destination,
-                               length, body)), rest)
-      end
+      # The addresses: 02:00:00:00:00:1h and 02:00:00:00:01:1h, for hop h. The TTL and the checksum change, and
+      # every other field stays where it is: nothing here moves the frame.
+      let hop = next_hop(destination) in
+      (Send(hop), Frame@d { dst_hi = 0x02000000, dst_lo = low16(+(pack<8>(hop), 0x10)),
+                            src_hi = 0x02000000, src_lo = low16(+(pack<8>(hop), 0x110)),
+                            ttl = -(ttl, 1), sum = patched(sum, ttl, proto) }, free)
   end;

@@ -306,7 +306,8 @@ SPAN_FIELDS = (("Int8", 8), ("Int16", 16), ("Int32", 32), ("Int64", 64), ("Be16"
 
 def span_program(rng: random.Random) -> tuple[bytes, int]:
     """One record across as many cells as its fields take, built from loose cells, rebuilt, and read. Some fields stay
-    and some change, in every cell and at every width, and a field can be anywhere in its cell, or waiting on a call."""
+    and some change, in every cell and at every width, and a field can be anywhere in its cell, or waiting on a call.
+    Half the rebuilds are updates, some with a let in front of them taking the name of a field they leave alone."""
     mask = (1 << 64) - 1
     while True:
         fields = [(f"f{i}", *rng.choice(SPAN_FIELDS)) for i in range(rng.randrange(3, 13))]
@@ -322,16 +323,23 @@ def span_program(rng: random.Random) -> tuple[bytes, int]:
     for step in range(rng.randrange(1, 4)):
         updated = dict(state)
         arguments = []
+        named = []
+        left = []
         for name, _type, bits in fields:
             if rng.random() < 0.6:
                 arguments.append(name)
+                left.append(name)
             else:
                 text, value = Scalars(rng, bits).value(rng.randrange(0, 3), {name: state[name]})
                 arguments.append(text)
+                named.append(f"{name} = {text}")
                 updated[name] = value
         state = updated
-        functions.append(f"fn u{step}(p: R) : R @p = match p with R(d, {', '.join(names)}) => "
-                         f"R@d({', '.join(arguments)}) end;")
+        built = f"R@d({', '.join(arguments)})"
+        if rng.random() < 0.5:
+            built = (" ".join(f"let {name} = 0 in" for name in left if rng.random() < 0.5)
+                     + f" R@d {{ {', '.join(named)} }}")
+        functions.append(f"fn u{step}(p: R) : R @p = match p with R(d, {', '.join(names)}) => {built} end;")
         calls = f"u{step}({calls})"
     weights = {name: rng.randrange(1, 1 << 16) for name in names}
     total = "0"
