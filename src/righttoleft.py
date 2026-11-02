@@ -10,7 +10,9 @@ Lower reads a program forward, once, and two things it needs are decided by what
                                    that at the function's first instruction, and it follows from the exits.
 
 This stage sits between Parse and Check and works one function at a time, in source order, because what a
-function returns can depend on what its callees return, and a callee always comes first. It has three steps.
+function returns can depend on what its callees return, and a callee always comes first. Every event goes through
+src/spans.py on its way in, so a record that spans cells has become the chain of records it is before any of this
+looks at it. It has three steps.
 
 Forward, as Parse writes the function's events to a file on disk, it resolves each name to its position in
 scope, just as Check will, and follows each value's word: which parameter's cell the value is, if any. That
@@ -53,10 +55,12 @@ from dataclasses import dataclass
 from typing import BinaryIO, Optional
 
 from .check import CELL_FIELDS_MAX, TUPLE_MAX
-from .dyck import (CLOSE, K_ARM, K_BINDER, K_BOOL, K_CALL, K_CTOR, K_DIAMOND, K_EOF, K_FIELD, K_FN, K_HANDLER, K_IF,
-                   K_INT, K_LET, K_LIVE, K_MATCH, K_NULLCTOR, K_PARAM, K_RESWORD, K_TARRAY, K_TFIN,
-                   K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_VARLAST, K_WITH, LEAF, OPEN, SEP, ev_class, ev_kind, ev_tag)
+from .dyck import (CLOSE, DEFAULT_D_MAX, K_ARM, K_BINDER, K_BOOL, K_CALL, K_CTOR, K_DIAMOND, K_EOF, K_FIELD, K_FN,
+                   K_HANDLER, K_IF, K_INT, K_LET, K_LIVE, K_MATCH, K_NULLCTOR, K_PARAM, K_RECORD, K_RESWORD, K_TARRAY,
+                   K_TFIN, K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_VARLAST, K_WITH, LEAF, OPEN, SEP, ev_class, ev_kind,
+                   ev_tag)
 from .ring import Reject, Stage
+from .spans import CELLS_PER_DEPTH as SPAN_CELLS_PER_DEPTH, Spans
 from .tokens import PAYLOAD_BYTES
 
 # A value's word. A parameter's position is 0 or more.
@@ -66,7 +70,7 @@ MASK_BITS = 8 * PAYLOAD_BYTES  # names beyond this are taken to be wanted: Lower
 NO_POSITION = 0xFFFF   # a name Check is going to refuse, or an event that binds nothing
 # Theorem 7.2. One open construct holds: its frame, or a branch's two sets going backward; the names an arm or a
 # let binds, and a let's while it waits; and the types of a function's parameters, counted at every depth.
-CELLS_PER_DEPTH = 3 + (CELL_FIELDS_MAX + 2) + TUPLE_MAX + MAX_PARAMETERS
+CELLS_PER_DEPTH = 3 + (CELL_FIELDS_MAX + 2) + TUPLE_MAX + MAX_PARAMETERS + SPAN_CELLS_PER_DEPTH
 _NOT_A_CELL = frozenset((b"Int8", b"Int16", b"Int32", b"Int64", b"Bool", b"Diamond"))
 
 # One event on disk: what Parse wrote, the line it was on, the name's position or the first position a let
@@ -105,8 +109,10 @@ class _Open:
 class RightToLeft(Stage):
     name = "right-to-left"
 
-    def __init__(self) -> None:
+    def __init__(self, d_max: int = DEFAULT_D_MAX) -> None:
         super().__init__()
+        self.d_max = d_max
+        self.spans = Spans(self)
         self.file: Optional[BinaryIO] = None
         self.records = 0
         self.phase = SPILLING
@@ -133,12 +139,17 @@ class RightToLeft(Stage):
         self.P = self.stack()  # going forward: the type of each parameter
         self.R = self.stack()  # going backward: for each open branch, the set after it, and so far before it
         self.T = self.stack()  # for all time: the name of each function, its tag holding its cell + 1
+        self.spans.attach()
 
     def depth(self) -> int:
         return max(len(self.K), len(self.R))
 
+    def table_cells(self) -> int:
+        """What this stage keeps for all time: the O(G) term of Theorem 7.2."""
+        return len(self.T.cells) + self.spans.table_cells()
+
     def has_work(self) -> bool:
-        return self.phase != SPILLING
+        return self.phase != SPILLING or self.spans.emitting is not None
 
     def _reject(self, message: str) -> Reject:
         return Reject(f"near line {self.ring.stages[0].line}: {message}")
@@ -147,7 +158,9 @@ class RightToLeft(Stage):
 
     def fire(self, cell: Optional[int]) -> None:
         if cell is None:
-            if self.phase == BACKWARD:
+            if self.spans.emitting is not None:
+                self._declare()
+            elif self.phase == BACKWARD:
                 self._step_back()
             else:
                 self._replay()
@@ -155,6 +168,10 @@ class RightToLeft(Stage):
         store = self.ring.store
         tag, payload = store.tag(cell), store.payload(cell)
         cls, kind = ev_class(tag), ev_kind(tag)
+        if kind == K_RECORD or self.spans.holding:
+            self.spans.hold(cls, kind, payload)
+            self.ring.drop(self, cell)
+            return
         if not self.in_function and not (cls == OPEN and kind in (K_FN, K_HANDLER)):
             self.ring.replay_line = None
             if kind == K_EOF and self.file is not None:
@@ -162,14 +179,24 @@ class RightToLeft(Stage):
                 self.file = None
             self.ring.pass_(self, cell, tag, payload)
             return
-        stamp, count = self._forward(cls, kind, payload)
-        self._append(tag, payload, stamp, count)
+        for new_tag, new_payload in self.spans.events(cls, kind, payload):
+            new_payload = new_payload.ljust(PAYLOAD_BYTES, b"\0")
+            stamp, count = self._forward(ev_class(new_tag), ev_kind(new_tag), new_payload)
+            self._append(new_tag, new_payload, stamp, count)
         self.ring.drop(self, cell)
         if cls == CLOSE and kind in (K_FN, K_HANDLER):
             self.in_function = False
             self.cursor = self.records
             self.live = 0
             self.phase = BACKWARD
+
+    def _declare(self) -> None:
+        """One event of a record on its way to Check, now that it is known what the record is. The last
+        call has nothing to send, and that is a firing with nothing to show for it, which is all right."""
+        self.ring.replay_line = None
+        event = self.spans.next_declaration_event()
+        if event is not None:
+            self.ring.emit_fresh(self, event[0], event[1])
 
     # --- the file
 
@@ -202,6 +229,10 @@ class RightToLeft(Stage):
         self.K.rewrite(len(self.K) - 1, kind, frame.pack())
 
     def _push(self, kind: int, frame: _Open) -> None:
+        """Parse has kept the source's nesting to the limit already. What a record that spans adds is counted here."""
+        if len(self.K) >= self.d_max:
+            raise self._reject(f"nesting too deep: more than {self.d_max} open constructs, counting two for each "
+                               f"cell of a record that spans after its first (the Depth rule)")
         self.K.push(kind, frame.pack())
 
     def _lookup(self, name: bytes) -> tuple[int, int]:
@@ -219,6 +250,7 @@ class RightToLeft(Stage):
     def _unbind_to(self, mark: int) -> None:
         while len(self.B) > mark:
             self.B.pop()
+        self.spans.unbind_to(mark)
 
     def _in_exit_position(self) -> bool:
         """Is the expression starting now the last thing this path of the function evaluates?"""

@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.lfplo import build_and_run, compile_program  # noqa: E402
 from src import rtlower  # noqa: E402
 from src.rtlower import Limit  # noqa: E402
+from src.spans import parts_of  # noqa: E402
 from src.symcheck import check_translation  # noqa: E402
 from src.validate import validate  # noqa: E402
 from tests.reference.lang import without_annotations  # noqa: E402
@@ -39,7 +40,7 @@ def compile_rt(source: bytes) -> str:
         in_use = ring.store.C - len(ring.F)
         depth = max(stage.depth() for stage in ring.stages)
         g_cells = (len(check.G.cells) + len(check.TA.cells) + len(check.TF.cells) + len(check.TT.cells)
-                   + len(passed.T.cells))
+                   + passed.table_cells())
         limit = rtlower.occupancy_bound(depth, g_cells)
         if in_use > limit:
             raise AssertionError(f"Theorem 7.2: {in_use} cells at depth {depth}, bound {limit}")
@@ -291,6 +292,61 @@ def record_program(rng: random.Random) -> tuple[bytes, int]:
     main = (f"fn main(free: Free) : Res = match free with End => Fail | More(c, rest) => "
             f"rd({calls.replace('P', build)}, rest) end;")
     return (RECORD + "\n".join(functions) + "\n" + main + "\n").encode(), expected
+
+
+def wire_record_program(rng: random.Random) -> tuple[bytes, int]:
+    """The same programs with their fields in network order. What they mean has not changed, so the answer has not."""
+    source, expected = record_program(rng)
+    return source.replace(b"record R { a: Int64, b: Int32, c: Int16, e: Int8 };",
+                          b"record R { a: Be64, b: Be32, c: Be16, e: Int8 };"), expected
+
+
+SPAN_FIELDS = (("Int8", 8), ("Int16", 16), ("Int32", 32), ("Int64", 64), ("Be16", 16), ("Be32", 32), ("Be64", 64))
+
+
+def span_program(rng: random.Random) -> tuple[bytes, int]:
+    """One record across as many cells as its fields take, built from loose cells, rebuilt, and read. Some fields stay
+    and some change, in every cell and at every width, and a field can be anywhere in its cell, or waiting on a call."""
+    mask = (1 << 64) - 1
+    while True:
+        fields = [(f"f{i}", *rng.choice(SPAN_FIELDS)) for i in range(rng.randrange(3, 13))]
+        parts = parts_of([bits // 8 for _name, _type, bits in fields])
+        if len(parts) > 1:
+            break
+    names = [name for name, _type, _bits in fields]
+    state = {name: rng.randrange(1 << bits) for name, _type, bits in fields}
+    initial = dict(state)
+    functions = ["fn h(x: Int64, y: Int64) : Int64 = +(*(x, 3), y);"]
+    cells = [f"c{i}" for i in range(len(parts))]
+    calls = f"R@({', '.join(cells)})({', '.join(str(initial[name]) for name in names)})"
+    for step in range(rng.randrange(1, 4)):
+        updated = dict(state)
+        arguments = []
+        for name, _type, bits in fields:
+            if rng.random() < 0.6:
+                arguments.append(name)
+            else:
+                text, value = Scalars(rng, bits).value(rng.randrange(0, 3), {name: state[name]})
+                arguments.append(text)
+                updated[name] = value
+        state = updated
+        functions.append(f"fn u{step}(p: R) : R @p = match p with R(d, {', '.join(names)}) => "
+                         f"R@d({', '.join(arguments)}) end;")
+        calls = f"u{step}({calls})"
+    weights = {name: rng.randrange(1, 1 << 16) for name in names}
+    total = "0"
+    expected = 0
+    for name, _type, bits in fields:
+        widened = name if bits == 64 else f"pack<{bits}>({name})"
+        total = f"+(*({widened}, {weights[name]}), {total})"
+        expected = (expected + state[name] * weights[name]) & mask
+    fields_text = ", ".join(f"{name}: {type_name}" for name, type_name, _bits in fields)
+    source = (f"data Free = End | More(next: Free);\ndata Res = Fail | Done(value: Int64, rest: Free);\n"
+              f"record R {{ {fields_text} }};\n" + "\n".join(functions) + "\n"
+              f"fn rd(p: R, free: Free) : Res = match p with R(d, {', '.join(names)}) => "
+              f"let (c, rest) = peel(d) in Done@c({total}, More@rest(free)) end;\n"
+              f"fn main(r0: Free) : Res = {take_cells(cells, f'rd({calls}, r{len(cells)})')};\n")
+    return source.encode(), expected
 
 
 LISTS = """data Free = End | More(next: Free);
@@ -739,6 +795,12 @@ class Differential(unittest.TestCase):
 
     def test_records(self):
         self._campaign(record_program, 4)
+
+    def test_records_in_network_order(self):
+        self._campaign(wire_record_program, 12)
+
+    def test_records_that_span(self):
+        self._campaign(span_program, 13)
 
     def test_lists(self):
         self._campaign(list_program, 5)

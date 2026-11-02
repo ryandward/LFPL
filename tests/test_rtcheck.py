@@ -100,6 +100,18 @@ class Refused(unittest.TestCase):
         with self.assertRaisesRegex(RTError, pattern):
             check(*parts)
 
+    def test_a_literal_result_is_the_null_of_a_tagless_type_and_nothing_else(self):
+        check(LIST, "fn f1 g() : t16\n    ret #0\nend\n")
+        self.refuse("only a tagless type has a literal", LIST, "fn f1 g() : t16\n    ret #1\nend\n")
+        self.refuse("only a tagless type has a literal", LIST, "fn f1 g() : i64\n    ret #0\nend\n")
+        self.refuse("only a tagless type has a literal", LIST, "tuple t40 t16 i64\n",
+                    "fn f1 g() : t40\n    ret #0, #0\nend\n")
+
+    def test_a_null_result_is_held_to_the_word_declared(self):
+        check(LIST, INC)
+        check(LIST, INC.replace("const r1, #0 : t16\n    ret r1", "ret #0"))
+        self.refuse("declared @0", LIST, "fn f1 g(r0 : t16) : t16 @0\n    ret #0\nend\n")
+
     def test_a_join_with_two_words_cannot_claim_restore(self):
         """Phase 1's join word taken from its last arm, which dropped a store."""
         stream = """

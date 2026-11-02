@@ -1,9 +1,8 @@
 """The fixed workload, as a Python model that shares nothing with what it judges.
 
-experimental/workload.md says what the workload is. This is the third opinion on it: the C baseline in
-experimental/ipv4_forward.c and experimental/ipv4.lfpl are compared with each other on a virtual pair, and
-both with this, on every frame. It works in network byte order, as the RFCs write it, where those two
-read little-endian words, so that a mistake in that trick would not be shared.
+experimental/workload.md says what the workload is. This is another opinion on it: examples/ipv4.lfpl is judged by
+it on UDP sockets, and the C baseline in experimental/ipv4_forward.c and experimental/ipv4.lfpl are compared with each
+other on a virtual pair, and both with this, on every frame. It works in network byte order, as the RFCs write it.
 """
 from typing import Callable, Optional
 
@@ -24,7 +23,7 @@ def macs_of(hop: int) -> tuple[bytes, bytes]:
 
 
 def by_top_bits(destination: bytes) -> int:
-    """The next hop experimental/ipv4.lfpl chooses: the top two bits of the first octet."""
+    """The next hop examples/ipv4.lfpl and experimental/ipv4.lfpl choose: the top two bits of the first octet."""
     return destination[0] >> 6
 
 

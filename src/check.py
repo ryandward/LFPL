@@ -47,22 +47,27 @@ from .tokens import PAYLOAD_BYTES
 
 CELL_FIELDS_MAX = 16
 LINEAR_BINDERS_MAX = 64
+LINK_NAME = b"$next"  # the last field of a cell of a record that spans, as src/spans.py names it
 
 # Type ids. Named types are G positions offset by FIRST_NAMED.
-T_I8, T_I16, T_I32, T_I64, T_BOOL, T_DIAMOND, T_LIT, T_LIT8, T_LIT16, T_LIT32 = range(10)
+T_I8, T_I16, T_I32, T_I64, T_BOOL, T_DIAMOND, T_LIT, T_LIT8, T_LIT16, T_LIT32, T_BE16, T_BE32, T_BE64 = range(13)
 FIRST_NAMED = 16
+# A field in network byte order. It says how the field lies in its cell, and nothing else: what a pattern binds
+# from one and what a constructor stores in one is the integer, swapped on the way.
+_WIRE = {T_BE16: T_I16, T_BE32: T_I32, T_BE64: T_I64}
 # A literal whose type nothing has fixed yet, by the bytes it needs.
 _LITERALS = {T_LIT8: 1, T_LIT16: 2, T_LIT32: 4, T_LIT: 8}
 _NARROWING = {b"low8": T_I8, b"low16": T_I16, b"low32": T_I32}
-_PRIMITIVES = {b"idx", b"get", *_NARROWING}
+_PRIMITIVES = {b"idx", b"get", b"peel", *_NARROWING}
 # Types with no entry in G. A range of ids per kind, so whether a type is linear can be read from
 # its id alone, as it already can for every other type.
 FIRST_ARRAY, FIRST_FIN, FIRST_TUPLE = 0x8000, 0xC000, 0xE000
 TUPLE_MAX = 6  # as many results as x86 has registers for: section 4.1's pairs, at most six wide
 _ELEMENT_TYPES = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4}  # dyck's element codes, as the ids just below
 _BUILTIN = {b"Int8": T_I8, b"Int16": T_I16, b"Int32": T_I32, b"Int64": T_I64,
-            b"Bool": T_BOOL, b"Diamond": T_DIAMOND}
-_SIZES = {T_I8: 1, T_I16: 2, T_I32: 4, T_I64: 8, T_BOOL: 1, T_LIT: 8, T_LIT8: 8, T_LIT16: 8, T_LIT32: 8}
+            b"Bool": T_BOOL, b"Diamond": T_DIAMOND, b"Be16": T_BE16, b"Be32": T_BE32, b"Be64": T_BE64}
+_SIZES = {T_I8: 1, T_I16: 2, T_I32: 4, T_I64: 8, T_BOOL: 1, T_LIT: 8, T_LIT8: 8, T_LIT16: 8, T_LIT32: 8,
+          T_BE16: 2, T_BE32: 4, T_BE64: 8}
 
 # G entries: name in the first cell, attributes in the second.
 E_TYPE, E_CTOR, E_FIELD, E_FUNC, E_PARAM, E_STATE = range(6)
@@ -72,16 +77,19 @@ _BINDER = struct.Struct("<HBHQB")  # type, linear index or 255, then its cell co
 _ARGUMENT = struct.Struct("<HQB")  # the cell count of one argument to a recursive call
 _FORWARD, _RESOLVED = 254, 253  # the `a` attribute of a forward-declared type
 
+# How a field is held, in the last byte of what Lower is told about one.
+ATTR_LINEAR, ATTR_WIRE = 1, 2
+
 # Payloads for Lower: positions, offsets and widths, and the id of whatever it must name.
 P_VAR = struct.Struct("<HBB")     # src index, linear, size
-P_FIELD = struct.Struct("<BBBB")  # index, off, size, linear
-P_BINDER = struct.Struct("<BBBB")  # 0 for diamond or 1 for a field, off, size, linear
+P_FIELD = struct.Struct("<BBBB")  # index, off, size, attributes
+P_BINDER = struct.Struct("<BBBB")  # 0 for diamond or 1 for a field, off, size, attributes
 P_PARAM_RT = struct.Struct("<HBBH")      # src index, size, linear, type
-P_DIAMOND_RT = struct.Struct("<HBBBBBBH")  # d src, tag, tagged, nfields, off, size, linear, the constructor
+P_DIAMOND_RT = struct.Struct("<HBBBBBBH")  # d src, tag, tagged, nfields, off, size, attributes, the constructor
 P_ARM_RT = struct.Struct("<BBBBBH")      # tag, tagged, is the null constructor, arm index, nctors, the constructor
 P_LET_RT = struct.Struct("<BBBB")        # separator 1, linear, size, how many names it binds
 P_CALL_RT = struct.Struct("<HBBBB")      # function ordinal, is self, argument count, result count, @k + 1 or 0
-P_WITH_RT = struct.Struct("<BBBHBB")     # off, size, linear, the constructor, its position and count
+P_WITH_RT = struct.Struct("<BBBHBB")     # off, size, attributes, the constructor, its position and count
 P_TYPE_RT = struct.Struct("<H")          # a type
 P_GET_RT = struct.Struct("<B")           # the element's size
 P_IDX_RT = struct.Struct("<Q")           # the bound
@@ -105,6 +113,15 @@ RESERVE_TYPE = b"Free"  # the reserve is never a measure: an item's work is paid
 
 def is_linear(ty: int) -> bool:
     return ty == T_DIAMOND or (ty >= FIRST_NAMED and not FIRST_FIN <= ty < FIRST_TUPLE)
+
+
+def value_of(ty: int) -> int:
+    """The type of what is in a field of this type, once it is out of the cell."""
+    return _WIRE.get(ty, ty)
+
+
+def attributes(ty: int) -> int:
+    return (ATTR_LINEAR if is_linear(ty) else 0) | (ATTR_WIRE if ty in _WIRE else 0)
 
 
 def is_composite(ty: int) -> bool:
@@ -182,7 +199,8 @@ class CheckStage(Stage):
 
     def _rt_type(self, ty: int) -> str:
         names = {T_I8: "i8", T_I16: "i16", T_I32: "i32", T_I64: "i64", T_BOOL: "bool",
-                 T_DIAMOND: "cap", T_LIT: "lit", T_LIT8: "lit", T_LIT16: "lit", T_LIT32: "lit"}
+                 T_DIAMOND: "cap", T_LIT: "lit", T_LIT8: "lit", T_LIT16: "lit", T_LIT32: "lit",
+                 T_BE16: "be16", T_BE32: "be32", T_BE64: "be64"}
         return names.get(ty, f"t{ty}")
 
     def _rt_line(self, index: int) -> bytes:
@@ -363,6 +381,9 @@ class CheckStage(Stage):
             if linear != 255:
                 if not self.used >> linear & 1:
                     name = data[:PAYLOAD_BYTES].rstrip(b"\0").decode()
+                    if "$" in name:  # src/spans.py's name for a cell of a record that spans
+                        raise self._reject(f"a cell of {name.split('$')[0] or 'a record'} is never used: it spans "
+                                           f"cells, and all of them have to go somewhere")
                     raise self._reject(f"linear variable {name} is never used")
                 self.used &= ~(1 << linear)
                 self.lin_held &= ~(1 << linear)
@@ -834,7 +855,7 @@ class CheckStage(Stage):
         elif kind == K_CTOR:
             self._arg(frame)
             field = self._g(frame[4] + 1 + frame[5])
-            return kind, P_FIELD.pack(frame[5], field[1], field[2], is_linear(field[7]))
+            return kind, P_FIELD.pack(frame[5], field[1], field[2], attributes(field[7]))
         elif kind == K_PACK:
             self._need_int(self.ty, "a pack field")
             frame[5] += 1
@@ -887,7 +908,7 @@ class CheckStage(Stage):
         if position >= frame[0]:
             raise self._reject(f"too many arguments: expected {frame[0]}")
         if self.K.peek()[0] == K_CTOR:
-            wanted = self._g(frame[4] + 1 + position)[7]
+            wanted = value_of(self._g(frame[4] + 1 + position)[7])
         else:
             wanted = self._g(frame[4] + position)[5]
         self._unify(wanted, self.ty, "an argument")
@@ -974,6 +995,9 @@ class CheckStage(Stage):
         if kind in (K_TYPE, K_TARRAY, K_TFIN):
             frame = self._top()
             ty = self._type_token(kind, payload)
+            if ty in _WIRE:
+                raise self._reject(f"{self._show(ty)} says how a field lies in a cell, and a value "
+                                   f"is an integer: {self._show(_WIRE[ty])} here")
             if self.K.peek()[0] == K_TTUPLE:
                 if len(self.TM) - frame[4] >= TUPLE_MAX:
                     raise self._reject(f"a tuple of more than {TUPLE_MAX}")
@@ -1007,7 +1031,7 @@ class CheckStage(Stage):
             off = size = linear = 0
             if count:
                 field = self._g(frame[4] + 1)
-                off, size, linear = field[1], field[2], is_linear(field[7])
+                off, size, linear = field[1], field[2], attributes(field[7])
             self.child_seen = False
             return kind, P_DIAMOND_RT.pack(src, tag, tagged, count, off, size, linear, frame[4])
         if len(self.K) and self.K.peek()[0] == K_IDX and self._top()[1]:
@@ -1060,10 +1084,10 @@ class CheckStage(Stage):
             self._bind(payload, T_DIAMOND)
             return K_BINDER, P_BINDER.pack(0, 0, 8, 1)
         field = self._g(frame[5] + position)
-        index = self._bind(payload, field[7])
+        index = self._bind(payload, value_of(field[7]))
         if frame[2]:  # the scrutinee was an unknown of this parameter: these fields replace it
             self.entry[frame[2] - 1] = self.entry[frame[2] - 1].plus(self._form_of(index))
-        return K_BINDER, P_BINDER.pack(1, field[1], field[2], is_linear(field[7]))
+        return K_BINDER, P_BINDER.pack(1, field[1], field[2], attributes(field[7]))
 
     def _with_field(self, payload: bytes):
         frame = self._top()
@@ -1072,11 +1096,14 @@ class CheckStage(Stage):
         for position in range(ctor + 1, ctor + 1 + count):
             if self.G.at(position)[1][:PAYLOAD_BYTES] == payload:
                 field = self._g(position)
-                frame[3] = field[7]
+                frame[3] = value_of(field[7])
                 self._store(frame)
-                self._bind(payload, field[7])
-                return K_FIELD, P_WITH_RT.pack(field[1], field[2], is_linear(field[7]), ctor,
+                self._bind(payload, frame[3])
+                return K_FIELD, P_WITH_RT.pack(field[1], field[2], attributes(field[7]), ctor,
                                                position - ctor - 1, count)
+        if count and self.G.at(ctor + count)[1][:PAYLOAD_BYTES].rstrip(b"\0") == LINK_NAME:
+            raise self._reject(f"{{ with }} reaches the first cell of {self._show(frame[2])}, and "
+                               f"{payload.rstrip(bytes(1)).decode()} is not there: rebuild it with a match")
         raise self._reject(f"no field {payload.rstrip(bytes(1)).decode()} in {self._show(frame[2])}")
 
     # --- close

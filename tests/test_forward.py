@@ -768,16 +768,22 @@ handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Verdict, Free) =
 """)
 
     def test_an_output_this_runtime_cannot_send(self):
-        self.assert_refused("carries scalars", """
+        self.assert_refused("carries scalars, records and one chain", """
 record Hdr { ttl: Int8 };
-record Box { a: Int8 };
+data Box = A(a: Int8) | B(b: Int16) | C;
 data Out = Nothing | X(port: Int8, b: Box);
 handler h(m: Hdr, free: Free) : (Out, Free) =
   match m with Hdr(d, ttl) => match free with
     | End => (Nothing, More@d(End))
-    | More(c, rest) => (X@d(1, Box@c(ttl)), rest)
+    | More(c, rest) => (X@d(1, A@c(ttl)), rest)
     end
   end;
+""")
+
+    def test_a_record_that_holds_itself_has_no_end_on_the_wire(self):
+        self.assert_refused("which has no end", """
+record R { a: Int8, next: R };
+handler h(m: R, free: Free) : (R, Free) = (m, free);
 """)
 
     def test_a_reserve_sent_away_needs_a_free_it_cannot_have(self):

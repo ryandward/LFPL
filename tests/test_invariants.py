@@ -459,8 +459,8 @@ class CellConservation(unittest.TestCase):
     def test_only_the_global_tables_stay_out_of_f_at_the_end(self):
         ring = compile_source(self.SOURCE)
         passed, check = ring.stages[2], ring.stages[3]
-        tables = (check.G, check.TA, check.TF, check.TT, passed.T)
-        self.assertEqual(ring.store.C - len(ring.F), sum(len(table.cells) for table in tables))
+        tables = (check.G, check.TA, check.TF, check.TT)
+        self.assertEqual(ring.store.C - len(ring.F), sum(len(table.cells) for table in tables) + passed.table_cells())
 
     def test_every_ring_rule_fired(self):
         ring = compile_source(self.SOURCE)
@@ -692,8 +692,8 @@ class DepthBound(unittest.TestCase):
         def on_step(ring: Ring) -> None:
             passed, check = ring.stages[2], ring.stages[3]
             depth = max(stage.depth() for stage in ring.stages)
-            tables = (check.G, check.TA, check.TF, check.TT, passed.T)
-            limit = occupancy_bound(depth, sum(len(table.cells) for table in tables))
+            tables = (check.G, check.TA, check.TF, check.TT)
+            limit = occupancy_bound(depth, sum(len(table.cells) for table in tables) + passed.table_cells())
             self.assertLessEqual(ring.store.C - len(ring.F), limit)
 
         ring = compile_source(source, on_step=on_step)
@@ -790,8 +790,9 @@ class LinearityAndRefusals(unittest.TestCase):
     def test_no_fresh(self):
         self._rejects(b"fn f() : List = Cons@d(1, Nil);", "unbound")
 
-    def test_a_constructor_must_fit_a_cell(self):
-        self._rejects(b"record Big { a: Int64, b: Int64, c: Int8 };", "does not fit")
+    def test_a_constructor_of_a_data_type_must_fit_a_cell(self):
+        """A record need not: tests/test_spans.py."""
+        self._rejects(b"data Big = B(a: Int64, b: Int64, c: Int8) | C;", "does not fit")
 
     def test_more_pending_values_than_registers_is_not_a_refusal(self):
         """The first Lower stopped here, with the state of every register. T8: nothing in this path has to."""
@@ -1105,8 +1106,8 @@ class MeaningCheck(unittest.TestCase):
          "same = value.off == field.off and value.size == field.size", "same = True",
          PRE + b"fn u(q: Q) : Q @q = match q with Q(d, a, b) => Q@d(b, a) end;\n", True),
         ("a waiting read is not moved out", LOWER,
-         "            if value.kind == V_LOC and value.cell == cell:\n                register = self.fresh()",
-         "            if False:\n                register = self.fresh()",
+         "            if value.kind == V_LOC and value.cell == cell:\n                self.V.set(index, self._hold(value))",
+         "            if False:\n                self.V.set(index, self._hold(value))",
          PRE + b"data Box;\nrecord B { p: Int64, c: Box };\n"
                b"record Box { n: Int64, m: Int64 };\n"
                b"fn f(z: Box, y: Box) : B = match z with Box(e, u, w) => "

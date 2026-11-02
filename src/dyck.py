@@ -26,11 +26,12 @@ already begins with a keyword or a name, so one token of lookahead decides it.
               | 'let' '(' id ',' id {',' id} ')' '=' e 'in' e
               | '(' e ',' e {',' e} ')' | 'idx' '(' e ',' int ')' | 'get' '(' e ',' e ')'
               | ('low8'|'low16'|'low32') '(' e ')'
-              | Name | Name '@' id '(' [e {',' e}] ')'
+              | Name | Name '@' cells '(' [e {',' e}] ')'
               | 'match' e 'with' ['|'] arm {'|' arm} 'end'
               | '{' e 'with' id '=' e '}'
               | id '(' [e {',' e}] ')'
               | 'pack' '<' int {',' int} '>' '(' e {',' e} ')'
+    cells   ::= id | '(' id {',' id} ')'
     arm     ::= Name ['(' id {',' id} ')'] '=>' e
 """
 from __future__ import annotations
@@ -268,6 +269,7 @@ S_CTOR_D, S_CTOR_LP = range(64, 66)
 S_PACK_LT, S_PACK_W, S_PACK_NEXT, S_PACK_LP = range(66, 70)
 S_TA_LB, S_TA_N, S_TA_RB, S_TA_ELEM, S_TF_N, S_TT_TYPE, S_TT_NEXT = range(70, 77)
 S_LTB, S_LTB_NEXT, S_ST_COLON, S_ST_TYPE, S_ST_SEMI = range(77, 82)
+S_CTOR_DL, S_CTOR_DN = range(82, 84)
 
 # Expression-expecting states, and what follows the expression.
 _AFTER = {S_BODY: S_SEMI, S_LET_E1: S_LET_IN, S_IF_COND: S_IF_THEN_KW,
@@ -763,9 +765,23 @@ class Parser(Stage):
                     raise self._fail("a second member: a tuple has at least two members")
                 self._close_args(cell)
         elif state == S_CTOR_D:
+            if tag == T_LPAREN:  # a record's cells, named one by one
+                self._set(S_CTOR_DL)
+                ring.drop(self, cell)
+                return
             require(T_IDENT, "the diamond variable after '@'")
             self._set(S_CTOR_LP)
             self._emit(cell, LEAF, K_DIAMOND, payload)
+        elif state == S_CTOR_DL:
+            require(T_IDENT, "a diamond variable")
+            self._set(S_CTOR_DN)
+            self._emit(cell, LEAF, K_DIAMOND, payload)
+        elif state == S_CTOR_DN:
+            if tag == T_COMMA:
+                self._set(S_CTOR_DL)
+                ring.drop(self, cell)
+            else:
+                next_state(S_CTOR_LP, "',' or ')'", T_RPAREN)
         elif state == S_CTOR_LP:
             next_state(S_ARGS_FIRST, "'('", T_LPAREN)
         elif state == S_PACK_LT:

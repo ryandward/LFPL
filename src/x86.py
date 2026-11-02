@@ -21,7 +21,7 @@ ALLOC = ("rbx", "rbp", "r12", "r13", "r14", "r15", "r9", "r8", "rcx", "rdx", "rs
 PARAMS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
 RESULTS = ("rax", "rdx", "rcx", "rsi", "rdi", "r8")
 SCRATCH, TRANSIT = "r10", "r11"
-SCALAR_TYPES = frozenset(("i8", "i16", "i32", "i64", "bool", "lit"))
+SCALAR_TYPES = frozenset(("i8", "i16", "i32", "i64", "bool", "lit", "be16", "be32", "be64"))
 NO_WORK = frozenset(("drop", "open", "move"))  # they write no instruction, and are not a step
 WIDTH = {1: "byte", 2: "word", 4: "dword", 8: "qword"}
 NEGATED = {"b": "ae", "be": "a", "a": "be", "ae": "b", "e": "ne", "ne": "e"}
@@ -871,6 +871,19 @@ class Backend:
         for bits, place in zip(widths[position:], places[position:]):
             self.ins("shl", register, str(bits))
             self._or_into(register, bits // 8, place)
+        self._define(a[0], register)
+
+    def i_bswap(self, a: list[str]) -> None:
+        """`rol` on the 16-bit register leaves the upper bits, which are zero, as they are, and a 32-bit `bswap`
+        clears them. Nothing here reads `movbe`, which an older x86-64 does not have."""
+        bits = int(a[1])
+        x, pins = self._operand(a[2], frozenset())
+        register = self._take(pins)
+        self._load(register, x)
+        if bits == 16:
+            self.ins("rol", self.sub(register, 2), "8")
+        else:
+            self.ins("bswap", self.sub(register, bits // 8))
         self._define(a[0], register)
 
     def _or_into(self, register: str, size: int, place: Union[Reg, Imm, Mem]) -> None:

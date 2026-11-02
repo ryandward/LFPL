@@ -20,14 +20,15 @@ import struct
 from dataclasses import dataclass, replace
 from typing import BinaryIO, Callable, Generic, Iterable, Iterator, NamedTuple, Optional, Protocol, TypeVar
 
-from .check import (P_ARM_RT, P_BINDER, P_CALL_RT, P_DIAMOND_RT, P_FIELD, P_GET_RT, P_IDX_RT,
-                    P_LET_RT, P_PARAM_RT, P_TYPE_RT, P_VAR, P_WITH_RT, CheckStage)
+from .check import (ATTR_LINEAR, ATTR_WIRE, P_ARM_RT, P_BINDER, P_CALL_RT, P_DIAMOND_RT, P_FIELD, P_GET_RT,
+                    P_IDX_RT, P_LET_RT, P_PARAM_RT, P_TYPE_RT, P_VAR, P_WITH_RT, CheckStage)
 from .dyck import (CC_NAMES, CLOSE, DEFAULT_D_MAX, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP, K_CTOR,
                    K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER, K_IDX, K_IF, K_INT, K_LET, K_LIVE,
                    K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
                    K_RTDECLMORE, K_TUPLE, K_TYPE, K_VAR, K_VARLAST, K_WITH, LEAF, OP_NAMES, OPEN, SEP, Lexer,
                    Parser, ev_class, ev_kind)
 from .righttoleft import CELLS_PER_DEPTH, MASK_BITS, RightToLeft
+from .spans import HELD_CELLS
 from .ring import FrameStack, Reject, Ring, Stage
 from .tokens import PAYLOAD_BYTES
 
@@ -49,7 +50,9 @@ class Limit(Exception):
 # --------------------------------------------------------------------- values
 
 V_LIT, V_NULL, V_REG, V_LOC, V_CAP, V_TUPLE, V_VIRT, V_CALL, V_FUNC = range(9)
-OWNED, LINEAR, CONSUMED, BOOL = 1, 2, 4, 8
+# WIRE: these bits are in network byte order, as they lie in a field of type Be16, Be32 or Be64. Such a value
+# is the integer to whatever reads it, which swaps it then, and bits to a field in that order, which takes it as it is.
+OWNED, LINEAR, CONSUMED, BOOL, WIRE = 1, 2, 4, 8, 16
 _VALUE = struct.Struct("<BBHBBII")
 _LITERAL = struct.Struct("<BBQ")
 
@@ -211,13 +214,17 @@ class Undo:
 
 @dataclass(frozen=True)
 class Layout:
-    """Where one field of the constructor being built goes."""
+    """Where one field of the constructor being built goes, and how it is held there."""
     off: int
     size: int
-    linear: int
+    attributes: int
+
+    @property
+    def wire(self) -> bool:
+        return bool(self.attributes & ATTR_WIRE)
 
     def pack(self) -> bytes:
-        return bytes((self.off, self.size, self.linear))
+        return bytes((self.off, self.size, self.attributes))
 
     @staticmethod
     def unpack(data: bytes) -> "Layout":
@@ -291,6 +298,7 @@ class RTLower(Stage):
         self.live_now = 0          # the names with a use still to come on this path: a set, as an integer
         self.param_types: list[int] = []  # at most 6
         self.last_into: list[Delivered] = [Delivered()]  # what was last delivered, per member
+        self.temporaries: list[int] = []  # registers that hold a scalar only for the build being written
 
     def attach(self, ring: Ring) -> None:
         super().attach(ring)
@@ -433,7 +441,7 @@ class RTLower(Stage):
         self.live = False
 
     def _as_reg(self, value: Value) -> int:
-        if value.kind in (V_REG, V_CAP):
+        if value.kind in (V_REG, V_CAP) and not value.flags & WIRE:
             return value.reg
         register = self.fresh()
         self._into(value, register)
@@ -461,6 +469,8 @@ class RTLower(Stage):
         elif value.kind == V_NULL:
             self.i(f"const r{d}, #0 : t{value.reg}")
             word, linear = 1, True
+        elif value.kind == V_LOC and value.flags & WIRE:
+            self.i(f"bswap r{d}, {8 * value.size}, r{value.reg}[{value.off}:{value.size}]")
         elif value.kind == V_LOC:
             verb = "take" if linear else "read"
             self.i(f"{verb} r{d}, r{value.reg}[{value.off}:{value.size}]")
@@ -472,7 +482,10 @@ class RTLower(Stage):
             linear, cell, tag = True, value.cell, value.off
         else:
             assert value.kind == V_REG, value
-            if value.reg != d:
+            if value.flags & WIRE:
+                self.i(f"bswap r{d}, {8 * value.size}, r{value.reg}")
+                self._release(value)
+            elif value.reg != d:
                 verb = "move" if value.flags & OWNED else "copy"
                 self.i(f"{verb} r{d}, r{value.reg}")
         self.last_into = [Delivered(word, int(linear), cell, tag)]
@@ -497,6 +510,25 @@ class RTLower(Stage):
         if last_use and value.flags & OWNED and not value.flags & LINEAR:
             return f"r{value.reg}!"
         return f"r{value.reg}"
+
+    def _native(self, value: Value) -> Value:
+        """What something that reads the value is given. A value in wire order is swapped here, into a temporary."""
+        if not value.flags & WIRE:
+            return value
+        register = self.fresh()
+        source = f"r{value.reg}[{value.off}:{value.size}]" if value.kind == V_LOC else f"r{value.reg}"
+        self.i(f"bswap r{register}, {8 * value.size}, {source}")
+        self._release(value)
+        return Value(V_REG, register, word=value.word, flags=OWNED)
+
+    def _hold(self, value: Value) -> Value:
+        """A location waiting on the value stack, read while it can be. Bits in wire order stay as they are,
+        since nothing yet says whether it is an integer that is wanted, or the same bits in another field."""
+        register = self.fresh()
+        verb = "take" if value.flags & LINEAR else "read"
+        self.i(f"{verb} r{register}, r{value.reg}[{value.off}:{value.size}]")
+        return Value(V_REG, register, off=value.off, size=value.size, word=value.word,
+                     flags=OWNED | (value.flags & (LINEAR | WIRE)))
 
     def _release(self, value: Value) -> None:
         """A temporary scalar has been read for the last time."""
@@ -587,10 +619,7 @@ class RTLower(Stage):
         for index in range(len(self.V)):
             value = self.V.at(index)
             if value.kind == V_LOC:
-                register = self.fresh()
-                self._into(value, register)
-                self.V.set(index, Value(V_REG, register, word=value.word,
-                                        flags=OWNED | (value.flags & LINEAR)))
+                self.V.set(index, self._hold(value))
 
     # --- leaves
 
@@ -658,8 +687,8 @@ class RTLower(Stage):
                 f"right-to-left pass said nothing would")
             return value
         if value.kind == V_REG:
-            return replace(value, flags=(value.flags & (LINEAR | OWNED)) if linear
-                           else value.flags & LINEAR)
+            return replace(value, flags=(value.flags & (LINEAR | OWNED | WIRE)) if linear
+                           else value.flags & (LINEAR | WIRE))
         return value
 
     def _gone(self, cell: int) -> bool:
@@ -673,7 +702,8 @@ class RTLower(Stage):
             top.aux += 1
             self.F.set_top(top)
             return
-        kind, off, size, linear = P_BINDER.unpack_from(payload)
+        kind, off, size, attributes = P_BINDER.unpack_from(payload)
+        linear = attributes & ATTR_LINEAR
         position = top.aux
         top.aux += 1
         self.F.set_top(top)
@@ -690,8 +720,8 @@ class RTLower(Stage):
             self._push_binder(Binder(Value(V_CAP, top.reg, off=top.l1, word=top.word, cell=top.cell,
                                            flags=LINEAR)))
             return
-        self._push_binder(Binder(Value(V_LOC, top.reg, off, size, self.new_word(), top.cell,
-                                       LINEAR if linear else 0), self.fresh() if linear else NO_REFUGE))
+        self._push_binder(Binder(Value(V_LOC, top.reg, off, size, self.new_word(), top.cell, _held(attributes)),
+                                 self.fresh() if linear else NO_REFUGE))
 
     def _sep_let(self, top: Frame, payload: bytes) -> None:
         _one, _linear, _size, count = P_LET_RT.unpack_from(payload)
@@ -958,12 +988,13 @@ class RTLower(Stage):
         width = payload[0]
         name = OP_NAMES[top.aux]
         field = self._field_being_built()
-        if (field is not None and top.dest == D_ANY and left.kind == V_LOC and name in _RMW
-                and left.cell == self.F.top().cell and right.kind in (V_LIT, V_REG)
-                and field.off == left.off and field.size == left.size == width):
-            self.V.push(right)
+        if (field is not None and not field.wire and top.dest == D_ANY and left.kind == V_LOC
+                and not left.flags & WIRE and name in _RMW and left.cell == self.F.top().cell
+                and right.kind in (V_LIT, V_REG) and field.off == left.off and field.size == left.size == width):
+            self.V.push(self._native(right))
             self.V.push(Value(V_FUNC, left.reg, left.off, left.size, top.aux, left.cell))
             return
+        left, right = self._native(left), self._native(right)
         register = self._result(top)
         self.i(f"op r{register}, {_RT_OPS.get(name, name)}/{8 * width}, "
                f"{self._operand(left)}, {self._operand(right)}")
@@ -985,6 +1016,7 @@ class RTLower(Stage):
     def _close_cmp(self) -> None:
         top = self.F.pop()
         right, left = self.V.pop(), self.V.pop()
+        left, right = self._native(left), self._native(right)
         cc = CC_NAMES[top.aux]
         if top.dest == D_COND:
             self.i(f"br {cc}, {self._operand(left, True)}, {self._operand(right, True)}, "
@@ -1002,6 +1034,7 @@ class RTLower(Stage):
         widths = (top.l1.to_bytes(4, "little") + top.l2.to_bytes(4, "little"))[:top.aux]
         values = [self.V.pop() for _ in range(top.aux)]
         values.reverse()
+        values = [self._native(v) for v in values]
         register = self._result(top)
         operands = ", ".join(self._operand(v) for v in values)
         self.i(f"pack r{register}, <{' '.join(str(w) for w in widths)}>, {operands}")
@@ -1011,7 +1044,7 @@ class RTLower(Stage):
 
     def _close_idx(self, payload: bytes) -> None:
         top = self.F.pop()
-        value = self.V.pop()
+        value = self._native(self.V.pop())
         register = self._result(top)
         self.i(f"idx r{register}, {P_IDX_RT.unpack_from(payload)[0]}, {self._operand(value)}")
         self._release(value)
@@ -1019,7 +1052,7 @@ class RTLower(Stage):
 
     def _close_low(self, payload: bytes) -> None:
         top = self.F.pop()
-        value = self.V.pop()
+        value = self._native(self.V.pop())
         register = self._result(top)
         self.i(f"trunc r{register}, {8 * payload[0]}, {self._operand(value)}")
         self._release(value)
@@ -1055,7 +1088,7 @@ class RTLower(Stage):
         if is_self and parent.kind == K_CTOR and parent.dest == D_RET and self.at is not None:
             field = self.L.top()
             word = self.V.at(arguments_from + self.at).word
-            if self._is_hole_of(word, parent.cell, field.off, field.size):
+            if self._is_hole_of(word, parent.cell, field):
                 self.V.push(Value(V_CALL, ordinal, argc, cell=word))
                 return
         if is_self and top.dest != D_RET:
@@ -1067,6 +1100,7 @@ class RTLower(Stage):
                 self._close_cell(value.cell, frozenset(), len(self.V))
         values = [self.V.pop() for _ in range(argc)]
         values.reverse()
+        values = [self._native(v) for v in values]
         operands = ", ".join(self._operand(v) for v in values)
         separator = ", " if operands else ""
         if top.dest == D_RET:
@@ -1160,12 +1194,14 @@ class RTLower(Stage):
         joined = ", ".join(sources)
         separator = ", " if joined else ""
         if call is not None:
-            operands = ", ".join(self._operand(v) for v in call[2])
+            self.temporaries.clear()  # control leaves, and a scalar left in a register goes with it
+            operands = ", ".join(self._operand(self._native(v)) for v in call[2])
             self.i(f"tailmod r{top.reg}, c{info.ctor}, {tag}{separator}{joined}, f{call[1].reg}"
                    f"{', ' if operands else ''}{operands}")
             self.live = False
             return
         self.i(f"build r{top.reg}, c{info.ctor}, {tag}{separator}{joined}")
+        self._drop_temporaries()
         for value, _operand in entries:
             self._release(value)
         for value, extra in entries:
@@ -1187,23 +1223,37 @@ class RTLower(Stage):
     def _mark_gone(self, cell: int) -> None:
         self.G.push(Cell(cell))
 
-    def _is_hole_of(self, word: int, cell: int, off: int, size: int) -> bool:
-        """Does this location of this cell belong to a name whose value this word is? If so the
-        value can go back with no store: that is RESTORE."""
+    def _is_hole_of(self, word: int, cell: int, field: Layout) -> bool:
+        """Does this location of this cell belong to a name whose value this word is, held the way this field
+        holds it? If so the value can go back with no store: that is RESTORE."""
         if not cell:
             return False
         for index in range(len(self.B) - 1, -1, -1):
             value = self.B.at(index).value
-            if (value.cell == cell and value.word == word and value.off == off
-                    and value.size == size and value.kind in (V_LOC, V_REG)):
+            if (value.cell == cell and value.word == word and value.off == field.off and value.size == field.size
+                    and value.kind in (V_LOC, V_REG) and bool(value.flags & WIRE) == field.wire):
                 return True
         return False
+
+    def _swapped_into(self, source: str, size: int) -> str:
+        """A value the other way round from the field it is going to, in a register until the build is written."""
+        register = self.fresh()
+        self.i(f"bswap r{register}, {8 * size}, {source}")
+        self.temporaries.append(register)
+        return f"r{register}"
+
+    def _drop_temporaries(self) -> None:
+        for register in self.temporaries:
+            self.i(f"drop r{register}")
+        self.temporaries.clear()
 
     def _field_sources(self, top: Frame, fields: list[Layout], entries: list[tuple]) -> list[str]:
         sources = []
         for field, (value, extra) in zip(fields, entries):
+            as_it_is = bool(value.flags & WIRE) == field.wire
             if value.kind == V_LIT:
-                sources.append(f"#{value.n}")
+                n = value.n
+                sources.append(f"#{int.from_bytes(n.to_bytes(field.size, 'little'), 'big') if field.wire else n}")
             elif value.kind == V_NULL:
                 sources.append("#0")
             elif value.kind == V_CALL:
@@ -1211,19 +1261,24 @@ class RTLower(Stage):
             elif value.kind == V_FUNC:
                 sources.append(f"{OP_NAMES[value.word]}([{value.off}:{value.size}], "
                                f"{self._operand(extra)})")
+            elif value.kind == V_LOC and not as_it_is:
+                sources.append(self._swapped_into(f"r{value.reg}[{value.off}:{value.size}]", value.size))
             elif value.kind == V_LOC and value.cell == top.cell:
                 same = value.off == field.off and value.size == field.size
                 sources.append("=" if same else f"[{value.off}:{value.size}]")
             elif value.kind == V_LOC:
-                register = self.fresh()
-                self._into(value, register)
-                sources.append(f"r{register}")
+                held = self._hold(value)
+                if not held.flags & LINEAR:
+                    self.temporaries.append(held.reg)
+                sources.append(f"r{held.reg}")
             else:
                 assert value.kind == V_REG, value
-                if self._is_hole_of(value.word, top.cell, field.off, field.size):
+                if self._is_hole_of(value.word, top.cell, field):
                     sources.append(f"r{value.reg}!" if value.flags & LINEAR else "=")
-                else:
+                elif as_it_is:
                     sources.append(f"r{value.reg}")
+                else:
+                    sources.append(self._swapped_into(f"r{value.reg}", value.size or field.size))
         return sources
 
     def _close_cell(self, cell: int, named: frozenset, values_to: int, arguments: Iterable = ()) -> None:
@@ -1233,10 +1288,7 @@ class RTLower(Stage):
         for index in range(values_to):
             value = self.V.at(index)
             if value.kind == V_LOC and value.cell == cell:
-                register = self.fresh()
-                self._into(value, register)
-                self.V.set(index, Value(V_REG, register, word=value.word,
-                                        flags=OWNED | (value.flags & LINEAR)))
+                self.V.set(index, self._hold(value))
         for index in range(len(self.B)):
             binder = self.B.at(index)
             value = binder.value
@@ -1251,8 +1303,8 @@ class RTLower(Stage):
             elif self._wanted_later(index):
                 refuge = self.fresh() if binder.refuge == NO_REFUGE else binder.refuge
                 self.i(f"read r{refuge}, r{value.reg}[{value.off}:{value.size}]")
-                self._set_binder(index, Binder(Value(V_REG, refuge, off=value.off, size=value.size,
-                                                     word=value.word, cell=cell, flags=OWNED), refuge))
+                self._set_binder(index, Binder(Value(V_REG, refuge, off=value.off, size=value.size, word=value.word,
+                                                     cell=cell, flags=OWNED | (value.flags & WIRE)), refuge))
         if cell:
             self._mark_gone(cell)
 
@@ -1279,16 +1331,16 @@ class RTLower(Stage):
         return register
 
     def _with_field(self, payload: bytes) -> None:
-        off, size, linear, ctor, position, count = P_WITH_RT.unpack_from(payload)
+        off, size, attributes, ctor, position, count = P_WITH_RT.unpack_from(payload)
         top = self.F.top()
         self.i(f"open r{top.reg}, c{ctor}")
         top.aux = position
         top.l1 = ctor
         top.l2 = count
-        top.l3 = off | size << 8 | linear << 16
+        top.l3 = off | size << 8 | attributes << 16
         self.F.set_top(top)
-        self.B.push(Binder(Value(V_LOC, top.reg, off, size, self.new_word(), top.cell,
-                                 LINEAR if linear else 0), self.fresh() if linear else NO_REFUGE))
+        self.B.push(Binder(Value(V_LOC, top.reg, off, size, self.new_word(), top.cell, _held(attributes)),
+                           self.fresh() if attributes & ATTR_LINEAR else NO_REFUGE))
 
     def _close_with(self) -> None:
         top = self.F.pop()
@@ -1301,6 +1353,7 @@ class RTLower(Stage):
         self._pop_binders(top.bmark)
         self._close_cell(top.cell, frozenset(), len(self.V))
         self.i(f"build r{top.reg}, c{top.l1}, none, {', '.join(sources)}")
+        self._drop_temporaries()
         self._release(value)
         if operand is not None:
             self._release(operand)
@@ -1393,6 +1446,11 @@ class RTLower(Stage):
             raise AssertionError(f"close of kind {kind}")
 
 
+def _held(attributes: int) -> int:
+    """A value's flags, for a field held this way."""
+    return (LINEAR if attributes & ATTR_LINEAR else 0) | (WIRE if attributes & ATTR_WIRE else 0)
+
+
 def _type_text(ty: int) -> str:
     names = {0: "i8", 1: "i16", 2: "i32", 3: "i64", 4: "bool", 5: "cap", 6: "lit"}
     return names.get(ty, f"t{ty}")
@@ -1417,7 +1475,8 @@ DEFAULT_G_MAX = 2048
 def occupancy_bound(depth: int, g_cells: int, l_max: int = PAYLOAD_BYTES, w: int = 1) -> int:
     """Theorem 7.2, for this ring: W + 5 + (E - 1) + L_max + (per-stage cells) * D + s * G. Five channels and
     held cells now, with the right-to-left pass among the stages."""
-    return w + 5 + (E_MAX - 1) + l_max + (S_PARSE + CELLS_PER_DEPTH + S_CHECK + S_LOWER) * depth + g_cells
+    return (w + 5 + (E_MAX - 1) + l_max + HELD_CELLS
+            + (S_PARSE + CELLS_PER_DEPTH + S_CHECK + S_LOWER) * depth + g_cells)
 
 
 def required_cells(d_max: int, g_max: int = DEFAULT_G_MAX) -> int:
@@ -1437,7 +1496,7 @@ def compiler_ring(source: Iterable[int], sink: Callable[[int, bytes], None],
                   on_step: Optional[Callable[[Ring], None]] = None, *, phase1: bool = False,
                   cells: Optional[int] = None, d_max: int = DEFAULT_D_MAX) -> Ring:
     """Every stage, on one ring. `required_cells` of them is Theorem 7.2's claim, so that receiving a cell cannot fail."""
-    stages = [Lexer(), Parser(d_max), RightToLeft(), CheckStage(phase1=phase1), RTLower()]
+    stages = [Lexer(), Parser(d_max), RightToLeft(d_max), CheckStage(phase1=phase1), RTLower()]
     return Ring(required_cells(d_max) if cells is None else cells, iter(source), stages, sink, on_step)
 
 

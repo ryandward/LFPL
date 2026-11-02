@@ -37,6 +37,7 @@ from fractions import Fraction
 from typing import Iterable, Mapping, Optional, Union
 
 SCALARS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64}
+WIRE = {"be16": 16, "be32": 32, "be64": 64}  # bits in network byte order: scalars, and no integer until bswap says so
 SIZES = {"i8": 1, "i16": 2, "i32": 4, "i64": 8, "bool": 1}
 OP_NAMES = {"add", "sub", "mul", "and", "or", "xor", "shl", "shr"}
 READ_MODIFY_WRITE = {"add", "sub", "and", "or", "xor"}  # what one x86 instruction does in memory
@@ -108,7 +109,7 @@ class ResourceProgram:
 
 
 def is_scalar(ty: Type) -> bool:
-    return ty in SCALARS or ty in ("bool", "lit") or (isinstance(ty, tuple) and ty[0] == "fin")
+    return ty in SCALARS or ty in WIRE or ty in ("bool", "lit") or (isinstance(ty, tuple) and ty[0] == "fin")
 
 
 def is_int(ty: Type) -> bool:
@@ -351,7 +352,7 @@ class Checker:
         return name
 
     def norm(self, text: str) -> Type:
-        if text in SCALARS or text in ("bool", "lit", "cap"):
+        if text in SCALARS or text in WIRE or text in ("bool", "lit", "cap"):
             return text
         name = self._resolve(text)
         if name in self.composite:
@@ -386,7 +387,7 @@ class Checker:
         if token.word[0] != "lit":
             return
         value = token.word[1]
-        limit = 2 if ty == "bool" else 1 << SCALARS[ty] if ty in SCALARS else None
+        limit = 2 if ty == "bool" else 1 << {**SCALARS, **WIRE}[ty] if ty in SCALARS or ty in WIRE else None
         if limit is not None and value >= limit:
             raise self.fail(f"{where}: the literal {value} is not a {ty}")
 
@@ -805,6 +806,8 @@ class Checker:
 
     def _comparable(self, left: str, right: str) -> None:
         x, y = self.scalar(left, "a comparison operand"), self.scalar(right, "a comparison operand")
+        if x.ty in WIRE or y.ty in WIRE:
+            raise self.fail(f"a comparison of {x.ty} with {y.ty}: bits in network order have to be swapped first")
         if x.ty != y.ty and "lit" not in (x.ty, y.ty):
             raise self.fail(f"a comparison of {x.ty} with {y.ty}")
         self.fits(x, y.ty, "a comparison")
@@ -828,8 +831,27 @@ class Checker:
         if len(widths) != len(a) - 2:
             raise self.fail("pack needs one operand per width")
         for operand in a[2:]:
-            self.scalar(operand, "a pack field")
+            if self.scalar(operand, "a pack field").ty in WIRE:
+                raise self.fail(f"a pack field {operand} is in network order, and has to be swapped first")
         self.set(a[0], Tok("i64", self.fresh()))
+
+    def i_bswap(self, a: list[str]) -> None:
+        """bswap d, W, a. The one way between bits in network order and the integer they are, either way."""
+        width = int(a[1])
+        if width not in WIRE.values():
+            raise self.fail(f"bswap of {width} bits: a byte has no order, and nothing else is that wide")
+        if _LIT.match(a[2]):
+            raise self.fail(f"bswap of {a[2]}: a literal is written already swapped, as a build's source")
+        token = self.scalar(a[2], "bswap's operand")
+        wire, integer = f"be{width}", f"i{width}"
+        if token.ty == wire:
+            result = integer
+        elif token.ty in (integer, "lit"):
+            self.fits(token, integer, "bswap's operand")
+            result = wire
+        else:
+            raise self.fail(f"bswap of {width} bits on {a[2]}, which is {token.ty}")
+        self.set(a[0], Tok(result, self.fresh()))
 
     # --- arrays
 
@@ -990,6 +1012,8 @@ class Checker:
         if _LOC.match(operand):
             raise self.fail(f"{where}: a computed source's operand is a register or a literal")
         token = self.scalar(operand, "a computed source's operand")
+        if token.ty in WIRE:
+            raise self.fail(f"{where}: {operand} is in network order, and has to be swapped first")
         self.fits(token, ty, where)
 
     def _tag_rule(self, tag: str, ctor: Ctor, decl: TypeDecl, cell: Cell) -> None:
@@ -1244,8 +1268,9 @@ class Checker:
             raise self.fail(f"ret of {len(a)} values from a function returning {len(wanted)}")
         for position, (operand, ty) in enumerate(zip(a, wanted)):
             if _LIT.match(operand):
+                word = self._null_result(operand, self.norm(ty))
                 if results is None:
-                    self._word_leaving(self._null_result(operand, self.norm(ty)), "ret")
+                    self._word_leaving(word, "ret")
                 continue
             r, token = self.full(operand)
             self.unify(token.ty, self.norm(ty), "a result")

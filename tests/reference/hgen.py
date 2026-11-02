@@ -7,6 +7,7 @@ from .lang import Interp, show, MASK
 from .gen import Gen, SCAL, INTS, BITS, SRC, parse_helpers, params_text, ret_text, type_text, Skip, Program
 
 FMT = {'i8': 'B', 'i16': 'H', 'i32': 'I', 'i64': 'Q', 'bool': 'B'}
+WIRE = {'i16': 'Be16', 'i32': 'Be32', 'i64': 'Be64'}  # the same integer, in network order on the wire
 SIZE = {'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8, 'bool': 1}
 PRELUDE = """data Fuel = Zed | Suc(prev: Fuel);
 fn id8(x: Int8) : Int8 = x;
@@ -35,13 +36,12 @@ class H:
         self.seed = seed
         r = self.r
         # item
-        while True:
-            self.has_body = r.random() < 0.6
-            n = r.randrange(0 if self.has_body else 1, 6)
-            self.item = [(f"i{k}", r.choice(SCAL)) for k in range(n)]
-            types = [t for _n, t in self.item] + (['Bytes'] if self.has_body else [])
-            if layout_fits(types, 0) and sum(SIZE[t] for _n, t in self.item) <= 15:
-                break
+        self.has_body = r.random() < 0.6
+        # Up to five fields usually fit one cell, and more take as many as they take.
+        n = r.randrange(0 if self.has_body else 1, 6 if r.random() < 0.7 else 13)
+        self.item = [(f"i{k}", r.choice(SCAL)) for k in range(n)]
+        self.wire = {name for name, t in self.item if t in WIRE and r.random() < 0.4}
+        self.spans = not layout_fits([t for _n, t in self.item] + (['Bytes'] if self.has_body else []), 0)
         # state
         self.states = []
         for k in range(r.randrange(0, 5)):
@@ -71,6 +71,7 @@ class H:
                 sends, fields = False, []
             if count == 2 and not sends and not fields and not self.has_body:
                 fields = [(f"o{k}f0", 'i8')]  # a tagless null constructor takes no cell, so give it a field
+            self.wire |= {name for name, t in fields if t in WIRE and r.random() < 0.4}
             self.outs.append((f"Ou{k}", sends, fields))
         self.g = Gen(r, spill=0.2)
         self.defs = []
@@ -126,6 +127,8 @@ class H:
         body = self.decide(env, lin_names, d, r.randrange(0, 3))
         for head in reversed(lets):
             body = (head[0], head[1], head[2], body)
+        if self.spans:  # one of its cells for the output, and the others go back
+            body = ('lett', ['dc', 'dr'], ('call', 'peel', [('var', d)]), body)
         pattern = [d] + binder_names + (['bd'] if self.has_body else [])
         self.body = ('match', ('var', 'm'), [('Hd', pattern, body)])
 
@@ -144,19 +147,27 @@ class H:
         if self.has_body:
             args.append(('var', 'bd'))
         state = [('var', lin_names[n]) for n, _l, _e in self.states]
+        if self.spans:
+            return ('tup', state + [('ctor', ctor, 'dc', args), ('ctor', 'More', 'dr', [('var', 'fr')])])
         return ('tup', state + [('ctor', ctor, d, args), ('var', 'fr')])
+
+    def source_type(self, name, t):
+        return WIRE[t] if name in self.wire else SRC[t]
+
+    def packed(self, name, t, value):
+        return struct.pack(('>' if name in self.wire else '<') + FMT[t], value)
 
     def text(self):
         out = [PRELUDE]
         if self.has_body:
             out.append("data Bytes;")
-        fields = ', '.join(f"{n}: {SRC[t]}" for n, t in self.item)
+        fields = ', '.join(f"{n}: {self.source_type(n, t)}" for n, t in self.item)
         if self.has_body:
             fields = (fields + ', ' if fields else '') + 'bd: Bytes'
         out.append(f"record Hd {{ {fields} }};")
         ctors = []
         for ctor, sends, fs in self.outs:
-            parts = (['port: Int8'] if sends else []) + [f"{n}: {SRC[t]}" for n, t in fs] + (['bd: Bytes'] if self.has_body else [])
+            parts = (['port: Int8'] if sends else []) + [f"{n}: {self.source_type(n, t)}" for n, t in fs] + (['bd: Bytes'] if self.has_body else [])
             ctors.append(f"{ctor}({', '.join(parts)})" if parts else ctor)
         out.append("data Out = " + " | ".join(ctors) + ";")
         for name, length, element in self.states:
@@ -179,6 +190,7 @@ class H:
         fns['hh0'] = ([n for n, _l, _e in self.states] + ['m', 'fr'], self.body)
         interp = Interp(fns, {})
         native = parse_helpers()
+        native['peel'] = lambda _cells: [('#',), ('#',)]
         orig = interp.call
         interp.call = lambda name, args: native[name](*args) if name in native else orig(name, args)
         return interp
@@ -194,7 +206,7 @@ class H:
                 m = MASK[BITS[t]]
                 v = r.choice((0, 1, 2, 7, m, m // 2, r.randrange(m + 1), r.randrange(m + 1)))
             vals.append(v)
-            wire += struct.pack('<' + FMT[t], v)
+            wire += self.packed(_n, t, v)
         body = b''
         if self.has_body:
             length = r.choice((0, 1, 6, 7, 8, 14, 15, r.randrange(50)))
@@ -216,5 +228,5 @@ class H:
         for (fname, t), v in zip(fields, out[2:]):
             if t == 'bool':
                 v = 1 if v else 0
-            wire += struct.pack('<' + FMT[t], v & MASK[8 * SIZE[t]])
+            wire += self.packed(fname, t, v & MASK[8 * SIZE[t]])
         return port, wire + body

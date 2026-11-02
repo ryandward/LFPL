@@ -45,7 +45,9 @@ fields are. The result of a call to `f @k` has the word of argument k.
 
 Types `t` are `Int w`, `Bool`, a named type `D`, `Cap`, which is a cell's capability and the
 source language's diamond, `Array[N] t`, which is linear, and `Fin N`, which is scalar. A literal
-whose width nothing has fixed yet has type `lit`, and it unifies with any `Int w`.
+whose width nothing has fixed yet has type `lit`, and it unifies with any `Int w`. `Be w` is `w` bits
+in network byte order: a scalar, which can be read, moved, copied and stored in a field of that type,
+and which is no integer, so that nothing can do arithmetic on it or compare it until `bswap` says what it is.
 
 ## The text format
 
@@ -64,7 +66,7 @@ gave them, and declarations come first:
     field c18 0 1 i8 ttl            offset, size, type, name
     state routes t32768
 
-Scalar types are `i8 i16 i32 i64 bool lit`. `cap` is the capability. Function headers carry the
+Scalar types are `i8 i16 i32 i64 be16 be32 be64 bool lit`. `cap` is the capability. Function headers carry the
 ordinal the callers use, the name, and the types:
 
     fn f3 inc(r0 : t30) : t30 @0
@@ -91,6 +93,9 @@ Each rule reads: tokens required `-->` tokens left. Tokens not named are untouch
     op d, f/W, a, b     a, b : Int W, free d    -->  d = fresh : Int W
     cmp d, cc, a, b     a, b same scalar, free d -->  d = fresh : Bool
     trunc d, W, a       a : Int V, V >= W, free d -->  d = fresh : Int W    (the source's low8, low16, low32)
+    bswap d, W, a       a : Be W, free d        -->  d = fresh : Int W
+                        a : Int W or lit, free d -->  d = fresh : Be W      a is a register or a location, W is
+                                                                            16, 32 or 64
     pack d, <W...>, a...  a_i scalar, free d    -->  d = fresh : Int 64
 
 `f` is add, sub, mul, and, or, xor, shl or shr, with the meaning LFPL-O section 4.4 gives
@@ -122,7 +127,7 @@ a mask.
           =             c[l_i] = w : t                     STAY: nothing moves
           r!            r = w : t, c[l_i] ~ w              RESTORE: nothing moves, r goes free
           r             r = w : t, and l_i does not already hold w    STORE
-          #n            a literal                          STORE
+          #n            a literal                          STORE. For a Be field, it is written already swapped
           [l]           c[l] = w : t, another location     STORE, read before anything is written
           f([l], b)     l = l_i, c[l] an integer, b a register or literal: one instruction in place.
                         f is add, sub, and, or or xor. Anything else computes into a register first.
@@ -138,6 +143,10 @@ a mask.
 
         -->  p = c : D, and every token of the open cell is gone, which closes the stale-read
         window. Reading from c afterwards has no token to use.
+
+A record that spans cells is not here. By this level it is a chain of records, each one cell, with
+a link in the last field of each but the last, which is called `$next`, and its later parts have names with a `$` in
+them that no source can have. Section 4.8 of LFPL-O and `src/spans.py` say how.
 
 `r` where `r!` would apply is a type error, and so is `r!` where it would not. That is
 Theorem 6.1 as a local check: writing a value back to where it came from is ill-typed, and
@@ -295,6 +304,8 @@ partial result is ever special. All the failures Phase 1 reports about registers
                            borrow rcx, and give 0 past the width. By a literal past W, xor.
     cmp                    cmp a, b; setcc; movzx
     trunc                  mov r32 or movzx
+    bswap                  a sized load or mov; then rol r16, 8, or bswap r32 or r64. Both leave the register
+                           zero extended
     pack                   Horner: shl, then or into the subregister, which keeps only the field's bits
                            of a wider operand. Leading literals are folded into one. A 32-bit field goes
                            through scratch, since `or r32` would clear the upper half
@@ -351,8 +362,9 @@ byte. No state uses both.
     drop, open         no state. `open` needs no read until a field of the cell is named
     move               no state: the move happens in the next clock, as one more <=
     const, copy, op,   one state, one <=. Verilog's << and >> are already 0 past the width, and a
-      cmp, trunc,      literal is written at the width it meets
-      pack, idx
+      cmp, trunc,      literal is written at the width it meets. bswap is nothing but wires: a
+      pack, idx,       concatenation of the same bytes the other way round
+      bswap
     read, take         one state: a slice of port A's output, latched
     build              one state: one write, whose byte enables cover exactly the sources that are
                        not `=`, `r!` or `*`, and the tag on `write`. RTL-3 is then a property of this

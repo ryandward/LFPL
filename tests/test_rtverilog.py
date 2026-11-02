@@ -30,7 +30,7 @@ from src.rtlower import Limit, rt_lines  # noqa: E402
 from src.rtverilog import CELL_BITS, Translation, translate  # noqa: E402
 from tests.test_checksum import (LARGEST, PORT, SOURCE, cells_in, internet_checksum,  # noqa: E402
                                  packet, payload)
-from tests.reference import hgen  # noqa: E402
+from tests.reference import hgen, ipv4_model  # noqa: E402
 from tests.test_forward import ROOT, Forwarder  # noqa: E402
 from tests.test_generated import DECLARED  # noqa: E402
 from tests.test_walks import STEPS, WIDTH, cells_of, payload_of, pipeline_text, wire_of  # noqa: E402
@@ -483,36 +483,77 @@ class Layout:
 
     @staticmethod
     def _is_scalar(type_text: str) -> bool:
-        return type_text in ("i8", "i16", "i32", "i64", "bool")
+        return type_text in ("i8", "i16", "i32", "i64", "bool", "be16", "be32", "be64")
+
+    def _record_of(self, type_text: str):
+        """The constructor of a field that is a record, whose cell it points to, or None."""
+        name = self._resolve(type_text)
+        return self.by_type[name][0] if self.kinds.get(name) == "record" else None
+
+    @staticmethod
+    def _is_length(size: int, type_text: str, name: str) -> bool:
+        return name == "length" and type_text == "i16"
+
+    def shape(self, ctor: str) -> tuple:
+        """How many bytes of this record are on the wire, and how many cells it is."""
+        wire, cells = 0, 1
+        for _offset, size, type_text, name in self.ctors[ctor][1]:
+            inner = self._record_of(type_text)
+            if inner is not None:
+                inner_wire, inner_cells = self.shape(inner)
+                wire += inner_wire
+                cells += inner_cells
+            elif self._is_scalar(type_text) and not self._is_length(size, type_text, name):
+                wire += size
+        return wire, cells
 
     def image(self, datagram: bytes, reserve: int) -> tuple:
         """The cells src/runtime.py would have made of a datagram: (address, enables, data)."""
-        fields = self.ctors[self.item][1]
-        header, enables, at = 0, 0, 0
+        words: dict = {}
         chain_field = None
-        for offset, size, type_text, _name in fields:
-            if self._is_scalar(type_text):
-                header |= int.from_bytes(datagram[at:at + size], "little") << (8 * offset)
+        at = 0
+        next_address = 2
+
+        def fill(ctor: str, address: int) -> None:
+            nonlocal at, next_address, chain_field
+            word, enables = 0, 0
+            for offset, size, type_text, name in self.ctors[ctor][1]:
+                inner = self._record_of(type_text)
+                if self._is_length(size, type_text, name):
+                    value = len(datagram)
+                elif inner is not None:
+                    value = next_address
+                    next_address += 1
+                    fill(inner, value)
+                elif self._is_scalar(type_text):
+                    value = int.from_bytes(datagram[at:at + size], "little")
+                    at += size
+                else:
+                    chain_field = (address, offset, size)
+                    continue
+                word |= value << (8 * offset)
                 enables |= ((1 << size) - 1) << offset
-                at += size
-            else:
-                chain_field = (offset, size)
+            words[address] = [enables, word]
+
+        fill(self.item, 1)
         body = datagram[at:]
         chunks = [body[i:i + WIDTH] for i in range(0, len(body), WIDTH)]
+        first_chunk = next_address
         loads = []
         for index, chunk in enumerate(chunks):
-            following = 3 + index if index + 1 < len(chunks) else 0
+            following = first_chunk + index + 1 if index + 1 < len(chunks) else 0
             word = len(chunk) | (int.from_bytes(chunk, "little") << 8) | (following << 64)
-            loads.append((2 + index, 0xffff, word))
+            loads.append((first_chunk + index, 0xffff, word))
         if chain_field is not None:
-            header |= (2 if chunks else 0) << (8 * chain_field[0])
-            enables |= ((1 << chain_field[1]) - 1) << chain_field[0]
-        loads.insert(0, (1, enables, header))
-        first_free = 2 + len(chunks)
+            address, offset, size = chain_field
+            words[address][1] |= (first_chunk if chunks else 0) << (8 * offset)
+            words[address][0] |= ((1 << size) - 1) << offset
+        loads = [(address, enables, word) for address, (enables, word) in sorted(words.items())] + loads
+        first_free = first_chunk + len(chunks)
         for index in range(reserve):
             following = first_free + index + 1 if index + 1 < reserve else 0
             loads.append((first_free + index, 0x00ff, following))
-        return loads, 1, (first_free if reserve else 0), 1 + len(chunks) + reserve
+        return loads, 1, (first_free if reserve else 0), first_free - 1 + reserve
 
     def gather(self, out: int, free: int, words: dict) -> tuple:
         """What egress would do with an output: where it goes, its bytes, and how many cells came back."""
@@ -539,13 +580,24 @@ class Layout:
 
         port, payload_out = None, b""
         chain = 0
-        for offset, size, type_text, name in self.ctors[ctor][1]:
-            if name == "port":
-                port = field(words[out], offset, size)[0]
-            elif self._is_scalar(type_text):
-                payload_out += field(words[out], offset, size)
-            else:
-                chain = int.from_bytes(field(words[out], offset, size), "little")
+
+        def walk(ctor: str, pointer: int) -> None:
+            nonlocal port, payload_out, chain, back
+            for offset, size, type_text, name in self.ctors[ctor][1]:
+                inner = self._record_of(type_text)
+                if name == "port" and pointer == out:
+                    port = field(words[pointer], offset, size)[0]
+                elif self._is_length(size, type_text, name):
+                    pass
+                elif inner is not None:
+                    back += 1
+                    walk(inner, int.from_bytes(field(words[pointer], offset, size), "little"))
+                elif self._is_scalar(type_text):
+                    payload_out += field(words[pointer], offset, size)
+                else:
+                    chain = int.from_bytes(field(words[pointer], offset, size), "little")
+
+        walk(ctor, out)
         while chain:
             word = words[chain]
             back += 1
@@ -559,8 +611,8 @@ def simulate_images(translation: Translation, layout: Layout, datagrams: list) -
     bound = translation.bound
     lines, cells = [], []
     for datagram in datagrams:
-        n = cells_in(max(0, len(datagram) - sum(f[1] for f in layout.ctors[layout.item][1]
-                                                if Layout._is_scalar(f[2]))))
+        wire_bytes, record_cells = layout.shape(layout.item)
+        n = record_cells - 1 + cells_in(max(0, len(datagram) - wire_bytes))
         reserve = bound.a * n + bound.b
         loads, item, free, words = layout.image(datagram, reserve)
         cells.append((n, reserve))
@@ -634,6 +686,11 @@ class OtherHandlers(unittest.TestCase):
             finally:
                 router.close()
         return translation
+
+    def test_the_ipv4_example(self):
+        """One record across five cells, in network order, as x86 runs it and as the machine does."""
+        frames = [frame for _name, _verdict, frame in ipv4_model.corpus() if 34 <= len(frame) < 300]
+        self.compare(os.path.join(ROOT, "examples", "ipv4.lfpl"), {}, ("--n-max", "217"), frames[::4], "ipv4")
 
     def test_the_forwarding_handler(self):
         routes = bytes((i * 7) % 8 for i in range(1024))

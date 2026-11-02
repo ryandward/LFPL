@@ -47,7 +47,7 @@ CELL_BITS = 128
 CELL_BYTES = CELL_BITS // 8
 K_IN = 1
 O_MAX = 1
-SCALAR_BITS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "bool": 1, "lit": 64}
+SCALAR_BITS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "bool": 1, "lit": 64, "be16": 16, "be32": 32, "be64": 64}
 OPERATORS = {"add": "+", "sub": "-", "mul": "*", "and": "&", "or": "|", "xor": "^", "shl": "<<", "shr": ">>"}
 COMPARISONS = {"b": "<", "be": "<=", "a": ">", "ae": ">=", "e": "==", "ne": "!="}
 KEYWORDS = frozenset(("always", "and", "assign", "begin", "buf", "case", "default", "edge", "else", "end",
@@ -398,7 +398,7 @@ class Emitter:
                 define(a[0], int(a[1].split("/")[1]))
             elif head == "cmp":
                 define(a[0], 1)
-            elif head == "trunc":
+            elif head in ("trunc", "bswap"):
                 define(a[0], int(a[1]))
             elif head == "pack":
                 define(a[0], 64)
@@ -654,6 +654,32 @@ class Emitter:
         width = int(a[1])
         self._locations(a[2:3])
         self._step("trunc", text, clocked=[self._set(a[0], self._value(a[2], width), width)])
+
+    def i_bswap(self, text: str, a: list[str]) -> None:
+        """Nothing but wires: the same bytes, the other way round."""
+        width = int(a[1])
+        self._locations(a[2:3])
+        parts = [self._byte_of(a[2], index) for index in range(width // 8)]
+        self._step("bswap", text, clocked=[self._set(a[0], "{" + ", ".join(parts) + "}", width)])
+
+    def _byte_of(self, text: str, index: int) -> str:
+        """One byte of an operand, counted from its least significant, as an expression of 8 bits."""
+        fn = self.fn
+        assert fn is not None
+        text = text.rstrip("!")
+        low = 8 * index
+        if text in self.latched:
+            return f"{self.latched[text][0]}[{low + 7}:{low}]"
+        where = self._location(text)
+        if where is not None:
+            return _slice("a_dout", 8 * where[1] + low, 8, 8)
+        register = int(_REG.match(text).group(1))
+        source = self.pending.get(register, register)
+        name = fn.flop(source)
+        if low >= fn.widths[source]:
+            return "8'd0"
+        self.cut[name] = (min(low + 8, self.cut.get(name, (low + 8,))[0]), fn.widths[source])
+        return f"{name}[{low + 7}:{low}]"
 
     def i_pack(self, text: str, a: list[str]) -> None:
         widths = [int(w) for w in a[1].strip("<>").split()]

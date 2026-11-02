@@ -5,15 +5,23 @@ libc, no allocator, and a handful of system calls. Everything the program will e
 laid out at link time, locked and touched at startup.
 
 An item arrives without being parsed. `recvmsg` scatters the datagram straight into cells,
-through an iovec that names each scalar field of the item's header cell and then the payload of
+through an iovec that names each scalar field of the item's record and then the payload of
 each body cell, so the wire format follows from the item's declared fields and no byte of it is
 copied twice. Egress gathers the same way with `sendmsg`. Refusing an item costs nothing: its
 cells never left ingress, so the next datagram simply overwrites them.
 
+A field whose type is a record is that record's cell, which is how a record that spans cells gets
+here, since src/spans.py has made it a chain of records by now. So an item or an output is a walk over
+those cells, and its n counts all of them.
+
 What the source does not say, this file decides:
 
-    Wire format     an item is its record's scalar fields in declaration order, little
-                    endian and packed, then the bytes of its one chain field.
+    Wire format     an item is its record's scalar fields in declaration order, packed, then the
+                    bytes of its one chain field. An IntN is little endian, and a BeN is as it
+                    came, in network order, so the kernel writes the one as it does the other.
+    Length          a field named `length`, of type Int16, is on the wire neither way. Admission
+                    fills it in with how long the datagram was, because a program that does not
+                    walk its body has no other way to find out.
     Chain type      a chain of cells: used count at 0, 7 payload bytes, next at 8, and null for
                     an empty body. A program can leave the type abstract, or declare exactly
                     that layout to walk it. Bytes past the used count read as zero, so nothing
@@ -38,7 +46,7 @@ from .rtcheck import SIZES, Bound, Checker, Ctor
 PAGE = 4096
 CELL = 16
 BODY_PAYLOAD = 7     # bytes of one chain cell
-HEADER_BYTES_MAX = 15
+LENGTH_FIELD = "length"
 K_IN = 1             # recvmsg takes one datagram per turn: the socket's own buffer is the ring
 O_MAX = 1            # a handler returns one output
 CONTROL_EVERY = 64   # turns between looks at the control port, so a flood cannot starve it
@@ -79,12 +87,26 @@ class StateSlot:
 
 
 @dataclass(frozen=True)
+class Walk:
+    """The cells of a record or an output as this runtime goes through them, numbered from the one it
+    starts at. `scalars` are in wire order, which is declaration order, going into a record where it is met."""
+    cells: int
+    scalars: tuple[tuple[int, int, int], ...]  # cell, offset, size
+    links: tuple[tuple[int, int, int], ...]    # cell, offset, the cell the field points to
+    chain: Optional[tuple[int, int]]           # cell, offset
+    length: Optional[tuple[int, int]]          # cell, offset
+
+    @property
+    def wire_bytes(self) -> int:
+        return sum(size for _cell, _off, size in self.scalars)
+
+
+@dataclass(frozen=True)
 class OutCtor:
     name: str
     tag: Optional[int]       # None: the null constructor of a tagless type
     port: Optional[tuple[int, int]]  # offset, size
-    scalars: tuple[tuple[int, int], ...]
-    chain: Optional[int]
+    walk: Walk
 
 
 @dataclass(frozen=True)
@@ -92,7 +114,7 @@ class Options:
     in_port: int
     out_base: int
     ctl_port: int
-    n_max: int = 216     # the largest item in cells: 1 header and 215 of 7 bytes, for a 1500 MTU
+    n_max: int = 216     # the largest item in cells: a record of 1 and 215 of 7 bytes, for a 1500 MTU
     k_out: int = 64      # the output queue, a power of two
     cells: Optional[int] = None  # None: section 3.4's C. Fewer can make admission refuse with Short
     measure_age: bool = False    # ask for each datagram's arrival time, and read the clock at admission
@@ -114,8 +136,7 @@ class Options:
 class Image:
     handler: str
     states: tuple[StateSlot, ...]
-    item_scalars: tuple[tuple[int, int], ...]
-    item_chain: Optional[int]
+    item: Walk
     out_tagged: bool
     out: tuple[OutCtor, ...]
     bound: Bound
@@ -146,9 +167,6 @@ class Image:
     def capacity(self) -> int:
         return self.cell_count - K_IN * self.options.n_max
 
-    @property
-    def header_bytes(self) -> int:
-        return sum(size for _off, size in self.item_scalars)
 
     @property
     def stack_bytes(self) -> int:
@@ -157,7 +175,15 @@ class Image:
 
     @property
     def body_cells(self) -> int:
-        return self.options.n_max - 1 if self.item_chain is not None else 0
+        return self.options.n_max - self.item.cells if self.item.chain is not None else 0
+
+    @property
+    def out_cells(self) -> int:
+        return max(ctor.walk.cells for ctor in self.out)
+
+    @property
+    def out_scalars(self) -> int:
+        return max(len(ctor.walk.scalars) for ctor in self.out)
 
     @property
     def bytes(self) -> int:
@@ -195,22 +221,19 @@ def bind(checker: Checker, handler_name: str, depth: int, options: Options,
     if decl is None or decl.kind != "record":
         raise BindingError(f"section 3.1: this runtime receives an item as a record, and "
                            f"{item_type} is not one")
-    scalars, chain = _split_fields(checker, decl.name, decl.ctors[0].fields)
-    for _off, _size, ty, name in decl.ctors[0].fields:
-        norm = checker.norm(ty)
-        if isinstance(norm, tuple) and norm[0] == "fin":
-            # A Fin is what makes an array read need no bounds check, and only idx may make one.
-            # Filled from the wire, it would let a sender choose an address.
-            raise BindingError(f"section 4.5: {decl.name}.{name} is a Fin, and an item's fields "
-                               f"come from the wire: take an integer and use idx")
-    if sum(size for _o, size in scalars) > HEADER_BYTES_MAX:
-        raise BindingError(f"section 3.1: {decl.name}'s header does not fit one cell's fields")
+    item = _walk(checker, decl.name, decl.ctors[0].fields, from_the_wire=True)
+    if options.n_max < item.cells:
+        raise BindingError(f"section 8.2: N_max of {options.n_max}, and {decl.name} alone is {item.cells} cells")
     out_decl = checker._decl(out_type)
     if out_decl is None or out_decl.kind not in ("tagged", "tagless", "record"):
         raise BindingError(f"section 3.1: the output {out_type} is not a data type")
     out = tuple(_out_ctor(checker, ctor) for ctor in out_decl.ctors)
-    return Image(handler_name, states, tuple(scalars), chain, out_decl.kind == "tagged",
-                 out, checker.bounds(handler_name), depth, options)
+    for ctor in out:
+        if len(ctor.walk.scalars) > IOV_MAX:
+            raise BindingError(f"section 8.2: {ctor.name} has {len(ctor.walk.scalars)} fields to send, "
+                               f"and one message gathers {IOV_MAX}")
+    return Image(handler_name, states, item, out_decl.kind == "tagged", out, checker.bounds(handler_name), depth,
+                 options)
 
 
 def _check_reserve(checker: Checker, reserve: str) -> None:
@@ -243,19 +266,45 @@ def _is_chain(checker: Checker, ty: str) -> bool:
     return bytes_in_order and fields[-1][:2] == (8, 8) and checker.norm(fields[-1][2]) == norm
 
 
-def _split_fields(checker: Checker, owner: str, fields: list) -> tuple[list, Optional[int]]:
-    scalars = []
-    chain = None
-    for off, size, ty, name in fields:
-        decl = checker._decl(checker.norm(ty))
-        if decl is None:
-            scalars.append((off, size))
-        elif _is_chain(checker, ty) and chain is None:
-            chain = off
-        else:
-            raise BindingError(f"section 3.1: {owner}.{name} is {decl.name}, and this runtime "
-                               f"carries scalars and one chain")
-    return scalars, chain
+def _walk(checker: Checker, owner: str, fields: list, *, from_the_wire: bool = False) -> Walk:
+    """Where everything is, going through these fields and the record of any field that is one."""
+    scalars: list = []
+    links: list = []
+    found: dict[str, Optional[tuple[int, int]]] = {"chain": None, "length": None}
+    cells = 1
+
+    def visit(cell: int, owner: str, fields: list, within: frozenset) -> None:
+        nonlocal cells
+        for off, size, ty, name in fields:
+            norm = checker.norm(ty)
+            decl = checker._decl(norm)
+            if name == LENGTH_FIELD and norm == "i16":
+                if found["length"] is not None:
+                    raise BindingError(f"section 3.1: {owner}.{name} is a second field saying how long it is")
+                found["length"] = (cell, off)
+            elif isinstance(norm, tuple) and norm[0] == "fin" and from_the_wire:
+                # A Fin is what makes an array read need no bounds check, and only idx may make one.
+                # Filled from the wire, it would let a sender choose an address.
+                raise BindingError(f"section 4.5: {owner}.{name} is a Fin, and an item's fields "
+                                   f"come from the wire: take an integer and use idx")
+            elif decl is None:
+                scalars.append((cell, off, size))
+            elif decl.kind == "record":
+                if decl.name in within:
+                    raise BindingError(f"section 3.1: {owner}.{name} holds a {decl.name} inside a {decl.name}, "
+                                       f"which has no end this runtime could find on the wire")
+                inner = cells
+                cells += 1
+                links.append((cell, off, inner))
+                visit(inner, decl.name, decl.ctors[0].fields, within | {decl.name})
+            elif _is_chain(checker, ty) and found["chain"] is None:
+                found["chain"] = (cell, off)
+            else:
+                raise BindingError(f"section 3.1: {owner}.{name} is {decl.name}, and this runtime "
+                                   f"carries scalars, records and one chain")
+
+    visit(0, owner, fields, frozenset((owner,)))
+    return Walk(cells, tuple(scalars), tuple(links), found["chain"], found["length"])
 
 
 def _out_ctor(checker: Checker, ctor: Ctor) -> OutCtor:
@@ -268,9 +317,8 @@ def _out_ctor(checker: Checker, ctor: Ctor) -> OutCtor:
             port = (entry[0], entry[1])
         else:
             rest.append(entry)
-    scalars, chain = _split_fields(checker, ctor.name, rest)
     tag = int(ctor.tag) if ctor.tag.isdigit() else (None if ctor.tag == "null" else 0)
-    return OutCtor(ctor.name, tag, port, tuple(scalars), chain)
+    return OutCtor(ctor.name, tag, port, _walk(checker, ctor.name, rest))
 
 
 def _be16(port: int) -> str:
@@ -281,10 +329,36 @@ def _is_null(ctor: OutCtor, tagged: bool) -> bool:
     return ctor.tag is None and not tagged
 
 
+def _out_cell(add: Callable[[str], None], register: str, cell: int) -> None:
+    """A cell of the output in r12, into a register. The first is r12's, and _read_out_cells has the others."""
+    add(f"    mov {register}, {'r12' if cell == 0 else f'[out_cells+{8 * cell}]'}")
+
+
+def _read_out_cells(add: Callable[[str], None], walk: Walk) -> None:
+    for cell, off, inner in walk.links:
+        _out_cell(add, "rax", cell)
+        add(f"    mov rax, [rax+{off}]")
+        add(f"    mov [out_cells+{8 * inner}], rax")
+
+
+def _free_all_but_the_first(add: Callable[[str], None], walk: Walk) -> None:
+    """The chain first, because a cell's next field is the first thing giving it back overwrites."""
+    if walk.chain is not None:
+        _out_cell(add, "rdi", walk.chain[0])
+        add(f"    mov rdi, [rdi+{walk.chain[1]}]")
+        add("    call free_chain")
+    for _cell, _off, inner in walk.links:
+        add(f"    mov rdi, [out_cells+{8 * inner}]")
+        add("    call push_cell")
+
+
 def assembly(image: Image) -> str:
     """The runtime and the image, as NASM, to follow the compiled functions."""
     o = image.options
-    if image.body_cells > 1000:
+    item = image.item
+    item_count = len(item.scalars)
+    iov_in = item_count + image.body_cells
+    if iov_in > IOV_MAX:
         raise BindingError("section 8.2: N_max is past what one recvmsg can scatter")
     if image.bytes > MAX_IMAGE_BYTES:
         raise BindingError(f"section 8.2: {image.handler} needs an image of {image.bytes} bytes, and "
@@ -299,9 +373,7 @@ def assembly(image: Image) -> str:
                            f"maximal transaction, which take {smallest}")
     lines: list[str] = []
     add = lines.append
-    item_count = len(image.item_scalars)
-    iov_in = item_count + image.body_cells
-    out_iov = min(IOV_MAX, HEADER_BYTES_MAX + max(1, image.largest_output))
+    out_iov = min(IOV_MAX, image.out_scalars + max(1, image.largest_output))
     k = len(image.states)
 
     add("section .text")
@@ -310,12 +382,13 @@ def assembly(image: Image) -> str:
     fixed_image_startup(add)
     add("    ; 5: ingress takes the first N_max cells, and the rest are the pool")
     add("    mov edi, cells")
-    add("    mov [slot_head], rdi")
-    add("    mov rax, rdi")
-    add("    call point_header_iovec")
-    for position, (_off, size) in enumerate(image.item_scalars):
+    for cell in range(item.cells):
+        add(f"    lea rax, [rdi+{CELL * cell}]")
+        add(f"    mov [slot_cells+{8 * cell}], rax")
+        add(f"    call point_cell_{cell}")
+    for position, (_cell, _off, size) in enumerate(item.scalars):
         add(f"    mov qword [in_iov+{16 * position + 8}], {size}")
-    add("    lea rax, [rdi+16]")
+    add(f"    lea rax, [rdi+{CELL * item.cells}]")
     add(f"    mov ecx, {image.body_cells}")
     add(f"    mov edx, in_iov+{16 * item_count}")
     add(".body_iovec:")
@@ -433,11 +506,11 @@ def assembly(image: Image) -> str:
     add("    ; Section 6.1, in order. A refusal counts itself and leaves the cells in ingress.")
     add("    test dword [in_msg+48], 32")
     add("    jnz .too_large")
-    add(f"    cmp rax, {image.header_bytes}")
+    add(f"    cmp rax, {item.wire_bytes}")
     add("    jb .malformed")
-    add(f"    sub rax, {image.header_bytes}")
+    add(f"    sub rax, {item.wire_bytes}")
     add("    mov r12, rax")
-    if image.item_chain is None:
+    if item.chain is None:
         add("    test rax, rax")
         add("    jnz .too_large")
     add(f"    add rax, {BODY_PAYLOAD - 1}")
@@ -445,7 +518,7 @@ def assembly(image: Image) -> str:
     add(f"    mov ecx, {BODY_PAYLOAD}")
     add("    div rcx")
     add("    mov r13, rax")
-    add("    lea r14, [rax+1]")
+    add(f"    lea r14, [rax+{item.cells}]")
     add("    mov rax, [admission]")
     add("    imul rax, r14")
     add("    add rax, [admission+8]")
@@ -509,12 +582,22 @@ def assembly(image: Image) -> str:
     add("    jz .body_counted")
     add("    mov [r10], dl")
     add(".body_counted:")
-    add("    mov r14, [slot_head]")
-    if image.item_chain is not None:
-        add(f"    mov [r14+{image.item_chain}], r8")
-    add("    call pop_cell")
-    add("    mov [slot_head], rax")
-    add("    call point_header_iovec")
+    for cell, off, inner in item.links:
+        add(f"    mov rax, [slot_cells+{8 * inner}]")
+        add(f"    mov rcx, [slot_cells+{8 * cell}]")
+        add(f"    mov [rcx+{off}], rax")
+    if item.chain is not None:
+        add(f"    mov rcx, [slot_cells+{8 * item.chain[0]}]")
+        add(f"    mov [rcx+{item.chain[1]}], r8")
+    if item.length is not None:
+        add(f"    lea rax, [r12+{item.wire_bytes}]")
+        add(f"    mov rcx, [slot_cells+{8 * item.length[0]}]")
+        add(f"    mov word [rcx+{item.length[1]}], ax")
+    add("    mov r14, [slot_cells]")
+    for cell in range(item.cells):
+        add("    call pop_cell")
+        add(f"    mov [slot_cells+{8 * cell}], rax")
+        add(f"    call point_cell_{cell}")
     add("    ; the item's reserve: R(n) cells, as a Free")
     add("    xor edx, edx")
     add(".reserve:")
@@ -558,9 +641,9 @@ def assembly(image: Image) -> str:
             add("    jmp serve")
         else:
             add("    inc qword [cnt_dropped]")
-            if ctor.chain is not None:
-                add(f"    mov rdi, [r12+{ctor.chain}]")
-                add("    call free_chain")
+            if not _is_null(ctor, image.out_tagged):
+                _read_out_cells(add, ctor.walk)
+                _free_all_but_the_first(add, ctor.walk)
             if not _is_null(ctor, image.out_tagged):
                 add("    mov rdi, r12")
                 add("    call push_cell")
@@ -666,18 +749,22 @@ def assembly(image: Image) -> str:
             add("    jmp .sent")  # never queued: only constructors with a port are
             continue
         port_off, port_size = ctor.port
+        walk = ctor.walk
         add(f"    movzx eax, {_WIDTH[port_size]} [r12+{port_off}]")
         add(f"    add eax, {image.options.out_base}")
         add("    xchg al, ah")
         add("    mov word [out_addr+2], ax")
-        for index, (off, size) in enumerate(ctor.scalars):
-            add(f"    lea rax, [r12+{off}]")
+        _read_out_cells(add, walk)
+        for index, (cell, off, size) in enumerate(walk.scalars):
+            _out_cell(add, "rax", cell)
+            add(f"    lea rax, [rax+{off}]")
             add(f"    mov [out_iov+{16 * index}], rax")
             add(f"    mov qword [out_iov+{16 * index + 8}], {size}")
-        add(f"    mov ecx, {len(ctor.scalars)}")
-        add(f"    mov ebx, out_iov+{16 * len(ctor.scalars)}")
-        if ctor.chain is not None:
-            add(f"    mov rdi, [r12+{ctor.chain}]")
+        add(f"    mov ecx, {len(walk.scalars)}")
+        add(f"    mov ebx, out_iov+{16 * len(walk.scalars)}")
+        if walk.chain is not None:
+            _out_cell(add, "rdi", walk.chain[0])
+            add(f"    mov rdi, [rdi+{walk.chain[1]}]")
             add(".chain_%d:" % position)
             add("    test rdi, rdi")
             add(f"    jz .send_ready_{position}")
@@ -707,13 +794,11 @@ def assembly(image: Image) -> str:
         add("    je .done")
         add("    test rax, rax")
         add(f"    jns .counted_{position}")
-        if ctor.chain is not None:  # a chain a program grew past what one message can gather
+        if walk.chain is not None:  # a chain a program grew past what one message can gather
             add(f".too_long_{position}:")
         add("    inc qword [cnt_send_errors]")
         add(f".counted_{position}:")
-        if ctor.chain is not None:
-            add(f"    mov rdi, [r12+{ctor.chain}]")
-            add("    call free_chain")
+        _free_all_but_the_first(add, walk)
         add("    jmp .sent")
     add(".sent:")
     add("    mov rdi, r12")
@@ -780,12 +865,14 @@ def assembly(image: Image) -> str:
     add("    xor edi, edi")
     add("    syscall")
     add("")
-    add("; rax: the header cell. The iovec names its scalar fields, so the kernel fills them.")
-    add("point_header_iovec:")
-    for position, (off, _size) in enumerate(image.item_scalars):
-        add(f"    lea rsi, [rax+{off}]")
-        add(f"    mov [in_iov+{16 * position}], rsi")
-    add("    ret")
+    add("; rax: a cell of the item's record. The iovec names its scalar fields, so the kernel fills them.")
+    for cell in range(item.cells):
+        add(f"point_cell_{cell}:")
+        for position, (where, off, _size) in enumerate(item.scalars):
+            if where == cell:
+                add(f"    lea rsi, [rax+{off}]")
+                add(f"    mov [in_iov+{16 * position}], rsi")
+        add("    ret")
     add("")
     pool_routines(add)
     add("")
@@ -830,9 +917,11 @@ def assembly(image: Image) -> str:
         add("clock_now: resq 2")
     add("last_drops: resq 1")
     add(f"out_iov: resq {2 * out_iov}")
+    add(f"out_cells: resq {image.out_cells}")
+    add(f"slot_cells: resq {item.cells}")
     for position in range(k):
         add(f"state_{position}: resq 1")
-    for name in ("pool", "pool_count", "slot_head", "q_head", "q_count", "turn", "in_fd", "out_fd",
+    for name in ("pool", "pool_count", "q_head", "q_count", "turn", "in_fd", "out_fd",
                  "ctl_fd", "egress_paused"):
         add(f"{name}: resq 1")
     add("counters:")

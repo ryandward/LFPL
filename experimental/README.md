@@ -27,7 +27,8 @@ record Eth1 { dmac_hi: Int32, dmac_lo: Int16, smac_hi: Int16, rest: Eth2 };
 ```
 
 Those are the frame's first 34 bytes, read in wire order. A cell holds 8 bytes of scalars beside its link,
-so the header takes five cells, each owning the next. A program can do nothing with a `Frame` but hand it
+so the header takes five cells, each owning the next. Main has since learned to write that as one record, in
+network byte order, and `examples/ipv4.lfpl` does, on the UDP runtime. This one is left as it was written. A program can do nothing with a `Frame` but hand it
 on, and because it is linear it has to: it cannot read one, forge one or lose one, and the output type is
 checked to hold exactly one in each constructor. The word that stands for a frame holds its address and
 its length together, so there is nothing a program could change about what gets sent except the fields
@@ -70,7 +71,7 @@ and it has a `--match` switch that swaps the table for what `experimental/ipv4.l
 the oracle for what the forwarder sends, and the ceiling for how fast it could go. `experimental/test_ipv4.py`
 puts a virtual Ethernet pair in a network namespace and sends the same frames through both, on valid
 frames, every malformed case, TTLs 1 and 2, and header checksums near 0xFFFF, and holds both to each other
-and to a third statement of the workload in `experimental/ipv4_model.py`, which shares nothing with either. Its
+and to a third statement of the workload in `tests/reference/ipv4_model.py`, which shares nothing with either. Its
 tests need root, and skip without it:
 
 ```

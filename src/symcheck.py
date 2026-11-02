@@ -13,6 +13,11 @@ LFPL-O build, after the compiler has finished, so unlike the compiler it may bui
 syntax trees: it is an oracle over one finished program, and it is what LFPL-O section 8.4
 means by Meaning.
 
+A record that spans cells, and a field in network byte order, are the source's business, so this works out both
+for itself. `unspan` rewrites the syntax tree into the chain of one-cell records the machine is really working on,
+with a layout rule of its own, and a field of type Be16, Be32 or Be64 means a load that is swapped and a store of
+what was swapped: `swap` is a term, and `swap(swap(x))` is x.
+
 Terms and joins. A value is a canonical decision diagram: comparisons at the inner
 nodes in one fixed order, and data at the leaves. Every operation distributes over
 decisions, so two values that agree under every outcome of the comparisons are the
@@ -43,7 +48,9 @@ from typing import Callable, Optional
 
 MASK64 = (1 << 64) - 1
 NO_ATOM = 1 << 60
-FIELD_SIZES = {"Int8": 1, "Int16": 2, "Int32": 4, "Int64": 8, "Bool": 1}
+FIELD_SIZES = {"Int8": 1, "Int16": 2, "Int32": 4, "Int64": 8, "Bool": 1, "Be16": 2, "Be32": 4, "Be64": 8}
+WIRE_FIELDS = frozenset(("Be16", "Be32", "Be64"))
+CELL_BYTES, BYTES_AHEAD_OF_THE_LINK = 16, 8
 
 
 class TooLarge(Exception):
@@ -61,7 +68,7 @@ class Terms:
             ('shr', x, count)  ('trunc', width, x)  ('call', f, args, size)
             ('struct', ctor, tag, cell, ((off, size, leaf), ...))
             ('setl', width, old, low)  ('undef', why)
-            ('tuple', members)  ('member', leaf, i, size)
+            ('tuple', members)  ('member', leaf, i, size)  ('swap', width, x)
             ('aload', array, index, size): one element of an array, as it is at entry
     Decisions: ('ite', atom, hi, lo), where an atom is ('lt', x, y) or ('eq', x, y).
     Values are in unsigned integer terms, so a width only matters where it wraps.
@@ -190,7 +197,7 @@ class Terms:
             return node[3]
         if kind == "op":
             return node[2]
-        if kind == "trunc":
+        if kind in ("trunc", "swap"):
             return node[1]
         if kind == "call":
             return node[3]
@@ -271,8 +278,19 @@ class Terms:
         return self.select(self.lt(count, self.const(bits)), shifted, self.ZERO)
 
     def setl(self, width: int, old: int, low: int) -> int:
-        """A write to a subregister: the low `width` bytes change, and the rest do not."""
-        return low if old == self.ZERO else self.intern(("setl", width, old, low))
+        """A write to a subregister: the low `width` bytes change, and the rest do not. With nothing above
+        them in the old value, that is the new low bytes."""
+        return low if self.width(old) <= width else self.intern(("setl", width, old, low))
+
+    def swap(self, width: int, x: int) -> int:
+        """The bytes the other way round. Doing it twice is what the value was."""
+        x = self.trunc(width, x)
+        node = self.nodes[x]
+        if node[0] == "c":
+            return self.const(int.from_bytes(node[1].to_bytes(width, "little"), "big"))
+        if node[0] == "swap" and node[1] == width:
+            return node[2]
+        return self.intern(("swap", width, x))
 
     def load(self, pointer: int, off: int, size: int) -> int:
         return self.intern(("load", pointer, off, size))
@@ -331,6 +349,8 @@ class Terms:
             result = self.shr(sub(node[1]), sub(node[2]))
         elif kind == "trunc":
             result = self.trunc(node[1], sub(node[2]))
+        elif kind == "swap":
+            result = self.swap(node[1], sub(node[2]))
         elif kind == "call":
             result = self.call(node[1], tuple(sub(a) for a in node[2]), node[3])
         elif kind == "struct":
@@ -366,6 +386,8 @@ class Terms:
             return f"shr({self.show(node[1])}, {self.show(node[2])})"
         if kind == "trunc":
             return f"low{node[1] * 8}({self.show(node[2])})"
+        if kind == "swap":
+            return f"swap{node[1] * 8}({self.show(node[2])})"
         if kind == "call":
             return f"{node[1]}({', '.join(self.show(a) for a in node[2])})"
         if kind == "struct":
@@ -426,6 +448,12 @@ class SourceParser:
         self.types: dict[str, TypeInfo] = {}
         self.fns: dict[str, Fn] = {}
         self.states: list[tuple[str, str]] = []
+        self.spans: dict[str, tuple[list, list]] = {}  # a record of many cells: their names, and fields in each
+
+    def unspan(self) -> None:
+        """Every function, in terms of records of one cell."""
+        for fn in self.fns.values():
+            fn.body = _Unspan(self.spans).expr(fn.body, {})
 
     def infer_cells(self) -> None:
         """`@` is optional, and a function that does not write it may still return a parameter's own cell.
@@ -518,7 +546,14 @@ class SourceParser:
         self.expect("{")
         fields = self._fields("}")
         self.expect(";")
-        self.types[name] = TypeInfo(name, [Ctor(name, None, False, 0, self._layout(fields, 0))])
+        cells = _cells_of(fields)
+        names = [name] + [f"{name}${index}" for index in range(1, len(cells))]
+        for index, (part, fields_here) in enumerate(zip(names, cells)):
+            if index + 1 < len(cells):
+                fields_here = fields_here + [("$next", names[index + 1])]
+            self.types[part] = TypeInfo(part, [Ctor(part, None, False, 0, self._layout(fields_here, 0))])
+        if len(cells) > 1:
+            self.spans[name] = (names, [len(fields_here) for fields_here in cells])
 
     @staticmethod
     def _layout(fields: list, start: int) -> list:
@@ -647,7 +682,11 @@ class SourceParser:
         if token[0].isupper():
             if self.peek() == "@":
                 self.next()
-                cell = self.next()
+                cell: object = self.next()
+                if cell == "(":  # a record's cells, named one by one: `unspan` takes this form out
+                    cell = [self.next()]
+                    while self.next() == ",":
+                        cell.append(self.next())
                 self.expect("(")
                 return ("ctor", token, cell, self._args())
             return ("null", token)
@@ -675,6 +714,135 @@ class SourceParser:
             arms.append((ctor, binders, self.expr()))
         self.next()
         return ("match", scrutinee, arms)
+
+
+# ------------------------------------------- a record that spans cells
+
+def _cells_of(fields: list) -> list:
+    """Which fields go in which cell: all that are left if they fit one, and otherwise what fits ahead of the link."""
+    def fit(remaining: list, room: int) -> int:
+        at = count = 0
+        for _name, ty in remaining:
+            size = FIELD_SIZES.get(ty, 8)
+            at = (at + size - 1) // size * size
+            if at + size > room:
+                break
+            at += size
+            count += 1
+        return count
+
+    cells = []
+    remaining = list(fields)
+    while fit(remaining, CELL_BYTES) < len(remaining):
+        count = fit(remaining, BYTES_AHEAD_OF_THE_LINK)
+        cells.append(remaining[:count])
+        remaining = remaining[count:]
+    cells.append(remaining)
+    return cells
+
+
+class _Unspan:
+    """A syntax tree, rewritten so that each record is one cell. `groups` says what names stand for several cells:
+    a pattern's diamond, then what `peel` leaves. The first cell keeps the name, and these are the others."""
+
+    def __init__(self, spans: dict):
+        self.spans = spans
+        self.used = 0
+
+    def fresh(self, stem: str) -> str:
+        self.used += 1
+        return f"{stem}${self.used}"
+
+    def expr(self, e: tuple, groups: dict) -> tuple:
+        kind = e[0]
+        if kind in ("int", "var", "null"):
+            return e
+        if kind == "bin":
+            return ("bin", e[1], self.expr(e[2], groups), self.expr(e[3], groups))
+        if kind == "not":
+            return ("not", self.expr(e[1], groups))
+        if kind == "if":
+            return ("if", *(self.expr(part, groups) for part in e[1:]))
+        if kind == "low":
+            return ("low", e[1], self.expr(e[2], groups))
+        if kind in ("idx", "get"):
+            return (kind, self.expr(e[1], groups), self.expr(e[2], groups))
+        if kind == "pack":
+            return ("pack", e[1], [self.expr(a, groups) for a in e[2]])
+        if kind == "tuple":
+            return ("tuple", [self.expr(m, groups) for m in e[1]])
+        if kind == "call":
+            return ("call", e[1], [self.expr(a, groups) for a in e[2]])
+        if kind == "let":
+            return ("let", e[1], self.expr(e[2], groups), self.expr(e[3], _without(groups, [e[1]])))
+        if kind == "lettuple":
+            return self._let_tuple(e, groups)
+        if kind == "with":
+            return ("with", self.expr(e[1], groups), e[2], self.expr(e[3], _without(groups, [e[2]])))
+        if kind == "match":
+            return ("match", self.expr(e[1], groups), [self._arm(arm, groups) for arm in e[2]])
+        if kind == "ctor":
+            return self._ctor(e, groups)
+        raise ValueError(f"unknown expression {kind}")
+
+    def _let_tuple(self, e: tuple, groups: dict) -> tuple:
+        _kind, names, bound, body = e
+        if bound[0] == "call" and bound[1] == "peel":
+            source = bound[2][0][1]
+            cells = groups[source]
+            inner = _without(groups, names)
+            if len(cells) > 1:
+                inner[names[1]] = cells[1:]
+            return ("lettuple", names, ("tuple", [("var", source), ("var", cells[0])]), self.expr(body, inner))
+        return ("lettuple", names, self.expr(bound, groups), self.expr(body, _without(groups, names)))
+
+    def _arm(self, arm: tuple, groups: dict) -> tuple:
+        ctor, binders, body = arm
+        if ctor not in self.spans:
+            return (ctor, binders, self.expr(body, _without(groups, binders)))
+        names, counts = self.spans[ctor]
+        cells = [self.fresh(binders[0]) for _ in names[1:]]
+        inner = _without(groups, binders)
+        inner[binders[0]] = cells
+        inside = self.expr(body, inner)
+        fields = binders[1:]
+        at = sum(counts)
+        result = None
+        for index in range(len(names) - 1, -1, -1):
+            at -= counts[index]
+            here = fields[at:at + counts[index]]
+            cell = binders[0] if index == 0 else cells[index - 1]
+            if result is None:
+                result = (names[index], [cell] + here, inside)
+            else:
+                link = self.fresh("$link")
+                result = (names[index], [cell] + here + [link], ("match", ("var", link), [result]))
+        return result
+
+    def _ctor(self, e: tuple, groups: dict) -> tuple:
+        _kind, name, cell, args = e
+        args = [self.expr(a, groups) for a in args]
+        if name in self.spans:
+            names, counts = self.spans[name]
+            cells = cell if isinstance(cell, list) else [cell] + groups[cell]
+            value = None
+            at = sum(counts)
+            for index in range(len(names) - 1, -1, -1):
+                at -= counts[index]
+                here = args[at:at + counts[index]]
+                value = ("ctor", names[index], cells[index], here + ([] if value is None else [value]))
+            return value
+        if cell in groups:  # More@d(free): one per cell, every one of them given back
+            value = ("ctor", name, groups[cell][-1], args)
+            for other in reversed(groups[cell][:-1]):
+                value = ("ctor", name, other, [value])
+            return ("ctor", name, cell, [value])
+        return ("ctor", name, cell, args)
+
+
+def _without(groups: dict, names: list) -> dict:
+    """A name bound again means something new."""
+    return {name: cells for name, cells in groups.items() if name not in names}
 
 
 # ------------------------------------------- which parameter's cell a function returns
@@ -759,8 +927,8 @@ def _returned_cell(fn: "Fn", fns: dict) -> Optional[int]:
 
 
 def _norm(ty):
-    """An integer type is its width in bytes; other types stay named."""
-    return {"Int8": 1, "Int16": 2, "Int32": 4, "Int64": 8}.get(ty, ty)
+    """An integer type is its width in bytes; other types stay named. A field in network order holds an integer."""
+    return {"Int8": 1, "Int16": 2, "Int32": 4, "Int64": 8, "Be16": 2, "Be32": 4, "Be64": 8}.get(ty, ty)
 
 
 def _joined(a, b):
@@ -958,15 +1126,27 @@ class SourceMeaning:
         self.orig[leaf] = known
         return leaf
 
+    def _stored(self, ty: str, size: int, term: int) -> int:
+        """What is in a field of this type, for a value that goes there."""
+        T = self.T
+        if ty in WIRE_FIELDS:
+            return T.lift(lambda x, w=size: T.swap(w, x), term, key=("swap", size))
+        return T.lift(lambda x, w=size: T.trunc(w, x), term, key=("trunc", size))
+
+    def _read_back(self, ty: str, size: int, term: int) -> int:
+        """And what is in a value that comes from one."""
+        if ty in WIRE_FIELDS:
+            return self.T.lift(lambda x, w=size: self.T.swap(w, x), term, key=("swap", size))
+        return term
+
     def _ctor(self, e: tuple, env: dict) -> tuple:
         T = self.T
         _, name, cell_name, args = e
         info, ctor = self.ctors[name]
         cell, _ty, known = env[cell_name]
         terms = []
-        for (_fname, _fty, _off, size), arg in zip(ctor.fields, args):
-            term = self.ev(arg, env)[0]
-            terms.append(T.lift(lambda x, w=size: T.trunc(w, x), term, key=("trunc", size)))
+        for (_fname, fty, _off, size), arg in zip(ctor.fields, args):
+            terms.append(self._stored(fty, size, self.ev(arg, env)[0]))
         layout = [(off, size) for _f, _t, off, size in ctor.fields]
 
         def build(*leaves: int) -> int:
@@ -994,14 +1174,15 @@ class SourceMeaning:
             return result
 
         def opaque_fields(ctor: Ctor, pointer: int) -> list:
-            return [(T.load(pointer, off, size), _norm(fty), None)
+            return [(self._read_back(fty, size, T.load(pointer, off, size)), _norm(fty), None)
                     for _f, fty, off, size in ctor.fields]
 
         def on_leaf(leaf: int) -> int:
             node = T.nodes[leaf]
             if node[0] == "struct":  # a known constructor: only its arm exists
                 _i, ctor = self.ctors[node[1]]
-                fields = [(f[2], _norm(meta[1]), None) for f, meta in zip(node[4], ctor.fields)]
+                fields = [(self._read_back(meta[1], meta[3], f[2]), _norm(meta[1]), None)
+                          for f, meta in zip(node[4], ctor.fields)]
                 return run(by_name[ctor.name], node[3], self.orig.get(leaf), fields)
             ctors = info.ctors
             if leaf == T.ZERO:
@@ -1044,13 +1225,13 @@ class SourceMeaning:
                 cell, known = leaf, None
                 old = [T.load(leaf, off, size) for _f, _t, off, size in ctor.fields]
             inner = dict(env)
-            inner[name] = (old[position], _norm(ctor.fields[position][1]), None)
-            new = self.ev(value, inner)[0]
-            size = ctor.fields[position][3]
+            field_type, size = ctor.fields[position][1], ctor.fields[position][3]
+            inner[name] = (self._read_back(field_type, size, old[position]), _norm(field_type), None)
+            new = self._stored(field_type, size, self.ev(value, inner)[0])
 
             def build(v: int) -> int:
                 leaves = list(old)
-                leaves[position] = T.trunc(size, v)
+                leaves[position] = v
                 fields = tuple((f[2], f[3], x) for f, x in zip(ctor.fields, leaves))
                 return self._built(ctor, cell, known, fields)
 
@@ -1075,7 +1256,7 @@ _RESULTS = ("rax", "rdx", "rcx", "rsi", "rdi", "r8")
 _SIZES = {"byte": 1, "word": 2, "dword": 4, "qword": 8}
 _ARITH = {"add", "sub", "imul", "shl"}
 _BITS = {"and", "or", "xor"}
-_WRITERS = _ARITH | _BITS | {"shr", "mov", "movzx"}
+_WRITERS = _ARITH | _BITS | {"shr", "mov", "movzx", "rol", "bswap"}
 
 
 def _operand(text: str) -> tuple:
@@ -1667,6 +1848,15 @@ class FunctionCheck:
             S.regs[ops[0][1]] = self._val(S, ops[1])
         elif op in _ARITH or op in _BITS or op == "shr":
             self._arith_step(S, op, ops, where)
+        elif op == "rol":  # only ever by 8 on 16 bits, and the upper bits stay as they were
+            if ops[0][0] != "reg" or ops[0][2] != 2 or ops[1] != ("imm", 8):
+                self.problems.append(Problem(self.fn.name, where, "a rotate that is not a swap of 16 bits"))
+            old = S.regs.get(ops[0][1], T.undef("rol of an unset register"))
+            S.regs[ops[0][1]] = T.lift(lambda x: T.setl(2, x, T.swap(2, x)), old)
+            S.flags = None
+        elif op == "bswap":
+            S.regs[ops[0][1]] = T.lift(lambda x, w=ops[0][2]: T.swap(w, x), self._val(S, ops[0]))
+            S.flags = None
         elif op == "cmp":
             S.flags = (self._val(S, ops[0]), self._val(S, ops[1]))
         elif op == "test":
@@ -1804,6 +1994,7 @@ def check_translation(source: bytes, asm: str) -> list[Problem]:
     program = SourceParser(source.decode("latin-1"))
     program.parse()
     program.builtin_reserve()
+    program.unspan()
     bodies, aliases = parse_assembly(asm)
     clobbers = _clobber_sets(bodies)
     problems: list[Problem] = []

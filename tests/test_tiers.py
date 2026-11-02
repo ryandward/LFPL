@@ -43,6 +43,6 @@ class TheFastTier(unittest.TestCase):
 
     def test_nothing_that_serves_a_socket_is_on_the_list(self):
         for name in TIER:
-            for live in ("test_forward", "test_checksum", "test_generated", "TheChecksum", "RandomWalks",
+            for live in ("test_forward", "test_checksum", "test_generated", "test_ipv4.", "TheChecksum", "RandomWalks",
                          "OtherHandlers", "Synthesis"):
                 self.assertNotIn(live, name)

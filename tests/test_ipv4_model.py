@@ -1,13 +1,13 @@
 """The model of the workload, against what the RFCs say, and against itself.
 
-The model judges the C baseline and experimental/ipv4.lfpl in experimental/test_ipv4.py, so it has to stand on
-something else. These are the numbers the RFCs print, a recomputation that uses none of the update
+The model judges examples/ipv4.lfpl in tests/test_ipv4.py, and the C baseline and experimental/ipv4.lfpl in
+experimental/test_ipv4.py, so it has to stand on something else. These are the numbers the RFCs print, a recomputation that uses none of the update
 arithmetic, and a table lookup done the slow way against what it should choose.
 """
 import random
 import unittest
 
-from experimental import ipv4_model as model
+from tests.reference import ipv4_model as model
 
 
 class TheChecksum(unittest.TestCase):

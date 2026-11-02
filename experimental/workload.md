@@ -4,7 +4,7 @@ This is the fixed workload of every measurement from now on. It is what a router
 down to where nothing in it is a matter of taste, so that a number measured today can be compared with
 a number measured a year from now, and one forwarder's with another's.
 
-`experimental/ipv4_forward.c` and `experimental/ipv4.lfpl` both do this, and `experimental/ipv4_model.py` is a third
+`experimental/ipv4_forward.c` and `experimental/ipv4.lfpl` both do this, and `tests/reference/ipv4_model.py` is a third
 statement of it, in Python, that shares nothing with either. `experimental/test_ipv4.py` holds all three to each
 other, frame by frame.
 

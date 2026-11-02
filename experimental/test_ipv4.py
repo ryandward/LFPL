@@ -29,7 +29,7 @@ from src.certify import certify
 from src.rtcheck import Checker
 from src.rtlower import rt_lines
 from src.runtime import BindingError
-from experimental import ipv4_model as model
+from tests.reference import ipv4_model as model
 from experimental import runtime_xdp, speed, xdp_load
 
 import io

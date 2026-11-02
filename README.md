@@ -24,9 +24,9 @@ before anything is built on them; Python is not meant to be the end state.
 
 A second specification, LFPL-O, asks what those rules buy a long-running service: a program
 that, once started, never crashes, hangs or leaks, and that refuses work at its boundary
-when demand exceeds what it can guarantee. Two programs of that kind now run here on real
-sockets, a packet forwarder and a checksum whose work depends on the packet, and they come later
-in this page.
+when demand exceeds what it can guarantee. Three programs of that kind now run here on real
+sockets, a packet forwarder, a checksum whose work depends on the packet, and an IPv4 router whose header
+is one record in network byte order, and they come later in this page.
 
 ## What a program looks like
 
@@ -54,16 +54,18 @@ come up shortly.
 That source compiles to this:
 
 ```
-fn_inc_body:
+fn_inc$body:
+    sub rsp, F_inc
     mov rax, rdi
-L1:
+X1:
     test rdi, rdi
-    je L2
-L3:
+    je L2_f0
+L3_f0:
     add qword [rdi], 1
     mov rdi, qword [rdi+8]
-    jmp L1
-L2:
+    jmp X1
+L2_f0:
+    add rsp, F_inc
     ret
 ```
 
@@ -306,6 +308,58 @@ interrupts in the machine for that to depend on, which is what x86 cannot say.
 What is not built on this target is everything around the handler. Ingress, egress and admission are
 test code driving the block RAM between items, so a datagram does not reach this machine by itself yet.
 
+## A program whose header is bigger than a cell
+
+An Ethernet and IPv4 header is 34 bytes, and a cell has 16. `examples/ipv4.lfpl` declares it as one record anyway,
+in the order the frame has it, and a field of type `Be16` or `Be32` lies in network byte order:
+
+```
+data Bytes;
+record Frame {
+  dst_hi: Be32, dst_lo: Be16, src_hi: Be32, src_lo: Be16, ethertype: Be16,
+  version: Int8, tos: Int8, total: Be16, id: Be16, frag: Be16,
+  ttl: Int8, proto: Int8, sum: Be16, source: Be32, destination: Be32,
+  length: Int16,
+  body: Bytes
+};
+data Out = Malformed(body: Bytes) | Expired(body: Bytes) | Send(port: Int8, frame: Frame);
+```
+
+The compiler lays that across five cells, each keeping 8 bytes for a link to the next unless what is left fits, and
+nothing after the first stage of it knows: a match on `Frame` is five matches by the time Check sees it, and `Frame@d(...)` is five
+builds, so what stays in a cell stays there and is not written. What a pattern binds from a `Be16` is the integer, so the code says
+`!=(ethertype, 2048)` and `+(pack<16>(total), 14)` and nobody swaps a constant or a byte. The fields leave and arrive as
+they lie, so the runtime scatters and gathers them without looking, and the only swaps that happen are the ones a read or
+a store of a changed value needs.
+
+`d`, from a pattern on `Frame`, stands for all five cells, and each still has to go somewhere. `Frame@d(...)` builds in them,
+`More@d(free)` gives them back, and a constructor that needs one takes it with `let (c, rest) = peel(d) in`:
+
+```
+    if !(well_formed(ethertype, version, total, length, words)) then
+      let (c, rest) = peel(d) in (Malformed@c(body), More@rest(free))
+    ...
+      | More(c, rest) =>
+          let hop = next_hop(destination) in
+          (Send@c(hop, Frame@d(33554432, low16(+(pack<8>(hop), 16)), 33554432, low16(+(pack<8>(hop), 272)),
+                               ethertype, version, tos, total, id, frag,
+                               -(ttl, 1), proto, patched(sum, ttl, proto), source, destination,
+                               length, body)), rest)
+```
+
+The cells count wherever they came from. The five that arrived are in `n`, so a frame of 1514 bytes is 217 cells, and the
+one this draws for its verdict is `R(n)`:
+
+```
+$ python3 -m src.lfplo examples/ipv4.lfpl -o ipv4 --in-port 9000 --out-port 9100 --ctl-port 9001 --n-max 217
+handler ipv4: R(n) = 1 cells, W(n) = 96 steps, stack 88 bytes, 14387 cells, image 234288 bytes
+```
+
+A record built from nothing names its cells, each of which came from a draw on the reserve, as `Frame@(a, b, c, d, e)(...)`. `length`
+is not on the wire: admission fills it in from how long the datagram was, because a program that does not walk its body
+has no other way to find out. `tests/test_ipv4.py` runs every kind of frame through a binary on live sockets, against a model
+that shares nothing with it, and `tests/test_rtverilog.py` holds the hardware target to the binary's bytes on a sample of them.
+
 ## How the compiler holds itself to the same rules
 
 Most compilers read a whole file into a syntax tree, which costs memory in proportion
@@ -497,7 +551,7 @@ a cell in one arm of a conditional and read after the join is in one register wh
 
 ## What is not here yet
 
-The two handlers ask for less than the specification offers. Bounds are derived and certified,
+The handlers ask for less than the specification offers. Bounds are derived and certified,
 but only `R(n)` refuses anything: deadlines cannot be declared yet, so admission works out `W(n)` and
 only adds it to a counter. Nothing relates a step to a number of machine instructions either, so
 `W(n)` is a count of the checker's steps and not a time. Arrays hold scalars, have a power-of-two
@@ -533,6 +587,11 @@ the frame's size.
 
 A diamond that passes through a join counts as handed over, so a scalar of that cell that is read later
 moves out, even when all that happens to it is that it is stored back where it was.
+
+A record's headers still get copied, by the kernel, into cells. Reading a field in place from the frame would save that, but
+it changes the resource model, so it comes later. Other things show in `examples/ipv4.lfpl`: rebuilding a record means
+writing all of its fields out even when two of them change, `{ e with f = v }` reaches only its first cell, a literal has to be
+written in decimal, and a 48-bit address is two fields.
 
 The largest gap in the language itself is non-tail recursion over a structure, the model's DESCEND
 and ASCEND, which is rejected for now. A tree therefore cannot be walked by recursing into both
