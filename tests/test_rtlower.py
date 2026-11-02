@@ -485,6 +485,25 @@ fn f(l: List, p: Bool) : List = match l with
                     self.assertEqual(self.answer(program), expected)
                 self.assertEqual(len(self.reads(program, "f")), 1)
 
+    def test_moved_only_in_the_last_arm_of_a_join_nothing_after_it_claims_the_register(self):
+        """With a value to join, the code goes on after the arms. One arm never moved the scalar, so its register
+        is free at the join, and the name has to have let go of it by then."""
+        for p, expected in (("true", 220), ("false", 1120)):
+            program = two_cells(self.NODE + """
+fn f(l: List, p: Bool) : List = let y = match l with
+  | Nil => Nil
+  | Cons(d, h, t) => let r = if p then Cons@d(2, t) else let c = Cons@d(1, t) in head(c, h) in r end in y;""",
+                                f"f(Cons@c0(10, Cons@c1(20, Nil)), {p})")
+            self.assertEqual(self.answer(program), expected)
+        program = two_cells(self.APPEND + """
+fn f(l: List, m: List) : List = let y = match l with
+  | Nil => m
+  | Cons(d, h, t) => let r = match m with
+      | Nil => Cons@d(2, t)
+      | Cons(e, x, u) => let c = Cons@d(1, app(t, u)) in Cons@e(h, c) end in r end in y;""",
+                            "f(Cons@c0(10, Nil), Cons@c1(20, Nil))")
+        self.assertEqual(self.answer(program), 1001)
+
     def test_read_after_a_join_it_moves_in_every_arm_to_one_register(self):
         program = two_cells(self.NODE + """
 fn f(l: List, p: Bool) : List = match l with

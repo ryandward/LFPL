@@ -302,8 +302,10 @@ MUTANTS = {
         "            elif self._wanted_later(index):\n", "            else:\n", PASS_TESTS),
     "lower: a last use does not end a name": ("src/rtlower.py",
         "            self.live_now &= ~(1 << src)\n", "            pass\n", PASS_TESTS),
-    "lower: a scalar moved in one arm is left in its register": ("src/rtlower.py",
+    "lower: a scalar moved in the last arm of an if is left in its register": ("src/rtlower.py",
         "        self._finish_moves_of_arm(top)\n        self._note_arm(top)\n", "        self._note_arm(top)\n", PASS_TESTS),
+    "lower: a scalar moved in the last arm of a match is left in its register": ("src/rtlower.py",
+        "        self._finish_moves_of_arm(match)\n", "", PASS_TESTS),
     "lower: each arm moves a scalar somewhere else": ("src/rtlower.py",
         "self.B.set(undo.index, replace(undo.binder, refuge=self.B.at(undo.index).refuge))",
         "self.B.set(undo.index, undo.binder)", PASS_TESTS),
@@ -326,8 +328,9 @@ MUTANTS = {
         "        else:\n            self.allowed = 0\n\n    def _finished", "\n    def _finished", PASS_TESTS),
     "pass: a null arm says nothing": ("src/righttoleft.py",
         "                self.nulls |= 1 << frame.word\n", "                pass\n", PASS_TESTS),
-    "pass: a null stays known after its arm": ("src/righttoleft.py",
-        "            self.nulls = frame.nulls\n", "", PASS_TESTS),
+    # There is no mutant for a null staying known after its arm. A function returning one value has to return every
+    # cell it was given, so an exit of null means every parameter of that type is null on that path, and a stale
+    # fact about one cannot change what is allowed, on a program that gets past Check.
     "pass: a recursive call allows anything": ("src/righttoleft.py",
         "for k in range(min(frame.count, MAX_PARAMETERS)) if frame.args[k] == k)",
         "for k in range(min(frame.count, MAX_PARAMETERS)))", PASS_TESTS),
