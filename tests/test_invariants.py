@@ -332,6 +332,21 @@ class ZeroUnchangedFieldCopies(unittest.TestCase):
         self.assertEqual(validate("    mov r10, qword [rdi]\n    mov r11, r10\n"
                                   "    mov qword [rdi], r11\n")[0].kind, "I2")
 
+    def test_a_narrow_load_stored_wider_is_not_a_copy(self):
+        """`pack<32>` reads only the low half of a wider field. Found by the generators, as a false positive."""
+        self.assertEqual(validate("    mov r10d, dword [rdi]\n    mov qword [rdi], r10\n"), [])
+        self.assertEqual(validate("    movzx r10d, word [rdi]\n    mov dword [rdi], r10d\n"), [])
+        self.assertEqual(validate("    mov r10, qword [rdi]\n    mov dword [rdi], r10d\n")[0].kind, "I2")
+        self.assertEqual(validate("    mov r10d, dword [rdi]\n    mov dword [rdi], r10d\n")[0].kind, "I2")
+
+    def test_taking_the_low_half_of_a_wider_field(self):
+        source = PRE + (b"fn u(q: Q) : Q = match q with Q(d, a, b) => Q@d(pack<32>(a), b) end;\n"
+                        b"fn hi(q: Q, free: Free) : Res = match q with Q(d, a, b) => Done@d(a, free) end;\n"
+                        b"fn main(free: Free) : Res = match free with End => Fail | "
+                        b"More(c, rest) => hi(u(Q@c(81985529216486895, 2)), rest) end;")
+        self.assertEqual(validate(compile_text(source)), [])
+        self.assertEqual(run(source), 81985529216486895 & 0xFFFFFFFF)
+
     def test_a_location_named_through_a_register_dies_with_that_register(self):
         """`[rdi+8]` names somewhere else after rdi changes, so a store there is not a
         write-back of what the old `[rdi+8]` held."""
@@ -917,6 +932,18 @@ class NoIdentityMorphisms(unittest.TestCase):
                         b"fn main(free: Free) : Res = match free with End => Fail | "
                         b"More(c, rest) => rd(s2(Q@c(1923856, 2544214)), rest) end;")
         self.assertEqual(run(source), 36 * 2544214)  # a' = 4b and b' = 16b
+
+    def test_a_value_reloaded_in_one_arm_is_not_stored_back_at_the_join(self):
+        """Found by the generators of records that span. t0 lives in a slot, and the other arm leaves it there, so the
+        join's home for it is that slot. This arm reads it, which brings it to a register, and the slot still holds it."""
+        lets = "".join(f"let t{i} = +(a, {i}) in " for i in range(18))
+        total = "".join(f"+(t{i}, " for i in range(18)) + "0" + ")" * 18
+        source = (f"fn f(a: Int64, b: Int64) : Int64 = {lets}let r = if <(a, b) then b else t0 in +(r, {total});\n"
+                  f"fn main() : Int64 = f(5, 1);").encode()
+        self.assertEqual(validate(compile_text(source)), [])
+        self.assertEqual(run(source), 5 + sum(5 + i for i in range(18)))
+        taken = source.replace(b"f(5, 1)", b"f(1, 5)")
+        self.assertEqual(run(taken), 5 + sum(1 + i for i in range(18)))
 
     def test_a_frame_is_one_adjustment_with_no_thunk(self):
         """`F_f` is an `equ` at the end of the function, so its size is known at the prologue."""

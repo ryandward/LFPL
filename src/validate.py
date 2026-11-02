@@ -22,6 +22,7 @@ import re
 from dataclasses import dataclass
 
 _MEM = re.compile(r"^(?:byte|word|dword|qword)?\s*\[(.+)\]$")
+_WIDTHS = {"byte": 1, "word": 2, "dword": 4, "qword": 8}
 _REG64 = {}
 for _r in ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp"):
     _REG64[_r] = _r
@@ -85,12 +86,16 @@ def _memory(operand: str):
     return match.group(1).replace(" ", "") if match else None
 
 
+def _width(operand: str) -> int:
+    return _WIDTHS.get(operand.split(" ")[0], 8)
+
+
 def validate(asm: str) -> list[Violation]:
     """Return every identity morphism found. Linear in the number of lines."""
     found: list[Violation] = []
     regs: dict[str, object] = {}
     mem: dict[str, object] = {}
-    loaded_from: dict[str, tuple[str, object]] = {}
+    loaded_from: dict[str, tuple[str, object, int]] = {}
     fresh = 0
 
     def new_word() -> tuple:
@@ -103,7 +108,7 @@ def validate(asm: str) -> list[Violation]:
         under that text is about a location this text no longer names."""
         for location in [m for m in mem if _names(m, register)]:
             del mem[location]
-        for holder in [r for r, (m, _w) in loaded_from.items() if _names(m, register)]:
+        for holder in [r for r, (m, _w, _size) in loaded_from.items() if _names(m, register)]:
             del loaded_from[holder]
 
     for number, op, operands in instructions(asm):
@@ -131,7 +136,7 @@ def validate(asm: str) -> list[Violation]:
                 overwritten(reg)
                 regs[reg] = word
                 if not _names(source_mem, reg):
-                    loaded_from[reg] = (source_mem, word)
+                    loaded_from[reg] = (source_mem, word, _width(source))
                 else:
                     loaded_from.pop(reg, None)
             elif dest_mem is not None and source in _REG64:
@@ -140,8 +145,10 @@ def validate(asm: str) -> list[Violation]:
                 if word is None:
                     word = new_word()
                     regs[reg] = word
-                # I2: a location is written back with the word it was loaded with.
-                if mem.get(dest_mem) == word and reg in loaded_from and loaded_from[reg][0] == dest_mem:
+                # I2: a location is written back with the word it was loaded with. Only with as much of it
+                # as was loaded: a narrow load stored wider makes a new value, by clearing what is above it.
+                if (mem.get(dest_mem) == word and reg in loaded_from and loaded_from[reg][0] == dest_mem
+                        and _width(dest) <= loaded_from[reg][2]):
                     found.append(Violation("I2", number, text))
                 stored = ("stored", word)
                 mem[dest_mem] = stored

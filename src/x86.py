@@ -632,9 +632,12 @@ class Backend:
             return False
         return any(r in edge[0] and edge[0][r] != home for r, home in table.items())
 
-    def _arrive(self, label: str, table: dict[int, Home], linear: set[int]) -> None:
+    def _arrive(self, label: str, table: dict[int, Home], linear: set[int],
+                clean: Optional[dict[int, int]] = None) -> None:
         """An edge reaches a label. The first sets its homes, and later ones move to them.
-        A value not live on every edge is not live after the label, by the merge rule."""
+        A value not live on every edge is not live after the label, by the merge rule. One that was
+        reloaded on this edge and whose home there is the slot it came from is there already."""
+        clean = dict(self.clean) if clean is None else clean
         self._table(table)
         self.linear = {r for r in linear if r in table}
         edge = self.edges.get(label)
@@ -647,7 +650,7 @@ class Backend:
         for r in [r for r in self.home if r not in target]:
             self._free(r)
         moves = [Move(_as_place(target[r]), _as_place(home))
-                 for r, home in self.home.items() if target[r] != home]
+                 for r, home in self.home.items() if target[r] != home and clean.get(r) != target[r]]
         self._pmove(moves)
         self._table(target)
 
@@ -658,17 +661,18 @@ class Backend:
     def _branch(self, cc: str, then: str, other: str, then_table: dict[int, Home],
                 other_table: dict[int, Home]) -> None:
         linear = set(self.linear)
+        clean = dict(self.clean)
         if self._needs_moves(then, then_table) or self._needs_moves(other, other_table):
             bridge = self.fresh_label()
             self.ins(f"j{cc}", bridge)
-            self._arrive(other, other_table, linear)
+            self._arrive(other, other_table, linear, clean)
             self.ins("jmp", self.asm_label(other))
             self.place(bridge)
-            self._arrive(then, then_table, linear)
+            self._arrive(then, then_table, linear, clean)
             self.ins("jmp", self.asm_label(then))
         else:
-            self._arrive(then, then_table, linear)
-            self._arrive(other, other_table, linear)
+            self._arrive(then, then_table, linear, clean)
+            self._arrive(other, other_table, linear, clean)
             self.hold = ("br", cc, then, other)
         self.live = False
 
