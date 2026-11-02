@@ -407,6 +407,7 @@ fn v(x: Int64) : Wide = A(low8(x), low16(>>(x, 8)), 5);
     def test_one_passed_to_a_function_is_still_there_afterwards(self):
         source = VERDICT + """fn g(v: Verdict) : Verdict = v;
 fn f(x: Int8) : (Verdict, Verdict, Verdict) = let v = Send(x) in let w = g(v) in (w, v, g(v));
+fn h(v: Verdict) : (Verdict, Verdict, Verdict) = let w = g(v) in (g(w), w, v);
 """
         asm = compile_program(source.encode())
         self.assertEqual([str(p) for p in check_translation(source.encode(), asm)], [])
