@@ -352,6 +352,8 @@ MUTANTS = {
     "symcheck: a word is updated only once": ("src/symcheck.py",
         "lambda x: T.select(cond, result, x) if self._pointer_of(x) == pointer else x, term)",
         "lambda x: T.select(cond, result, x) if x == pointer else x, term)", PASS_TESTS),
+    "symcheck: what a test ruled out is read against the type the cell is now": ("src/symcheck.py",
+        "        tested = self.types.get(self._declared_type(cell), info)\n", "        tested = info\n", ["tests.test_invariants.TagWrites"]),
     # --- a record that spans cells: the layout and the rewrite
     "span: a cell does not keep room for its link": ("src/spans.py",
         "        count = _fitting(sizes[start:], LINK)\n", "        count = _fitting(sizes[start:], CELL)\n", SPAN_TESTS),

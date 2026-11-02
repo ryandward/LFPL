@@ -1508,7 +1508,27 @@ class FunctionCheck:
                 at = node[1]
         return False
 
-    def _tag_of(self, fact: Optional[tuple], tag_leaf: int, info: TypeInfo) -> Optional[int]:
+    def _declared_type(self, pointer: int) -> Optional[str]:
+        """What this pointer is according to the source, where that can be told from what it came from."""
+        T = self.T
+        node = T.nodes[pointer]
+        if node[0] == "arg":
+            return self.fn.params[node[1]][1]
+        if node[0] == "call":
+            ret = self.fns[node[1]].ret
+            return ret if isinstance(ret, str) else None
+        if node[0] == "member" and T.nodes[node[1]][0] == "call":
+            ret = self.fns[T.nodes[node[1]][1]].ret
+            return ret[node[2]] if isinstance(ret, tuple) else None
+        if node[0] == "load":
+            parent = self.types.get(self._declared_type(node[1]))
+            if parent is not None:
+                found = {ty for ctor in parent.ctors for _f, ty, off, size in ctor.fields
+                         if off == node[2] and size == node[3]}
+                return found.pop() if len(found) == 1 else None
+        return None
+
+    def _tag_of(self, fact: Optional[tuple], tag_leaf: int, info: TypeInfo, cell: int) -> Optional[int]:
         T = self.T
         if T.is_const(tag_leaf):
             return T.value(tag_leaf)
@@ -1516,7 +1536,10 @@ class FunctionCheck:
             return 0 if len(info.ctors) == 1 else None
         if fact[0] == "is":
             return fact[1]
-        left = [c.tag for c in info.ctors if c.tag not in fact[1]]
+        # What the tests ruled out is about the constructors of the type they tested, and the last arm of a match takes
+        # no test. So the tag left over is that type's, whatever type the cell is being read as now.
+        tested = self.types.get(self._declared_type(cell), info)
+        left = [c.tag for c in tested.ctors if c.tag not in fact[1]]
         return left[0] if len(left) == 1 else None
 
     def _result_of(self, S: State) -> int:
@@ -1614,7 +1637,7 @@ class FunctionCheck:
         def on_tag(tag_leaf: int, p: int) -> int:
             if self._unchanged_on(S, leaf, p):  # the tag facts have split the path by now
                 return leaf
-            tag = self._tag_of(fact, tag_leaf, info)
+            tag = self._tag_of(fact, tag_leaf, info, leaf)
             ctor = next((c for c in info.ctors if c.tag == tag), None)
             if ctor is None:
                 return T.undef(f"tag of {T.show(leaf)} is {T.show(tag_leaf)}")

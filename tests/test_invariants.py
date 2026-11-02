@@ -1000,6 +1000,23 @@ class TagWrites(unittest.TestCase):
         lines = body(self.FLIP + b"fn main() : Int64 = 0;", "flip")
         self.assertEqual(len([l for l in lines if l == "mov byte [rdi], 1"]), 2, lines)
 
+    def test_a_tag_known_by_elimination_can_stay_for_a_constructor_of_another_type(self):
+        """Found by the generators, as a false alarm that would have refused the program. The last arm of a match
+        takes no test, so all a reader of the machine knows is what the tests ruled out, and that is about the
+        three constructors of T. Read as an S, which has four, that leaves two, so it could not say what was there."""
+        source = (b"data Free = End | More(next: Free);\n"
+                  b"data Res = Fail | Done(value: Int64, rest: Free);\n"
+                  b"data T = Ta(x: Int8) | Tb(y: Int8) | Tc(z: Int8);\n"
+                  b"data S = Sa(x: Int32) | Sb(x: Int32, y: Int16) | Sc(z: Int8) | Sd;\n"
+                  b"fn f(t: T) : S = match t with Tb(d, y) => Sb@d(1, 2) | Tc(d, z) => Sd@d() | Ta(d, x) => Sa@d(7) end;\n"
+                  b"fn rd(s: S, free: Free) : Res = match s with Sa(d, x) => Done@d(pack<32>(x), free) "
+                  b"| Sb(d, x, y) => Done@d(1000, free) | Sc(d, z) => Done@d(2000, free) | Sd(d) => Done@d(3000, free) end;\n"
+                  b"fn main(free: Free) : Res = match free with End => Fail | More(c, rest) => rd(f(Ta@c(9)), rest) end;")
+        lines = body(source, "f")
+        self.assertEqual([l for l in lines if l.startswith("mov byte [rdi], ")], ["mov byte [rdi], 3"])  # Sd's, and no other
+        self.assertEqual(check_translation(source, compile_text(source)), [])
+        self.assertEqual(run(source), 7)
+
     def test_a_tag_write_does_not_corrupt_a_field_still_owed_at_offset_zero(self):
         """Found by the symbolic check, in programs whose result never showed it: the
         tag landed on the free list's next pointer before that pointer was moved out."""
