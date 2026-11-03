@@ -43,6 +43,15 @@ class Starved(Exception):
     limit it is, so the driver can tell it from a bug."""
 
 
+class NotLowered(Exception):
+    """Something RT has that this backend does not lower yet: a declared limit of section 12, not a bug."""
+
+
+# A slot and a countdown are the Verilog backend's for now: src/runtime.py places no slot, and src/symcheck.py, which
+# every x86 build has to pass, does not read either yet.
+_NOT_LOWERED = {"sget": "a byte of a slot", "slen": "a slot's length", "br.down": "a match that counts a Fin down"}
+
+
 @dataclass(frozen=True)
 class Reg:
     name: str
@@ -505,6 +514,9 @@ class Backend:
             self.ctors[parts[0]][1].append((int(parts[1]), int(parts[2])))
         elif head == "type":
             parts = rest.split()
+            if parts[1] == "slot":
+                raise NotLowered(f"section 12: slot {parts[2]} is not lowered to x86 yet, which has no slots in its "
+                                 f"image: src/rtverilog.py lowers it")
             self.tagged[parts[0]] = parts[1] == "tagged"
             if parts[1] == "enum":
                 self.enums.add(parts[0])
@@ -519,6 +531,8 @@ class Backend:
         elif head in ("array", "state"):
             pass
         else:
+            if head in _NOT_LOWERED:
+                raise NotLowered(f"section 12: {_NOT_LOWERED[head]} is not lowered to x86 yet: src/rtverilog.py lowers it")
             if self.count_steps and head not in NO_WORK:
                 self.ins("inc", "qword [cnt_steps]")
             getattr(self, "i_" + head.replace(".", "_"))(_args(rest))

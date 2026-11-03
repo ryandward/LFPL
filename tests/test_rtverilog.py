@@ -32,7 +32,7 @@ from src.rtcheck import RTError, Unbounded  # noqa: E402
 from src.rtlower import Limit, rt_lines  # noqa: E402
 from src.certify import certify_turn  # noqa: E402
 from src.rtcheck import Checker  # noqa: E402
-from src.rtverilog import CELL_BITS, Emitter, Translation, translate  # noqa: E402
+from src.rtverilog import CELL_BITS, CELL_BYTES, Emitter, Translation, translate  # noqa: E402
 from tests.test_checksum import (LARGEST, PORT, SOURCE, cells_in, internet_checksum,  # noqa: E402
                                  packet, payload)
 from tests.reference import hgen, ipv4_model  # noqa: E402
@@ -727,10 +727,13 @@ class Layout:
         self.kinds: dict = {}
         self.tuples: dict = {}
         self.aliases: dict = {}
+        self.slot_bytes = 0
         for line in lines:
             head, *parts = line.split() or [""]
             if head == "type":
                 self.kinds[parts[0]] = parts[1]
+                if parts[1] == "slot":
+                    self.slot_bytes = int(parts[3])
             elif head == "alias":
                 self.aliases[parts[0]] = parts[1]
             elif head == "tuple":
@@ -781,15 +784,20 @@ class Layout:
                 wire += size
         return wire, cells
 
-    def image(self, datagram: bytes, reserve: int) -> tuple:
-        """The cells src/runtime.py would have made of a datagram: (address, enables, data)."""
+    def is_slot(self, type_text: str) -> bool:
+        return self.kinds.get(self._resolve(type_text)) == "slot"
+
+    def image(self, datagram: bytes, reserve: int, slot: Optional[int] = None, slot_length: Optional[int] = None) -> tuple:
+        """The cells src/runtime.py would have made of a datagram: (address, enables, data). A record that owns a slot
+        has its payload in slot `slot`, built in memory: its cells, and in the record its number and its length, which
+        is `slot_length` if that is given and how many bytes the payload has if not."""
         words: dict = {}
-        chain_field = None
+        chain_field = slot_field = None
         at = 0
         next_address = 2
 
         def fill(ctor: str, address: int) -> None:
-            nonlocal at, next_address, chain_field
+            nonlocal at, next_address, chain_field, slot_field
             word, enables = 0, 0
             for offset, size, type_text, name in self.ctors[ctor][1]:
                 inner = self._record_of(type_text)
@@ -802,6 +810,9 @@ class Layout:
                 elif self._is_scalar(type_text):
                     value = int.from_bytes(datagram[at:at + size], "little")
                     at += size
+                elif self.is_slot(type_text):
+                    slot_field = (address, offset, size)
+                    continue
                 else:
                     chain_field = (address, offset, size)
                     continue
@@ -811,6 +822,20 @@ class Layout:
 
         fill(self.item, 1)
         body = datagram[at:]
+        if slot_field is not None:
+            assert slot is not None and len(body) <= self.slot_bytes, (slot, len(body))
+            address, offset, size = slot_field
+            length = len(body) if slot_length is None else slot_length
+            words[address][1] |= (slot | length << 32) << (8 * offset)
+            words[address][0] |= ((1 << size) - 1) << offset
+            first = slot * (self.slot_bytes // CELL_BYTES)
+            loads = [(address, enables, word) for address, (enables, word) in sorted(words.items())]
+            loads += [(first + start // CELL_BYTES, 0xffff, int.from_bytes(body[start:start + CELL_BYTES], "little"))
+                      for start in range(0, len(body), CELL_BYTES)]
+            for index in range(reserve):
+                following = next_address + index + 1 if index + 1 < reserve else 0
+                loads.append((next_address + index, 0x00ff, following))
+            return loads, 1, (next_address if reserve else 0), next_address - 1 + reserve
         chunks = [body[i:i + WIDTH] for i in range(0, len(body), WIDTH)]
         first_chunk = next_address
         loads = []
@@ -891,15 +916,27 @@ class Layout:
 def simulate_images(translation: Translation, layout: Layout, datagrams: list) -> tuple:
     bound = translation.bound
     lines, cells = [], []
-    for datagram in datagrams:
+    for number, datagram in enumerate(datagrams):
         wire_bytes, record_cells = layout.shape(layout.item)
-        n = record_cells - 1 + cells_in(max(0, len(datagram) - wire_bytes))
+        slot = translation.first_slot + number % translation.slots if translation.slots else None
+        n = record_cells - 1 + (0 if slot is not None else cells_in(max(0, len(datagram) - wire_bytes)))
         reserve = bound.a * n + bound.b
-        loads, item, free, words = layout.image(datagram, reserve)
+        loads, item, free, words = layout.image(datagram, reserve, slot)
         cells.append((n, reserve))
-        lines.append(f"{item:x} {free:x} {len(loads):x} {words:x}")
-        lines += [f"{address:x} {enables:x} {word:x}" for address, enables, word in loads]
-    lines.append("0 0 0 0")
+        lines += image_lines(item, free, words, loads)
+    results, summary = run_images(translation, lines)
+    return results, summary, cells
+
+
+def image_lines(item: int, free: int, words: int, loads: list) -> list:
+    """One item, as tests/tb_image.v reads it."""
+    return [f"{item:x} {free:x} {len(loads):x} {words:x}"] + [f"{address:x} {enables:x} {word:x}"
+                                                              for address, enables, word in loads]
+
+
+def run_images(translation: Translation, lines: list) -> tuple:
+    """Every item tests/tb_image.v is given, through the handler's machine: what each returned, and the summary."""
+    lines = lines + ["0 0 0 0"]
     with tempfile.TemporaryDirectory() as workdir:
         design = os.path.join(workdir, "design.v")
         with open(design, "w") as handle:
@@ -932,7 +969,7 @@ def simulate_images(translation: Translation, layout: Layout, datagrams: list) -
             words[int(parts[1])] = parts[2]
     last = done.stdout.strip().splitlines()[-1]
     assert last.startswith("DONE"), done.stdout[-500:]
-    return results, dict(part.split("=") for part in last.split()[1:]), cells
+    return results, dict(part.split("=") for part in last.split()[1:])
 
 
 @SIMULATOR

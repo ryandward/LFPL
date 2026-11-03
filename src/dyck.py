@@ -16,8 +16,9 @@ already begins with a keyword or a name, so one token of lookahead decides it.
               | 'enum' Name '=' ctor {'|' ctor} ';'
               | 'record' Name '{' id ':' ty {',' id ':' ty} '}' ';'
               | 'state' id ':' ty ';'
+              | 'slot' Name ';'
     ctor    ::= Name ['(' id ':' ty {',' id ':' ty} ')']
-    ty      ::= Name | 'Array' '[' int ']' Name | 'Fin' int
+    ty      ::= Name | 'Array' '[' int ']' Name | 'Fin' int | 'Fin' Name
     res     ::= ty | '(' ty ',' ty {',' ty} ')'
     int     ::= digit {digit} | '0x' hex {hex}
     e       ::= id | int | 'true' | 'false'
@@ -34,8 +35,12 @@ already begins with a keyword or a name, so one token of lookahead decides it.
               | '{' e 'with' id '=' e '}'
               | id '(' [e {',' e}] ')'
               | 'pack' '<' int {',' int} '>' '(' e {',' e} ')'
+              | id '[' e ']'
     cells   ::= id | '(' id {',' id} ')'
-    arm     ::= Name ['(' id {',' id} ')'] '=>' e
+    arm     ::= Name ['(' id {',' id} ')'] '=>' e | '0' '=>' e | 'down' '(' id ')' '=>' e
+
+`Fin Name` and `idx(e, Name)` name a slot, whose size in bytes is the bound. `id[e]` reads a byte of the slot
+`id` names, and `0` and `down(j)` are the two arms of a match on a Fin, which counts it down.
 """
 from __future__ import annotations
 
@@ -94,7 +99,7 @@ _KINDS = tuple((
     "FN PARAM TYPE RESWORD DATA CTORDECL FIELD RECORD LET BINDER IF MATCH ARM "
     "WITH BINOP CMP AND OR NOT CALL CTOR DIAMOND PACK VAR INT BOOL NULLCTOR "
     "EOF HANDLER STATE TARRAY TFIN TTUPLE TUPLE IDX GET RTDECL RTDECLMORE LOW "
-    "VARLAST LIVE UPDATE VARAT ENUM VALUE TURN "
+    "VARLAST LIVE UPDATE VARAT ENUM VALUE TURN SLOT SGET SLEN TFINNAME "
 ).split())
 (
     K_FN, K_PARAM, K_TYPE, K_RESWORD, K_DATA, K_CTORDECL, K_FIELD, K_RECORD,
@@ -109,8 +114,14 @@ _KINDS = tuple((
     K_ENUM,             # a declaration of a sum held in a register
     K_VALUE,            # and one of its values: open(VALUE) `C(`, or from Check, leaf(VALUE) for a C with no fields
     K_TURN,             # the runtime's turn, the one function that may call the program's handler
+    K_SLOT,             # a declaration of a slot: a linear type that owns one whole slot of bytes
+    K_SGET,             # `s[i]`, open(SGET, s): byte i of the slot s, which it reads and keeps
+    K_SLEN,             # and `len(s)`, from Check, which knows len for the primitive it is
+    K_TFINNAME,         # `Fin S`: the bound is the size of slot S in bytes, a build constant
 ) = range(len(_KINDS))
 FUNCTIONS = (K_FN, K_HANDLER, K_TURN)
+DOWN = b"down"  # the arm of a match on a Fin that binds one less. An arm that says `0` has a payload of zeros
+SLOT = b"slot"  # what a declaration of a slot starts with. Like `down`, it is a word only there, and a name anywhere else
 VARAT = struct.Struct("<HB")  # the position, and whether the right-to-left pass found this to be its last use
 VALUE = struct.Struct("<HB")  # the constructor, as Check numbers it, and how many fields it has
 
@@ -303,12 +314,14 @@ S_TA_LB, S_TA_N, S_TA_RB, S_TA_ELEM, S_TF_N, S_TT_TYPE, S_TT_NEXT = range(70, 77
 S_LTB, S_LTB_NEXT, S_ST_COLON, S_ST_TYPE, S_ST_SEMI = range(77, 82)
 S_CTOR_DL, S_CTOR_DN = range(82, 84)
 S_UP_FIRST, S_UP_FIELD, S_UP_EQ, S_UP_E, S_UP_NEXT = range(84, 89)
+S_SLOT_SEMI, S_SGET_E, S_SGET_END = range(89, 92)
 
 # Expression-expecting states, and what follows the expression.
 _AFTER = {S_BODY: S_SEMI, S_LET_E1: S_LET_IN, S_IF_COND: S_IF_THEN_KW,
           S_IF_THEN: S_IF_ELSE_KW, S_M_SCRUT: S_M_WITH, S_W_E: S_W_KW,
           S_W_V: S_W_END, S_OP_E1: S_OP_COMMA, S_OP_E2: S_OP_END,
-          S_NOT_E: S_NOT_END, S_ARG: S_ARGS_NEXT, S_ARGS_FIRST: S_ARGS_NEXT, S_UP_E: S_UP_NEXT}
+          S_NOT_E: S_NOT_END, S_ARG: S_ARGS_NEXT, S_ARGS_FIRST: S_ARGS_NEXT, S_UP_E: S_UP_NEXT,
+          S_SGET_E: S_SGET_END}
 # Expression-expecting states whose construct has no closing token: when the
 # child completes, the frame's own cell carries the close event.
 _IMPLICIT_CLOSE = {S_LET_BODY: K_LET, S_IF_ELSE: K_IF, S_ARM_BODY: K_ARM}
@@ -405,7 +418,7 @@ class Parser(Stage):
             self._resolve_name(cell, tag)
             return
         if not len(self.frames):
-            self._declaration(cell, tag)
+            self._declaration(cell, tag, payload)
             return
         state = self._state()
         if state in _EXPECTS_EXPR:
@@ -429,13 +442,16 @@ class Parser(Stage):
         elif name_tag == T_NAME and tag == T_LPAREN:
             self._push(K_VALUE, S_ARGS_FIRST, cell)
             self._emit(name_cell, OPEN, K_VALUE, text)
+        elif name_tag == T_IDENT and tag == T_LBRACKET:
+            self._push(K_SGET, S_SGET_E, cell)
+            self._emit(name_cell, OPEN, K_SGET, text)
         else:
             kind = K_VAR if name_tag == T_IDENT else K_NULLCTOR
             self._emit(name_cell, LEAF, kind, text)
             self.held = cell
             self._complete()
 
-    def _declaration(self, cell: int, tag: int) -> None:
+    def _declaration(self, cell: int, tag: int, payload: bytes) -> None:
         if tag == T_EOF:
             self._emit(cell, LEAF, K_EOF)
         elif tag == T_FN:
@@ -452,6 +468,8 @@ class Parser(Stage):
             self._push(K_ENUM, S_NAME, cell)
         elif tag == T_RECORD:
             self._push(K_RECORD, S_NAME, cell)
+        elif tag == T_IDENT and payload.rstrip(b"\0") == SLOT:
+            self._push(K_SLOT, S_NAME, cell)
         else:
             raise self._fail("a declaration", tag)
 
@@ -531,7 +549,7 @@ class Parser(Stage):
                 self._emit(cell, OPEN, K_STATE, payload)
             else:
                 require(T_NAME, "a type name")
-                self._set(S_DATA_EQ if kind in (K_DATA, K_ENUM) else S_REC_LBRACE)
+                self._set(S_DATA_EQ if kind in (K_DATA, K_ENUM) else S_SLOT_SEMI if kind == K_SLOT else S_REC_LBRACE)
                 self._emit(cell, OPEN, kind, payload)
         elif state == S_LPAREN:
             next_state(S_PARAM_OR_END, "'('", T_LPAREN)
@@ -584,7 +602,11 @@ class Parser(Stage):
             self.frames.pop()
             self._emit(cell, LEAF, K_TARRAY, length + bytes((code,)))
         elif state == S_TF_N:
-            require(T_INT, "the bound of a Fin")
+            if tag == T_NAME:  # a slot's size in bytes
+                self.frames.pop()
+                self._emit(cell, LEAF, K_TFINNAME, payload)
+                return
+            require(T_INT, "the bound of a Fin, a number or a slot")
             self.frames.pop()
             self._emit(cell, LEAF, K_TFIN, payload[:_PACK_FIELDS])
         elif state == S_TT_NEXT:
@@ -598,6 +620,15 @@ class Parser(Stage):
                     raise self._fail("a second type: a tuple has at least two members")
                 self.frames.pop()
                 self._emit(cell, CLOSE, K_TTUPLE)
+        elif state == S_SLOT_SEMI:
+            require(T_SEMI, "';'")
+            self.frames.pop()
+            self._emit(cell, CLOSE, K_SLOT)
+        elif state == S_SGET_END:
+            require(T_RBRACKET, "']'")
+            self.frames.pop()
+            self._emit(cell, CLOSE, K_SGET)
+            self._complete()
         elif state == S_ST_COLON:
             next_state(S_ST_TYPE, "':'", T_COLON)
         elif state == S_ST_SEMI:
@@ -722,7 +753,10 @@ class Parser(Stage):
             if tag == T_BAR:
                 ring.drop(self, cell)  # the optional leading bar
             else:
-                require(T_NAME, "a constructor pattern")
+                if tag == T_INT and payload[:8] == bytes(8):
+                    payload = bytes(len(payload))  # the arm of a Fin that is 0
+                elif tag != T_NAME and not (tag == T_IDENT and payload.rstrip(b"\0") == DOWN):
+                    raise self._fail("a constructor pattern, or 0 or down(j) for a Fin", tag)
                 self._set(S_M_NEXT)
                 self._push(K_ARM, S_ARM_OPEN, None)
                 self._emit(cell, OPEN, K_ARM, payload)

@@ -58,10 +58,10 @@ from dataclasses import dataclass
 from typing import BinaryIO, Optional
 
 from .check import CELL_FIELDS_MAX, TUPLE_MAX
-from .dyck import (CLOSE, DEFAULT_D_MAX, K_ARM, K_BINDER, K_BOOL, K_CALL, K_CTOR, K_DIAMOND, K_ENUM, K_EOF, K_FIELD, K_FN,
-                   K_HANDLER, K_IF, K_INT, K_LET, K_LIVE, K_MATCH, K_NULLCTOR, K_PARAM, K_RECORD, K_RESWORD, K_TARRAY,
-                   K_TFIN, K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_VARAT, K_VARLAST, K_WITH, LEAF, OPEN, SEP, VARAT, ev_class,
-                   ev_kind, ev_tag, FUNCTIONS)
+from .dyck import (CLOSE, DEFAULT_D_MAX, DOWN, K_ARM, K_BINDER, K_BOOL, K_CALL, K_CTOR, K_DIAMOND, K_ENUM, K_EOF, K_FIELD,
+                   K_FN, K_HANDLER, K_IF, K_INT, K_LET, K_LIVE, K_MATCH, K_NULLCTOR, K_PARAM, K_RECORD, K_RESWORD,
+                   K_TARRAY, K_TFIN, K_TFINNAME, K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_VARAT, K_VARLAST, K_WITH, LEAF, OPEN,
+                   SEP, VARAT, ev_class, ev_kind, ev_tag, FUNCTIONS)
 from .ring import Reject, Stage
 from .spans import CELLS_PER_DEPTH as SPAN_CELLS_PER_DEPTH, Spans
 from .tokens import PAYLOAD_BYTES
@@ -312,7 +312,10 @@ class RightToLeft(Stage):
             return
         if kind == K_ARM:
             _match_kind, match = self._top()
-            self._push(K_ARM, _Open(exit=match.exit, mark=len(self.B), word=match.word, nulls=self.nulls))
+            # An arm of a match on a Fin, `0` or `down(j)`, has no cell, and what it binds is no parameter's.
+            counting = payload.rstrip(b"\0") in (b"", DOWN)
+            self._push(K_ARM, _Open(exit=match.exit, mark=len(self.B), word=NOTHING_KNOWN if counting else match.word,
+                                    nulls=self.nulls))
             return
         frame = _Open(exit=int(self._in_exit_position()), mark=len(self.B))
         if kind == K_CALL:
@@ -406,7 +409,7 @@ class RightToLeft(Stage):
         if kind == K_PARAM:
             self.pending_name = payload
             return NO_POSITION
-        if kind in (K_TYPE, K_TARRAY, K_TFIN):
+        if kind in (K_TYPE, K_TARRAY, K_TFIN, K_TFINNAME):
             return self._type(kind, payload)
         if kind == K_RESWORD:
             self.inferring = False

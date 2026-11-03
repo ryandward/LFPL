@@ -20,13 +20,13 @@ import struct
 from dataclasses import dataclass, replace
 from typing import BinaryIO, Callable, Generic, Iterable, Iterator, NamedTuple, Optional, Protocol, TypeVar
 
-from .check import (ATTR_LINEAR, ATTR_WIRE, P_ARM_RT, P_BINDER, P_CALL_RT, P_DIAMOND_RT, P_FIELD, P_GET_RT,
-                    P_IDX_RT, P_LET_RT, P_PARAM_RT, P_TYPE_RT, P_VAR, P_WITH_RT, CheckStage)
+from .check import (ARM_ENUM, ARM_FIN, ATTR_LINEAR, ATTR_WIRE, P_ARM_RT, P_BINDER, P_CALL_RT, P_DIAMOND_RT, P_FIELD,
+                    P_GET_RT, P_IDX_RT, P_LET_RT, P_PARAM_RT, P_TYPE_RT, P_VAR, P_WITH_RT, CheckStage)
 from .dyck import (CC_NAMES, CLOSE, DEFAULT_D_MAX, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP, K_CTOR,
                    K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER, K_IDX, K_IF, K_INT, K_LET, K_LIVE,
                    K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
-                   K_RTDECLMORE, K_TUPLE, K_TURN, K_TYPE, K_VALUE, K_VAR, K_VARLAST, K_WITH, LEAF, OP_NAMES, OPEN,
-                   SEP, VALUE, FUNCTIONS, Lexer, Parser, ev_class, ev_kind)
+                   K_RTDECLMORE, K_SGET, K_SLEN, K_TUPLE, K_TURN, K_TYPE, K_VALUE, K_VAR, K_VARLAST, K_WITH, LEAF,
+                   OP_NAMES, OPEN, SEP, VALUE, FUNCTIONS, Lexer, Parser, ev_class, ev_kind)
 from .righttoleft import CELLS_PER_DEPTH, MASK_BITS, RightToLeft
 from .spans import HELD_CELLS
 from .ring import FrameStack, Reject, Ring, Stage
@@ -595,6 +595,8 @@ class RTLower(Stage):
             aux = payload[0] if kind in (K_BINOP, K_CMP) else 0
             self.F.push(Frame(kind, dest=dest.kind, d=dest.d, count=dest.count, t=dest.t, f=dest.f,
                               aux=aux, vmark=len(self.V)))
+            if kind == K_SGET:
+                self.V.push(self._borrow(P_VAR.unpack_from(payload)[0]))
 
     def _open_join(self, dest: Dest) -> int:
         mark = len(self.J)
@@ -650,6 +652,8 @@ class RTLower(Stage):
             self._value_with_no_fields(VALUE.unpack_from(payload)[0])
         elif kind == K_EOF:
             pass
+        elif kind in (K_VAR, K_VARLAST) and self.F.top().kind == K_SLEN:
+            self.V.push(self._borrow(P_VAR.unpack_from(payload)[0]))
         else:
             self._deliver(self._leaf_value(kind, payload), self._dest())
 
@@ -701,6 +705,19 @@ class RTLower(Stage):
     def _gone(self, cell: int) -> bool:
         return any(self.G.at(i).number == cell for i in range(len(self.G)))
 
+    def _borrow(self, index: int) -> Value:
+        """A slot a read borrows, which stays its name's. It is read from a register: one still in its record's cell
+        moves to its name's refuge first, as it would before that cell is rebuilt, and stays there."""
+        binder = self.B.at(index)
+        value = binder.value
+        if value.kind == V_LOC:
+            self.i(f"take r{binder.refuge}, r{value.reg}[{value.off}:{value.size}]")
+            value = Value(V_REG, binder.refuge, off=value.off, size=value.size, word=value.word, cell=value.cell,
+                          flags=OWNED | LINEAR)
+            self._set_binder(index, Binder(value, binder.refuge))
+        assert value.kind == V_REG, value
+        return replace(value, flags=LINEAR)
+
     # --- let
 
     def _leaf_binder(self, payload: bytes) -> None:
@@ -718,6 +735,9 @@ class RTLower(Stage):
             register = self.fresh()
             self.i(f"efield r{register}, r{top.reg}, c{top.l2}, {off}")
             self._push_binder(Binder(Value(V_REG, register, word=self.new_word(), flags=OWNED)))
+            return
+        if kind == 3:  # `down(j)`: the register br.down wrote one less into
+            self._push_binder(Binder(Value(V_REG, top.l3, word=self.new_word(), flags=OWNED)))
             return
         if top.state == 1:  # a known constructor: the names are its field values
             if kind == 0:
@@ -845,7 +865,13 @@ class RTLower(Stage):
         if frame.count > 1:
             self.V.push(Value(V_TUPLE, frame.count))
 
-    def _sep_match(self, top: Frame) -> None:
+    def _sep_match(self, top: Frame, payload: bytes) -> None:
+        if payload[1]:  # a Fin, which br.down reads and leaves where it is: it needs no register of its own
+            top.reg = self._as_reg(self._native(self.V.pop()))
+            top.state = 4
+            top.gmark, top.umark = len(self.G), len(self.U)
+            self.F.set_top(top)
+            return
         value = self.V.pop()
         if value.kind == V_VIRT:
             top.state = 1
@@ -870,10 +896,13 @@ class RTLower(Stage):
         self.F.set_top(top)
 
     def _open_arm(self, payload: bytes) -> None:
-        tag, tagged, is_null, arm_index, nctors, ctor, enum = P_ARM_RT.unpack_from(payload)
+        tag, tagged, is_null, arm_index, nctors, ctor, what = P_ARM_RT.unpack_from(payload)
         match = self.F.top()
-        if enum:
+        if what == ARM_ENUM:
             self._open_enum_arm(match, tag, arm_index, nctors, ctor)
+            return
+        if what == ARM_FIN:
+            self._open_fin_arm(match, bool(tag), arm_index)
             return
         if match.state == 1:
             if ctor != match.l1:
@@ -931,6 +960,19 @@ class RTLower(Stage):
         self.F.set_top(match)
         self.F.push(Frame(K_ARM, state=3, dest=match.dest, d=match.d, count=match.count, t=match.t, f=match.f,
                           reg=match.reg, word=match.word, cell=self.new_cell(), bmark=len(self.B), l2=ctor))
+
+    def _open_fin_arm(self, match: Frame, down: bool, arm_index: int) -> None:
+        """A Fin counted down: one test, before the first arm, which writes one less into a register of its own
+        on the way to `down(j)`. The Fin itself stays where it was, as any scalar a test reads does."""
+        self._rollback(match)
+        if arm_index == 0:
+            match.l1, match.l2, match.aux = self.new_label(), self.new_label(), self.fresh()
+            self.i(f"br.down r{match.reg}, r{match.aux}, L{match.l1}, L{match.l2}")
+            self.live = False
+        self.label(match.l2 if down else match.l1)
+        self.F.set_top(match)
+        self.F.push(Frame(K_ARM, state=4, dest=match.dest, d=match.d, count=match.count, t=match.t, f=match.f,
+                          reg=match.reg, word=match.word, cell=self.new_cell(), bmark=len(self.B), l3=match.aux))
 
     def _forget_cells_from(self, first: int) -> None:
         """The cells opened since this number are out of scope, and nothing can name them. What
@@ -1132,6 +1174,24 @@ class RTLower(Stage):
         self.V.push(Value(V_REG, base, word=array.word, flags=OWNED | LINEAR))
         self.V.push(Value(V_REG, element, word=self.new_word(), flags=OWNED))
         self._deliver(Value(V_TUPLE, 2), top.as_dest())
+
+    def _close_sget(self) -> None:
+        """`s[i]`: byte i of the slot, which the read leaves its name's."""
+        top = self.F.pop()
+        index, slot = self.V.pop(), self.V.pop()
+        position = self._as_reg(self._native(index))
+        register = self._result(top)
+        self.i(f"sget r{register}, r{slot.reg}, r{position}")
+        if index.kind != V_REG or index.flags & OWNED:  # a temporary, read for the last time
+            self.i(f"drop r{position}")
+        self._finish(top, register)
+
+    def _close_slen(self) -> None:
+        top = self.F.pop()
+        slot = self.V.pop()
+        register = self._result(top)
+        self.i(f"slen r{register}, r{slot.reg}")
+        self._finish(top, register)
 
     def _close_tuple(self) -> None:
         top = self.F.pop()
@@ -1435,7 +1495,7 @@ class RTLower(Stage):
         elif kind == K_IF:
             self._sep_if(top, payload)
         elif kind == K_MATCH:
-            self._sep_match(top)
+            self._sep_match(top, payload)
         elif kind == K_ARM:
             if top.state == 1:  # every field of a known constructor now has its name
                 self.V.truncate(self.F.at(len(self.F) - 2).vmark)
@@ -1507,6 +1567,10 @@ class RTLower(Stage):
             self._close_get(payload)
         elif kind == K_TUPLE:
             self._close_tuple()
+        elif kind == K_SGET:
+            self._close_sget()
+        elif kind == K_SLEN:
+            self._close_slen()
         else:
             raise AssertionError(f"close of kind {kind}")
 

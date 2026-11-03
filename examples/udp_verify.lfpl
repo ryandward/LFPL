@@ -1,10 +1,11 @@
 # examples/ipv4.lfpl's forwarding, and before it the UDP checksum of every datagram that has one, over the
 # pseudo-header, the UDP header and every byte of the payload: a frame whose checksum is wrong is dropped.
 #
-# This is written for the slot design, which does not exist yet, and it does not compile. The payload is not a chain
-# of cells but one slot of N_max consecutive cells, which the frame owns whole: its bytes are in order, from a base
-# and for a length within the slot, and `body[i]` reads byte i of them, with i a Fin counting down. The headers,
-# the UDP one with them, are a record, as in ipv4.lfpl, 42 bytes on the wire.
+# The payload is not a chain of cells but one slot, 2048 bytes in 128 consecutive cells, which the frame owns whole:
+# its bytes are in order from byte 0, `len(body)` of them, and `body[i]` reads byte i, with i a Fin counting down.
+# The headers, the UDP one with them, are a record, as in ipv4.lfpl, 42 bytes on the wire. Neither runtime fills a
+# slot yet, and the x86 backend refuses one, so this runs on the Verilog backend, with slots written into its store
+# directly, as tests/test_slots.py does.
 slot Payload;
 record Frame {
   dst_hi: Be32, dst_lo: Be16, src_hi: Be32, src_lo: Be16, ethertype: Be16,
@@ -58,8 +59,8 @@ fn verified(body: Payload, checkable: Bool, total: Int16, ulen: Int16, head: Int
   if !(checkable) then (body, Fine)
   else if ||(<(ulen, 8), !=(ulen, -(total, 20))) then (body, Broken)
   else if <(len(body), -(ulen, 8)) then (body, Broken)
-  else let (rest, data) = payload_sum(body, -(ulen, 8)) in
-    (rest, if ==(fold(fold(+(head, data))), 0xFFFF) then Fine else Wrong);
+  else let (rest, payload) = payload_sum(body, -(ulen, 8)) in
+    (rest, if ==(fold(fold(+(head, payload))), 0xFFFF) then Fine else Wrong);
 
 # As in ipv4.lfpl.
 fn patched(sum: Int16, ttl: Int8, proto: Int8) : Int16 =

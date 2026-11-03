@@ -25,7 +25,12 @@ TIER = ("tests.test_simplex",
         "tests.test_rtverilog.TargetIndependence",
         "tests.test_rtverilog.TheEmittersOwnArithmetic",
         "tests.test_walks.ReportedBounds",
-        "tests.test_walks.TheModels")
+        "tests.test_walks.TheModels",
+        "tests.test_slots.TheLanguage",
+        "tests.test_slots.TheCountdown",
+        "tests.test_slots.TheBound",
+        "tests.test_slots.InRT",
+        "tests.test_slots.OnX86")
 SIMULATORS = frozenset(("iverilog", "vvp", "yosys", "verilator"))
 
 

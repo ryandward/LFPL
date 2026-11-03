@@ -174,7 +174,7 @@ C \;\ge\; K_{\mathsf{in}} N_{\max} \;+\; \big(R(N_{\max}) + N_{\max}\big) \;+\; 
 
 ## 4. The language
 
-LFPL-O is the first specification's LFPL with ten additions:
+LFPL-O is the first specification's LFPL with twelve additions:
 
 - recursion restricted to structural recursion, so every function terminates;
 - every primitive total;
@@ -185,7 +185,9 @@ LFPL-O is the first specification's LFPL with ten additions:
 - fields in network byte order;
 - record update, which names only the fields that change;
 - sums held in a register, so that a decision costs no cell;
-- the runtime's turn, the one entry point that may call a handler (section 9.6).
+- the runtime's turn, the one entry point that may call a handler (section 9.6);
+- slots, a linear type that owns a frame's bytes, read one byte at a time (section 4.12);
+- a match that counts a Fin down, which is rule R3's other measure (section 4.6).
 
 Everything else, including ◇, exactly-once linearity and in-place construction, is unchanged.
 
@@ -193,24 +195,26 @@ Everything else, including ◇, exactly-once linearity and in-place construction
 
 ```latex
 \begin{array}{rcl}
-\tau &::=& \mathsf{Int}_w \ (w \in \{8,16,32,64\}) \mid \mathsf{Bool} \mid \Diamond \mid D \mid R \mid \mathsf{Array}[N]\,\tau \mid \mathsf{Fin}\,N \mid \mathsf{Free} \mid \tau \otimes \tau\\[4pt]
+\tau &::=& \mathsf{Int}_w \ (w \in \{8,16,32,64\}) \mid \mathsf{Bool} \mid \Diamond \mid D \mid R \mid S \mid \mathsf{Array}[N]\,\tau \mid \mathsf{Fin}\,N \mid \mathsf{Fin}\,S \mid \mathsf{Free} \mid \tau \otimes \tau\\[4pt]
 \mathit{field} &::=& \tau \mid \mathsf{Be}_w \ (w \in \{16,32,64\})\\[4pt]
 e &::=& \cdots \text{(first specification §1)} \mid \langle e_1, e_2 \rangle \mid \mathsf{let}\ \langle x, y \rangle = e_1\ \mathsf{in}\ e_2\\
 &\mid& \mathsf{idx}(e, N) \mid \mathsf{get}(a, i) \mid \mathsf{swap}(a, i, e) \mid e_1 \,/\, e_2 \mid e_1 \,\%\, e_2\\
 &\mid& R@(d_1, \ldots, d_m)(\bar e) \mid \mathsf{let}\ \langle c, r \rangle = \mathsf{peel}(d)\ \mathsf{in}\ e\\
-&\mid& R@d\,\{f_1 = e_1, \ldots, f_k = e_k\} \mid C(\bar e)\\[4pt]
-\mathit{prog} &::=& \overline{\mathit{data}} \;\; \overline{\mathsf{enum}} \;\; \overline{\mathsf{state}\ x : \tau} \;\; \overline{\mathsf{fn}} \;\; \overline{\mathsf{handler}} \;\; [\mathsf{turn}]
+&\mid& R@d\,\{f_1 = e_1, \ldots, f_k = e_k\} \mid C(\bar e)\\
+&\mid& s[e] \mid \mathsf{len}(s) \mid \mathsf{idx}(e, S) \mid \mathsf{match}\ e\ \mathsf{with}\ 0 \Rightarrow e_0 \mid \mathsf{down}(j) \Rightarrow e_1\ \mathsf{end}\\[4pt]
+\mathit{prog} &::=& \overline{\mathsf{slot}\ S} \;\; \overline{\mathit{data}} \;\; \overline{\mathsf{enum}} \;\; \overline{\mathsf{state}\ x : \tau} \;\; \overline{\mathsf{fn}} \;\; \overline{\mathsf{handler}} \;\; [\mathsf{turn}]
 \end{array}
 ```
 
 - D is a data type and R a record. Each constructor of a data type must fit one cell of B bytes: 1 tag byte plus B − 1 payload bytes. A record is B payload bytes per cell, and takes as many cells as its fields need (section 4.8). B is a link-time constant: 16 in Phase 1, and 64 matches a cache line and most packet headers.
+- S is a slot type, declared `slot S;` (section 4.12). `Fin S` and `idx(e, S)` take the slot's size in bytes for N, which is a build constant. `slot` and `down` are words only where a declaration and a pattern start, so either can still be a name.
 - τ ⊗ τ is an **unboxed** pair. It can be returned and bound, but never stored in a cell, so it costs registers, not memory. This fills the gap the Phase 1 implementation found: the first specification's types had ⊗ but no term for it.
 - A program has no `main`. Its entry points are `handler` declarations of the type in section 3.1.
 - An integer literal is decimal, or hexadecimal after a lowercase `0x`, with digits of either case: `0x0800`, `0x45`, `0xFFFF`. Either way it is the value it says, and its type is decided by that value, as for any literal.
 
 ### 4.2 Linearity
 
-Values of type ◇, D, R, Array\[N\] τ and Free are linear: each is used exactly once on every path. Int\_w, Bool and Fin N are erasable. Linearity has one consequence that recursion depends on: **linear data are acyclic.** A cycle would need a pointer to a cell inside the value built in that cell, and the only such pointer is the constructed value itself, which is consumed by being stored.
+Values of type ◇, D, R, S, Array\[N\] τ and Free are linear: each is used exactly once on every path. Int\_w, Bool and Fin N are erasable. Reading a byte of a slot or its length borrows it, and is not its use (section 4.12). Linearity has one consequence that recursion depends on: **linear data are acyclic.** A cycle would need a pointer to a cell inside the value built in that cell, and the only such pointer is the constructed value itself, which is consumed by being stored.
 
 ### 4.3 Exhaustive matching
 
@@ -230,6 +234,10 @@ Every `match` must cover every constructor of its type, or the program is refuse
 | idx(e, N) : Fin N | e mod N, which is a mask when N is a power of two |
 | get(a, i), for scalar τ | ⟨a, a\[i\]⟩ |
 | swap(a, i, v), for any τ | ⟨a\[i := v\], a\[i\]⟩ |
+| s\[i\], for a slot s of B bytes and i : Fin B | byte i of s, which stays s's |
+| len(s) | how many of s's bytes the runtime filled, an Int16 |
+| match i with 0 => e0 \| down(j) => e1 | e0 if i is 0, and e1 with j = i - 1 if not |
+| pack<w>(i), for i : Fin N with N at most 2^w | the value of i, an Int64 |
 
 The x86 lowering pays for totality where the hardware would trap or mask:
 
@@ -247,6 +255,8 @@ State is declared, fixed in size, and threaded through each handler as a linear 
 ### 4.6 Structural recursion
 
 **Rule R3 (summed measure).** For each recursive function f, the compiler must find one fixed set S of f's linear parameters such that every recursive call f(ē) in f's body strictly decreases the total μ over S. Alternatively, a parameter x\_k of type Fin N decreases: e\_k = x\_k − 1 inside an arm where x\_k ≠ 0.
+
+That arm is `down(j)`, in `match x_k with | 0 => e0 | down(j) => e1`, which binds j = x\_k - 1. The checker follows how much less than x\_k each Fin is: j is one less, a `down` of j is two less, and a `let` is a renaming, so it keeps what it is bound to. Anything else, such as a value `idx` makes, is known to be less than nothing. A call that passes, as argument k, something known to be at least one less than x\_k shrinks the Fin at k, and every linear argument may be passed on as it was: that is how `examples/udp_verify.lfpl` walks its slot. The implementation takes a set of linear parameters if one falls at every call, and the lowest such Fin if none does, and `end decreasing` names it at the register-transfer level.
 
 μ composes, so the check is linear arithmetic inside the checker:
 
@@ -365,6 +375,28 @@ At the register-transfer level, `enum d, c, a...` makes one, and nothing else ca
 
 **Limits,** which section 8.2 lists: an enum cannot be stored in a cell. Its fields are integers, and each constructor has to fit the register with its tag.
 
+### 4.12 Slots
+
+```
+slot Payload;
+record Frame { ..., length: Int16, body: Payload };
+```
+
+A slot is 2048 consecutive bytes of the image, 128 cells: a power of two that holds a 1518-byte frame, so finding a byte in one needs no division. `slot S;` declares S, a linear type whose every value owns one whole slot: which one it is, and how many of its bytes the runtime filled, its length. A value of S can be bound, passed, returned, and held in a field of a record or of a constructor, like any linear value. Nothing can make one, take one apart, copy one or drop one: there is no constructor of one, no match on one and no literal of one. So the slots a handler holds are exactly the slots its item brought, and it hands back every one of them. They are counted apart from cells: a slot carries no potential, is not among an item's n cells, and is never drawn, and the checker counts an item's slots from its type, which the RTL backend reports beside R(n) and W(n).
+
+Two expressions read a slot, and both borrow it, so neither is its use:
+
+- `s[i]` is byte i of s, an Int8, for i : Fin S, which is Fin 2048. Every byte i can name is in the slot, so no bounds check exists and none can fail. A byte past the length is one the runtime did not fill for this frame, and what it holds is unspecified, as a field nothing wrote is.
+- `len(s)` is the length, an Int16.
+
+A read has to come before the slot's use, in the order an expression is evaluated, which is the order it is written: `f(s, s[i])` is refused, because the first argument has used s before the second reads it.
+
+With a Fin bounded by a slot's size and a match that counts it down (section 4.6), a program can walk every byte of a slot under a bound, and `examples/udp_verify.lfpl` checks a UDP checksum over the whole of its payload that way. Its handler draws nothing, and its work is a constant: section 5 bounds a countdown by where it starts, and `idx` can start one at 2047 at most.
+
+At the register-transfer level a slot is a register: its number in bits 0 to 31, and its length in bits 32 to 47. `sget d, s, i` and `slen d, s` read it, and nothing does anything else with one but move it. On the RTL target, slot k is the 128 cells from cell 128 k of the cell store, after the cells, so byte i of it is in the cell whose address is k and the top seven bits of i side by side, in the lane the bottom four say: one read, and a byte of what it returned (section 9.1).
+
+**Limits,** which section 8.2 lists: the x86 backend lowers no slot and no countdown yet, and neither runtime places a slot. A handler that owns one runs on the RTL target alone, with slots written into its store directly, which is how `tests/test_slots.py` runs `examples/udp_verify.lfpl`. Every slot is the same size.
+
 ## 5. Resource typing
 
 Every handler gets two linear bounds, derived by the compiler: R(n) = a·n + b cells drawn from its reserve, and W(n) = c·n + d steps. The method is the potential method of amortized analysis in the type system of Hofmann and Jost (POPL 2003). Linearity makes it simpler here than in their setting, because no value is ever shared.
@@ -378,10 +410,10 @@ Resource amounts are pairs q = (q\_c, q\_t) of non-negative rationals, compared 
 
 ### 5.2 Annotated types
 
-A data type carries potential on each cell: D^(p,s) means every cell of the value holds p cell-units and s step-units, available to whoever destructures it. Scalars, ◇ and arrays carry none.
+A data type carries potential on each cell: D^(p,s) means every cell of the value holds p cell-units and s step-units, available to whoever destructures it. A Fin carries potential on each unit of its value: Fin N^(p,s) holds (p, s) for each unit, available to whoever counts it down. Other scalars, ◇, arrays and slots carry none: a slot's bytes are not cells, and nothing can take one apart.
 
 ```latex
-\Phi(v : D^{(p,s)}) \;=\; \big(p \cdot \mu(v),\; s \cdot \mu(v)\big) \qquad \Phi(x_1{:}A_1, \dots, x_k{:}A_k) \;=\; \textstyle\sum_i \Phi(x_i : A_i)
+\Phi(v : D^{(p,s)}) \;=\; \big(p \cdot \mu(v),\; s \cdot \mu(v)\big) \qquad \Phi(i : \mathsf{Fin}\,N^{(p,s)}) \;=\; \big(p \cdot i,\; s \cdot i\big) \qquad \Phi(x_1{:}A_1, \dots, x_k{:}A_k) \;=\; \textstyle\sum_i \Phi(x_i : A_i)
 ```
 
 The judgment reads: with context Γ and q units free beforehand, e evaluates to a value of type A and leaves q′ units free, the value's own potential not counted.
@@ -416,12 +448,25 @@ The judgment reads: with context Γ and q units free beforehand, e evaluates to 
 {\Gamma_1, \Gamma_2 \;\vdash^{q}_{q'}\; \mathsf{let}\ x = e_1\ \mathsf{in}\ e_2 : A}
 \qquad
 \textsf{Relax}\ \dfrac{\Gamma \vdash^{p}_{p'} e : A \quad q \ge p \quad q' \le p'}{\Gamma \vdash^{q}_{q'} e : A}
+\\[22pt]
+\textsf{Idx} &
+\dfrac{q \;\ge\; q' + (N - 1)\,(p,s) + (0, c_{\mathsf{idx}})}
+{\Gamma \;\vdash^{q}_{q'}\; \mathsf{idx}(e, N) : \mathsf{Fin}\,N^{(p,s)}}
+\qquad \text{(it pays for the most it can be)}
+\\[22pt]
+\textsf{Down} &
+\dfrac{\Gamma \;\vdash^{q - (0,c_{\mathsf{m}})}_{q'}\; e_0 : A \qquad \Gamma,\ j{:}\mathsf{Fin}\,N^{(p,s)} \;\vdash^{\,q + (p,s) - (0,c_{\mathsf{m}})}_{q'}\; e_1 : A}
+{\Gamma,\ i{:}\mathsf{Fin}\,N^{(p,s)} \;\vdash^{q}_{q'}\; \mathsf{match}\ i\ \mathsf{with}\ 0 \Rightarrow e_0 \mid \mathsf{down}(j) \Rightarrow e_1 : A}
+\\[22pt]
+\textsf{Share} &
+\dfrac{\Gamma,\ i_1{:}\mathsf{Fin}\,N^{r_1},\ i_2{:}\mathsf{Fin}\,N^{r_2} \;\vdash^{q}_{q'}\; e[i_1, i_2 / i] : A \qquad r \;\ge\; r_1 + r_2}
+{\Gamma,\ i{:}\mathsf{Fin}\,N^{r} \;\vdash^{q}_{q'}\; e : A}
 \end{array}
 ```
 
 Two things differ from Hofmann and Jost:
 
-- **There is no sharing rule.** Linear data are never duplicated, so potential never has to be split between two uses of one value.
+- **Only a Fin is shared.** Linear data are never duplicated, so their potential never has to be split between two uses of one value. A Fin is erasable, and read as often as a program likes, so its potential is split by Share wherever one Fin has two uses: what one use takes, the other cannot. At the register-transfer level a copy, an argument, a result or a countdown takes an amount per unit of a register's Fin, and the register keeps a fresh amount for what is left, with one inequality saying the two are no more than it held. A Fin with none on it, such as one read from a cell, is still a number, so wherever an amount is wanted of it, the amount has to be nothing: a countdown it starts cannot be paid for, and its handler has no bound.
 - **DRAW types only the `More` arm against the budget.** The `End` arm must still type-check, but Theorem 5.1 shows it is unreachable when the reserve is large enough. Its cost therefore never enters the bound. This rests on every Free a program holds being that reserve, and the certificate checks it: linearity keeps there from being two of one, so a handler that makes a Free on a path that can run gets no bound. A compiled handler should never reach that refusal, because it could not get rid of a second one: a `More` arm leaves as many as it found, R3 does not count a Free anywhere a handler can reach, an output cannot hold one, and a handler returns exactly one. The inequalities of an `End` arm are kept apart, not thrown away. A handler's bound leaves them out by DRAW, and the runtime's turn (section 9.6) counts them, since the Frees it walks are what a handler gave back, and they do run out. That counts the handler's own too, which costs nothing for a handler the turn serves: it draws nothing, so it never matches its reserve.
 
 ### 5.4 Soundness
@@ -446,6 +491,7 @@ The LP solver need not be trusted. The typing derivation with its numbers filled
 | `forward` (section 4.7) | rebuilds the header cell, reads one table entry | 0 | a constant |
 | checksum over the body | walks every body cell once | 0 | c·n + d |
 | duplicate to two ports | copies the body into fresh cells | n + 1 | c·n + d |
+| `udp_verify` (section 4.12) | checks the UDP checksum over its slot, a byte at a time | 0 | a constant: idx starts the count at 2047 at most |
 
 Only the copy needs a reserve. Each copied cell is one DRAW, so the body's type is inferred as Bytes^(1, s), with one cell of potential per cell.
 
@@ -600,6 +646,9 @@ With exact last uses, a scalar is moved out before its location is overwritten, 
 | the fields an update names | in the order the record declares them, each at most once | right-to-left pass |
 | a constructor of an enum fits one register with its tag | 8 bytes | checker |
 | storing an enum in a cell | refused until built | checker |
+| a slot's size, which every slot has | 2,048 bytes, a power of two, 128 cells | checker |
+| a slot or a countdown on x86-64 | refused until lowered | x86 backend |
+| slots in the hardware target's store, for a handler that owns one | declared, with `--slots` | src/rtverilog.py |
 | a handler the turn serves: no state slots, R(n) = 0, a record with one chain, and a verdict of `port: Int8` or nothing beside that record | — | src/turn.py |
 | places in the hardware target's output queue, K\_out | declared, 4 by default, and at least 2: the head and a place after it | src/turn.py |
 | the bytes N\_max cells hold on the hardware target, and one more | below 2^16, since ingress counts a frame to one byte past what it holds, in a 16-bit length | src/turn.py |
@@ -672,6 +721,9 @@ LFPL's operational semantics is already a register-transfer semantics: a fixed s
 | DESCEND and ASCEND | a pointer-reversal walk through the cells; no hardware stack exists or is needed |
 | a function | a unit (a state machine plus its datapath), inlined, or shared by sequential call sites |
 | Array\[N\] τ | a block RAM of N words; `swap` is a read, then a write |
+| a slot | 128 words of the cell store, from word 128 k for slot k, after the cells. Its value is a register of its number and its length |
+| `s[i]` | a block-RAM read at the address that is k and i's top seven bits side by side, then lane i's bottom four bits say of what it returned |
+| a countdown | the comparison of i with 0 that chooses the next state, and i - 1 into j, in one clock |
 | Free | a chain of free addresses through the cells, as on x86 |
 | ingress and egress | AXI4-Stream ports with valid and ready signals |
 | admission | a check of n against the pool counter, done before `ready` is raised; R(n) = a·n + b needs one small multiplier |
@@ -875,10 +927,11 @@ The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and 
 | --- | --- | --- |
 | exactly-once linear typing | present in Check, and repeated one level down by `src/rtcheck.py` | nothing |
 | exhaustive matching | present | nothing |
-| structural recursion (R3) | present, with the summed measure, not counting Free, so `spin` is refused | the Fin N case |
+| structural recursion (R3) | present, with the summed measure, not counting Free, so `spin` is refused, and with the Fin N case: a Fin passed one less, counted down by `down(j)` | nothing |
 | total primitives | shifts are total, and `idx` and `get` cannot go out of range. There is no division yet. | division with the semantics of section 4.4 |
 | non-tail recursion | refused, as a declared limit | DESCEND and ASCEND |
-| arrays and Fin N | `Array[N] t` of scalars, read with `idx` and `get`. N must be a power of two. A Fin N may live in a cell. | `swap`, linear elements, and any N once division exists |
+| arrays and Fin N | `Array[N] t` of scalars, read with `idx` and `get`. N must be a power of two, and may be a slot's size. A Fin N may live in a cell, carries potential on its value, is counted down by a match, and becomes an integer by `pack`. | `swap`, linear elements, and any N once division exists |
+| slots (section 4.12) | present in the compiler and on the RTL target: `slot S;`, `s[i]` and `len(s)`, held in records, and placed in the store after its cells. `examples/udp_verify.lfpl` compiles, its handler is certified with R(n) = 0 and a constant W, and its Verilog decides as RFC 768 says on slots written into its store. The x86 backend refuses a slot and a countdown. | the runtimes: ingress filling a slot, egress sending from one, the turn handing them on; and x86 |
 | unboxed pairs | present, as flat tuples of at most six, returned and bound and never stored | nothing |
 | records that span cells, and fields in network order | present, for records: `src/spans.py` rewrites one record into its chain of cells ahead of Check, and `examples/ipv4.lfpl` is one record of five cells. A field is still read from its cell, which the runtime copied it into. | reading a field in place from the frame, which changes the resource model; a record built from loose cells has to name each one |
 | record update and hex literals | present: `src/spans.py` rewrites `R@d { f = e }` into the constructor written out, for a record of any size, and `src/symcheck.py` does it again on its own | naming the fields in any order |
@@ -925,7 +978,7 @@ The plan, with what is done marked. Arrays and tuples came ahead of resource ana
 3. **Stack in the image, and the startup sequence.** Done. This closes F3, F4 and F10 on x86-64.
 4. **A serving loop with admission.** Done, with measured constant bounds instead of hand-written ones. This closes F6 and F7 for a handler that does not recurse.
 5. **Resource analysis,** which replaces the measured bounds with derived and certified ones. Done. `examples/checksum.lfpl` is the first handler that needs it, with R(n) = 0 and W(n) = c n + d.
-6. **Arrays, Fin N with R3's Fin N case, unboxed pairs and division,** for router tables. Arrays, Fin N and tuples are done, to the extent the table says. R3's Fin N case, division and `swap` are not.
+6. **Arrays, Fin N with R3's Fin N case, unboxed pairs and division,** for router tables. Arrays, Fin N, R3's Fin N case and tuples are done, to the extent the table says. Division and `swap` are not.
 7. **DESCEND and ASCEND,** which lift the limit on non-tail recursion.
 8. **The right-to-left pass,** for exact last uses and the inferred result cell. Done, for those two. This removes the refusal of a scalar read after its cell closes (T8).
 9. **The RTL backend,** built from the register-transfer layer and checked by differential simulation against x86-64.

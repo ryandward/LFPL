@@ -27,6 +27,15 @@ recursive call says that pays for the iteration. Other linear parameters and res
 potential too, because a walk that moves cells onto an accumulator has to hand the second pass's
 budget over with them. This is also a second proof of termination: a recursive call that released
 nothing would have to pay for itself, and no numbers satisfy that.
+
+A Fin carries potential too, an amount per unit of its value, so that a countdown pays for itself the
+way a walk does. `idx` makes one that can be as large as N - 1, so it pays that many units up front,
+and `br.down` releases one unit as the value goes one lower. A Fin is a scalar, which a program may
+read as often as it likes, so its amount is shared, never copied: whatever takes some of it, a copy, an
+argument or a countdown, leaves the register what is left, and the two together are no more than it
+was. That is Hofmann and Jost's share rule, which linear data never need. A Fin with none still has a
+value, unlike a null, so wherever an amount is wanted of it, the amount has to be nothing. A slot
+carries none: its bytes are not cells, and nothing can make one or take one apart.
 """
 from __future__ import annotations
 
@@ -46,7 +55,7 @@ RESERVE = "Free"
 NO_WORK = {"drop", "open", "move"}  # these move tokens and lower to nothing, so they cost no step
 MAX_OBLIGATIONS = 1024  # one handler's, with its callees': the size of a linear program, section 8.2
 
-Type = Union[str, tuple]  # a builtin name, ("named", id), ("enum", id), ("array", N, t) or ("fin", N)
+Type = Union[str, tuple]  # a builtin name, ("named", id), ("enum", id), ("array", N, t) or ("fin", N). A slot is named
 ENUM_BYTES = 8  # an enum is one register: its tag in byte 0, and its fields after it
 Word = tuple
 
@@ -178,6 +187,7 @@ class TypeDecl:
     kind: str
     name: str
     ctors: list = field(default_factory=list)
+    bytes: int = 0  # a slot's size
 
 
 @dataclass
@@ -350,6 +360,33 @@ class Checker:
         """The admission table of a handler whose certificate has passed."""
         return self.certified[name]
 
+    def held_slots(self, name: str) -> Optional[int]:
+        """Slots are counted apart from cells. Nothing draws one, makes one or drops one, so a handler holds the
+        slots its item brought and gives back every one of them: this many, by its item's type. None if the type
+        does not say, as for a list that can hold any number."""
+        return self._slots_in(self.norm(self._handler_named(name).params[-2]))
+
+    def _slots_in(self, ty: Type) -> Optional[int]:
+        decl = self._decl(ty)
+        if decl is None:
+            return 0
+        if decl.kind == "slot":
+            return 1
+        if decl.kind == "record":
+            counts = [self._slots_in(self.norm(field_type)) for _off, _size, field_type, _name in decl.ctors[0].fields]
+            return None if None in counts else sum(counts)
+        return None if self._reaches_a_slot(ty, set()) else 0
+
+    def _reaches_a_slot(self, ty: Type, seen: set) -> bool:
+        decl = self._decl(ty)
+        if decl is None or decl.name in seen:
+            return False
+        if decl.kind == "slot":
+            return True
+        seen.add(decl.name)
+        return any(self._reaches_a_slot(self.norm(field_type), seen)
+                   for ctor in decl.ctors for _off, _size, field_type, _name in ctor.fields)
+
     # --- the potential method
 
     def unknown(self) -> int:
@@ -357,11 +394,13 @@ class Checker:
         return self.next_unknown
 
     def _carries(self, ty: Type) -> bool:
-        """Scalars have no cells, a capability's cell is empty, and an array is not made of cells."""
-        return self._decl(ty) is not None
+        """Scalars have no cells, a capability's cell is empty, and neither an array nor a slot is made of cells."""
+        decl = self._decl(ty)
+        return decl is not None and decl.kind != "slot"
 
     def _pot_for(self, ty: Type) -> Optional[int]:
-        return self.unknown() if self._carries(ty) else None
+        """An amount per cell for what holds cells, and per unit of its value for a Fin."""
+        return self.unknown() if self._carries(ty) or is_fin(ty) else None
 
     def obligate(self, row: Budget, *, beyond_end: bool = False) -> None:
         fn = self.fn
@@ -393,6 +432,34 @@ class Checker:
             return
         self.obligate(Budget().plus(have).plus(need, -1))
 
+    def units_at_least(self, have: Optional[int], need: Optional[int]) -> None:
+        """A Fin carrying `have` per unit, used where `need` per unit is wanted. None on the left is a Fin that
+        carries nothing, and is still a number: so nothing can be wanted of it."""
+        if need is None or have == need:
+            return
+        self.obligate(Budget().plus(have).plus(need, -1))
+
+    def owed(self, ty: Type, have: Optional[int], need: Optional[int]) -> None:
+        """A value of type `ty` that carries `have`, where `need` is wanted, whichever way that type carries it."""
+        if is_fin(ty):
+            self.units_at_least(have, need)
+        else:
+            self.at_least(have, need)
+
+    def share(self, text: str, token: "Tok", need: Optional[int]) -> None:
+        """`need` per unit of a Fin's amount, taken by what reads it now. If the Fin stays in its register, the
+        register keeps what is left, and the two together are no more than it carried: so nothing is spent twice."""
+        register = _REG.match(text.rstrip("!"))
+        assert self.S is not None
+        held = register is not None and self.S.regs.get(int(register.group(1))) == token
+        if token.pot is None or not held:
+            self.units_at_least(token.pot, need)
+            return
+        left = self.unknown()
+        self.obligate(Budget().plus(token.pot).plus(need, -1).plus(left, -1))
+        assert register is not None
+        self.S.regs[int(register.group(1))] = replace(token, pot=left)
+
     # --- helpers
 
     def fail(self, message: str) -> RTError:
@@ -420,6 +487,14 @@ class Checker:
     def is_reserve(self, ty: Type) -> bool:
         decl = self._decl(ty)
         return decl is not None and decl.name == RESERVE
+
+    def _slot(self, text: str, what: str) -> TypeDecl:
+        """The slot a register holds, which reading it leaves there."""
+        r, token = self.full(text)
+        decl = self._decl(token.ty)
+        if decl is None or decl.kind != "slot":
+            raise self.fail(f"{what} of r{r}, which is {token.ty} and not a slot")
+        return decl
 
     def unify(self, a: Type, b: Type, where: str) -> Type:
         if a == b:
@@ -543,7 +618,7 @@ class Checker:
                     raise self.fail(f"r{r} holds {present.ty} on one edge and nothing on another")
                 continue
             ty = self.unify(x.ty, y.ty, f"r{r} at a join") if x.ty != y.ty else x.ty
-            regs[r] = Tok(ty, self._merge_word(x.word, y.word), self._merge_pot(x.pot, y.pot, a, b))
+            regs[r] = Tok(ty, self._merge_word(x.word, y.word), self._merge_pot(x.pot, y.pot, a, b, units=is_fin(ty)))
         cells = {}
         for word in set(a.cells) & set(b.cells):
             cells[word] = self._merge_cell(word, a.cells[word], b.cells[word], a, b)
@@ -563,11 +638,18 @@ class Checker:
         return State(regs, cells, nulls, ruled, self._merge_budget(a, b),
                      a.unreachable and b.unreachable)
 
-    def _merge_pot(self, x: Optional[int], y: Optional[int], a: State, b: State) -> Optional[int]:
-        """After a join, a value carries what every edge that can run vouches for."""
-        if b.unreachable or x == y or y is None:
+    def _merge_pot(self, x: Optional[int], y: Optional[int], a: State, b: State, *, units: bool = False) -> Optional[int]:
+        """After a join, a value carries what every edge that can run vouches for. A Fin that carries nothing on
+        one edge carries nothing after it, where a null on one edge has no cells to vouch for."""
+        if b.unreachable or x == y:
             return x
-        if a.unreachable or x is None:
+        if a.unreachable:
+            return y
+        if units and (x is None or y is None):
+            return None
+        if y is None:
+            return x
+        if x is None:
             return y
         joined = self.unknown()
         self.at_least(x, joined)
@@ -628,7 +710,12 @@ class Checker:
     # --- declarations
 
     def _declaration(self, head: str, parts: list[str]) -> None:
-        if head == "type":
+        if head == "type" and parts[1] == "slot":
+            size = int(parts[3])
+            if size <= 0 or size & size - 1:
+                raise self.fail(f"slot {parts[2]} of {size} bytes: a byte's place in one is a mask, so a power of two")
+            self.types[parts[0]] = TypeDecl("slot", parts[2], bytes=size)
+        elif head == "type":
             self.types[parts[0]] = TypeDecl(parts[1], parts[2])
         elif head == "alias":
             self.aliases[parts[0]] = parts[1]
@@ -679,7 +766,7 @@ class Checker:
         for off, size, ty, _name in ctor.fields:
             norm = self.norm(ty)
             locs[(off, size)] = Loc(True, ("field", opening, off), norm,
-                                    None if is_scalar(norm) else pot)
+                                    None if is_scalar(norm) or not self._carries(norm) else pot)
         tag = ("is", int(ctor.tag)) if ctor.tag.isdigit() else None
         return Cell(tag, locs)
 
@@ -804,6 +891,9 @@ class Checker:
         pots = [fn.param_pots[p] for p in positions]
         if any(pot is None for pot in pots):
             raise self.fail(f"a decreasing set of {fn.name} names a parameter with no cells")
+        if len(positions) > 1 and any(is_fin(self.norm(fn.params[p])) for p in positions):
+            raise self.fail(f"a decreasing set of {fn.name} is parameters with cells, whose amounts are per cell, or one "
+                            f"Fin, whose amount is per unit")
         for first, second in zip(pots, pots[1:]):
             self.at_least(first, second)
             self.at_least(second, first)
@@ -853,6 +943,10 @@ class Checker:
         _r, token = self.full(a[1])
         if not is_scalar(token.ty):
             raise self.fail(f"copy of {token.ty}: only a scalar can be copied")
+        if is_fin(token.ty) and token.pot is not None:
+            copied = self.unknown()
+            self.share(a[1], token, copied)
+            token = replace(token, pot=copied)
         self.set(a[0], token)
 
     def i_drop(self, a: list[str]) -> None:
@@ -900,12 +994,14 @@ class Checker:
         widths = [int(w) for w in a[1].strip("<>").split()]
         if len(widths) != len(a) - 2:
             raise self.fail("pack needs one operand per width")
-        for operand in a[2:]:
+        for width, operand in zip(widths, a[2:]):
             ty = self.scalar(operand, "a pack field").ty
             if ty in WIRE:
                 raise self.fail(f"a pack field {operand} is in network order, and has to be swapped first")
             if is_enum(ty):
                 raise self.fail(f"a pack field {operand} is an enum, and a field is an integer")
+            if is_fin(ty) and ty[1] > 1 << width:
+                raise self.fail(f"a pack field {operand} is a Fin {ty[1]}, whose largest value does not fit {width} bits")
         self.set(a[0], Tok("i64", self.fresh()))
 
     def _an_enum(self, text: str, what: str) -> tuple:
@@ -970,7 +1066,10 @@ class Checker:
         token = self.scalar(a[2], "idx's operand")
         if not is_int(token.ty):
             raise self.fail(f"idx of {token.ty}")
-        self.set(a[0], Tok(("fin", bound), self.fresh()))
+        pot = self.unknown()  # it can be as large as bound - 1, and that many units are paid for now
+        assert self.S is not None
+        self.S.budget = self.S.budget.plus(pot, -(bound - 1))
+        self.set(a[0], Tok(("fin", bound), self.fresh(), pot))
 
     def i_aget(self, a: list[str]) -> None:
         _r, array = self.full(a[1])
@@ -983,6 +1082,22 @@ class Checker:
         if SIZES[element] != int(a[3]):
             raise self.fail(f"aget of {a[3]} bytes from an array of {element}")
         self.set(a[0], Tok(element, self.fresh()))
+
+    # --- slots
+
+    def i_sget(self, a: list[str]) -> None:
+        """sget d, s, i: byte i of slot s, which it reads and leaves where it is. i is a Fin of the slot's size,
+        so every byte it can name is in the slot."""
+        decl = self._slot(a[1], "sget")
+        _i, index = self.full(a[2])
+        if index.ty != ("fin", decl.bytes):
+            raise self.fail(f"sget at {index.ty}: a slot of {decl.bytes} bytes is read at a Fin {decl.bytes}")
+        self.set(a[0], Tok("i8", self.fresh()))
+
+    def i_slen(self, a: list[str]) -> None:
+        """slen d, s: how many of slot s's bytes the runtime filled, which it reads and leaves where it is."""
+        self._slot(a[1], "slen")
+        self.set(a[0], Tok("i16", self.fresh()))
 
     # --- cells
 
@@ -1065,7 +1180,8 @@ class Checker:
                                     f"{'`=`' if held.full else 'RESTORE'}, Theorem 6.1")
                 self.unify(token.ty, ty, where)
                 self.fits(token, ty, where)
-                self.at_least(token.pot, carried)
+                if not is_scalar(ty):  # a Fin's amount is per unit, and nothing in a cell keeps it
+                    self.at_least(token.pot, carried)
         if star is not None and stars != 1:
             raise self.fail("tailmod needs exactly one `*`")
         for key, loc in cell.locs.items():
@@ -1161,6 +1277,27 @@ class Checker:
         self.edge(a[4])
         self.S = None
 
+    def i_br_down(self, a: list[str]) -> None:
+        """br.down p, d, Lz, Ld: to Lz if the Fin p is 0, and to Ld with d one less if not. p stays where it is. On
+        the way to Ld, d carries what it takes of p's amount per unit, and the unit d is less releases that amount, so
+        a countdown pays for each step as a walk does for each cell. p keeps what is left, by the share rule."""
+        _r, token = self.full(a[0])
+        if not is_fin(token.ty):
+            raise self.fail(f"br.down on {token.ty}: only a Fin counts down")
+        down = None
+        if token.pot is not None:
+            down = self.unknown()
+            self.share(a[0], token, down)
+        assert self.S is not None
+        base = self.S
+        self.S = base.copy()
+        self.edge(a[2])
+        self.S = base
+        self.set(a[1], Tok(token.ty, self.fresh(), down))
+        self.S.budget = self.S.budget.plus(down)
+        self.edge(a[3])
+        self.S = None
+
     def _dispatched(self, r: int, token: Tok, ctor: Ctor) -> None:
         """The cell opens, and what it carried becomes spendable."""
         assert self.S is not None
@@ -1240,7 +1377,10 @@ class Checker:
             want = self.norm(ty)
             token = self.operand(operand)
             self.fits(token, want, f"an argument of {signature.name}")
-            self.at_least(token.pot, signature.param_pots[position])
+            if is_fin(want):
+                self.share(operand, token, signature.param_pots[position])
+            else:
+                self.at_least(token.pot, signature.param_pots[position])
             if want == "cap" or token.ty == "cap":
                 if token.ty != want:
                     raise self.fail(f"argument {operand} is {token.ty}, and {signature.name} "
@@ -1386,7 +1526,10 @@ class Checker:
             r, token = self.full(operand)
             self.unify(token.ty, self.norm(ty), "a result")
             self.fits(token, self.norm(ty), "a result")
-            self.at_least(token.pot, fn.result_pots[position])
+            if is_fin(token.ty):  # one register can be two results, and its amount is shared between them
+                self.share(operand, token, fn.result_pots[position])
+            else:
+                self.at_least(token.pot, fn.result_pots[position])
             if not is_scalar(token.ty):
                 assert self.S is not None
                 del self.S.regs[r]
@@ -1420,8 +1563,9 @@ class Checker:
             self._word_leaving(tokens[signature.at].word, "tail")
         self._no_linear_left("tail")
         if signature is not fn:  # what it returns, this function returns
-            for theirs, ours in zip(signature.result_pots, fn.result_pots):
-                self.at_least(theirs, ours)
+            results = self.tuples.get(self._resolve(fn.ret), [fn.ret])
+            for theirs, ours, ty in zip(signature.result_pots, fn.result_pots, results):
+                self.owed(self.norm(ty), theirs, ours)
         assert self.S is not None
         self.obligate(self.S.budget)
         self.S = None

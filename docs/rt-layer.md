@@ -64,6 +64,7 @@ gave them, and declarations come first:
     alias t16 t40                   a forward declaration t16 turned out to mean t40
     array t32768 1024 i8            Array[1024] Int8
     fin t32769 1024                 Fin 1024
+    type t20 slot Payload 2048      a slot type: its every value owns one slot of that many bytes
     tuple t32770 t32768 t22 t30     the result of a function that returns several things
     ctor c18 t17 - Hdr              id, type, tag or `-` or `null`, name
     field c18 0 1 i8 ttl            offset, size, type, name
@@ -127,6 +128,21 @@ way to get a `Fin N` is `idx` or a parameter of that type, and the type carries 
 the array. Consuming a and giving it back in the source's `get` is a renaming at this level, so
 the register stays full. N must be a power of two until division exists, because `idx` is then
 a mask.
+
+### Slots
+
+    sget d, s, i        s = w : S, a slot of B bytes, i : Fin B, free d  -->  s = w : S, d = fresh : Int 8
+    slen d, s           s = w : S, free d                                -->  s = w : S, d = fresh : Int 16
+    br.down p, d, Lz, Ld  p : Fin N, free d
+                        Lz: p unchanged, and d free
+                        Ld: p unchanged, d = fresh : Fin N, one less than p
+
+`sget` and `slen` read a slot and leave it where it is: the source's `s[i]` and `len(s)` borrow it. B is a
+power of two and i a Fin B, so `sget` needs no bounds check, for the reason `aget` needs none. Nothing here
+makes a slot or takes one apart, and `const`, `copy` and `drop` refuse one, so the slots a function holds are
+what it was given, and it hands each of them on, as it does any linear value. `br.down` is the source's
+`match i with | 0 => ... | down(j) => ...`. It writes d only on the way to Ld, and p stays where it is, a scalar
+anything may read again.
 
 ### Cells
 
@@ -246,8 +262,9 @@ that only moves forward: nothing is solved here. The pass writes down inequaliti
 proposes numbers, and the pass evaluates every inequality with them.
 
 Every value made of cells carries an unknown amount per cell, the same unknown for both
-resources, which are solved separately: cells drawn and steps run. Scalars, capabilities and arrays
-carry nothing, and a null has no cells to carry anything on. A budget, a sum of unknowns plus a
+resources, which are solved separately: cells drawn and steps run. A Fin carries one per unit of its
+value. Other scalars, capabilities, arrays and slots carry nothing, and a null has no cells to carry
+anything on. A budget, a sum of unknowns plus a
 constant for each resource, follows each path from the function's own unknown entry amount:
 
     a working instruction    budget - 1 step: everything but move, drop and open, which lower to nothing
@@ -258,11 +275,24 @@ constant for each resource, follows each path from the function's own unknown en
                              linear field it names must carry at least q
     call, tail               budget - the callee's entry; every argument must carry at least what its
                              parameter wants, and a result carries what the callee's result does
+    idx d, N, a              a fresh amount q per unit for d: budget - (N - 1) q, the most d can be
+    br.down p, d             on the way to Ld, d takes an amount of p's: budget + that amount, which is the
+                             unit d is less
     ret, tail, tailmod       every result must carry at least what the function's result does, and
                              what is left in the budget must not be negative
     a label                  each edge's budget must cover a fresh one, unless all the edges have
                              the same unknowns, when the join takes the smallest constant; each
                              register's amount must cover a fresh one if the edges disagree
+
+A Fin is a scalar, read as often as the code likes, so its amount is shared and never copied. Whatever
+takes some of a register's, a `copy`, an argument, a result or `br.down`, leaves the register a fresh amount
+for the rest, and one row says the two are no more than it held. A Fin with nothing on it, such as one read from
+a cell, is still a number, unlike a null: so wherever an amount is wanted of it, the amount has to be nothing,
+and a countdown it starts cannot be paid for.
+
+Slots are counted apart from cells. None is drawn or made, so a handler's slots are its item's, and
+`Checker.held_slots` counts them from the item's type: one for each slot field of its record, through the records
+it holds, and none known for a type that can hold any number.
 
 Each "must" is one row of a linear program, whose unknowns may not be negative. A handler's
 reserve carries nothing, because those cells are paid for by being drawn. So the program's rows
@@ -275,7 +305,9 @@ ties the parameters it names to one amount per cell, because R3 only says that t
 and the cell that left may have been any of them. Other linear parameters may carry their own
 amounts, and they have to, because a walk that moves cells onto an accumulator hands the next walk's
 budget over with them. So a recursive function that released nothing could not pay for itself, which
-is a second proof of termination, and it is why `end` must name a set if the function recursed.
+is a second proof of termination, and it is why `end` must name a set if the function recursed. The set
+may instead be one Fin parameter, R3's other measure, which ties nothing: its amount is per unit, and
+`br.down` releases one unit's at each step down.
 
 A call of a function that has already ended gets its own copy of that function's unknowns and rows,
 which is the callee's derivation again with other numbers in it. With one set of numbers per
@@ -335,6 +367,8 @@ partial result is ever special. All the failures Phase 1 reports about registers
     etag, efield           movzx of the low byte; mov, shr by the field's offset, then movzx or mov r32
     idx                    mov d, a; and d, N - 1
     aget                   a sized mov through [a + i * s]
+    sget, slen, br.down    refused, as a limit, until src/runtime.py places slots and src/symcheck.py reads
+                           a countdown: a build of either stops before any assembly
     br                     cmp; jcc, with the fall-through chosen by the next label. On two literals, a
                            jump, and the other label's arm is code nothing reaches
     br.null                test p, p; jcc
@@ -397,6 +431,10 @@ The emitter first writes a state for each instruction:
                        pointer is null
     br.tag             one state, and a read in front of it if the word is not already at the port
     aget               two states: an array is its own block RAM, so a read, and then its word
+    sget               two states: the read of the slot's cell, at the address that is the slot's number
+                       and i's high bits side by side, and then the byte of it that i's low four bits say
+    slen               one state: bits 32 to 47 of the slot's register
+    br.down            one state: p = 0 chooses the next, and d <= p - 1 at the same edge
     call               one state: <= on the callee's parameters, and on its return state if it has
                        more than one. The results come back by the callee's `ret`
     tail               one state: <= on every parameter, and the entry state. `tail f0, r23, r24,
@@ -419,6 +457,12 @@ the next clock, at a branch or jump, at a call or return, and before a label; a 
 or another write follows. What a joined state computes for a later instruction in the same clock is a wire,
 and a register gets the last value written to it. Nothing is reordered and nothing is inlined, so a call of
 even a one-instruction function costs two clocks, its call and its return.
+
+A slot is a register of 48 bits, its number below its length, and its bytes are cells of the same store:
+slot k is the 128 cells from cell 128 k, all of them after the cells, so its cells are found with no adder.
+`translate` places `slots` of them, and refuses a program whose values own slots when it is asked for none.
+A `take` of a slot's field is as wide as a slot, which the emitter knows from the constructor of the cell it
+is taken from, and it refuses a take it cannot place where some constructor has a slot at that offset.
 
 A turn's machine has one more thing. `src/machine.py` says where the record the turn gives its handler lives,
 and those cells are registers, a 128-bit word each, behind the same two ports as the block RAM, which decode

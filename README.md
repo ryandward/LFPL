@@ -408,6 +408,30 @@ deliberately broken build, with every argument of the turn wired to its first, n
 first turn ended in 47 cycles and every one after it in 5, and egress sent the same head forever. `tests/test_machine.py` breaks the generated
 Verilog that way and others, and each time the machine stops, counts it and goes on.
 
+### A frame's bytes, owned whole
+
+A checksum over a whole payload needs a program that can read every byte of it, and know that doing so ends. So a
+frame can own a slot: 2048 bytes in a row, 128 cells. `slot Payload;` names the type, and a record holds one like any
+other linear field. `body[i]` reads byte i, `len(body)` says how many bytes the runtime put there, and neither uses
+the slot up. The index is a `Fin Payload`, a number below 2048, so no read can leave the slot, and a match counts it
+down, `| 0 => ... | down(j) => ...`, which is how the compiler knows the walk ends and what it costs.
+`examples/udp_verify.lfpl` checks every UDP datagram's checksum that way, over the pseudo-header, the UDP header and
+every byte of the payload:
+
+```
+$ python3 -m src.rtverilog examples/udp_verify.lfpl -o udp.v --n-max 217 --slots 4
+handler udp_verify: R(n) = 0 cells, W(n) = 22699 steps, 1 slot an item holds and gets back, 14322 cells of 128 bits, 4 slots from number 112, 14-bit pointers, 93 states
+walk add_up: 7 clocks per iteration, 5 to leave
+clocks(n) <= 14407, certified, from the edge that samples start to the edge that raises done
+```
+
+It draws no cell, and its slot is counted apart from the cells: nothing can make or drop one, so each frame's one
+comes back. Its work is the same for every frame: `idx` can start the count at 2047 at most, and pays for
+that many steps down before the first, and each step down releases what one costs. `tests/test_slots.py` runs that
+Verilog on slots written into its store directly, and every frame there is decided as RFC 768 says, from a right
+checksum over an odd number of bytes to a slot that holds fewer bytes than its datagram claims, within the bound in
+clocks. Neither runtime fills a slot from a frame yet, and the x86 backend refuses a program that has one.
+
 ## How the compiler holds itself to the same rules
 
 Most compilers read a whole file into a syntax tree, which costs memory in proportion

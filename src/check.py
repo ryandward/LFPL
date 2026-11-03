@@ -34,18 +34,23 @@ format, one event at a time, so they reach every reader of the stream:
   * a built-in Free, and a type declared but never defined, which is the runtime's own to build.
     A program with a main has no runtime, so there it is refused;
   * an enum, a sum whose every value fits one register: its tag in the low byte and its fields above it.
-    It is a scalar, so it has ids of its own, and making one costs no cell.
+    It is a scalar, so it has ids of its own, and making one costs no cell;
+  * a slot, a linear type that owns one whole slot of SLOT_BYTES bytes, which no expression can make or
+    take apart. `s[i]` and `len(s)` borrow it, so neither is a use of s. A Fin's bound may be a slot's size;
+  * a match on a Fin, which counts it down: `| 0 => ...` and `| down(j) => ...`, with j one less. It is the
+    other measure rule R3 takes, beside the cells: a Fin parameter that every recursive call passes one less of.
 """
 from __future__ import annotations
 
 import struct
 from typing import NamedTuple, Optional
 
-from .dyck import (CLOSE, ELEMENT_CODES, OP_NAMES, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP,
+from .dyck import (CLOSE, DOWN, ELEMENT_CODES, OP_NAMES, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP,
                    K_CTOR, K_CTORDECL, K_DATA, K_DIAMOND, K_ENUM, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER,
                    K_IDX, K_IF, K_INT, K_LET, K_LIVE, K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR,
-                   K_PACK, K_PARAM, K_RECORD, K_RESWORD, K_RTDECL, K_RTDECLMORE, K_STATE, K_TARRAY, K_TFIN,
-                   K_TTUPLE, K_TUPLE, K_TURN, K_TYPE, K_VALUE, K_VAR, K_VARAT, K_VARLAST, K_WITH, LEAF, OPEN, SEP, VALUE,
+                   K_PACK, K_PARAM, K_RECORD, K_RESWORD, K_RTDECL, K_RTDECLMORE, K_SGET, K_SLEN, K_SLOT, K_STATE,
+                   K_TARRAY, K_TFIN, K_TFINNAME, K_TTUPLE, K_TUPLE, K_TURN, K_TYPE, K_VALUE, K_VAR, K_VARAT, K_VARLAST,
+                   K_WITH, LEAF, OPEN, SEP, VALUE,
                    FUNCTIONS,
                    VARAT, ev_class, ev_kind, ev_tag)
 from .ring import FrameStack, Reject, Ring, Stage
@@ -64,7 +69,11 @@ _WIRE = {T_BE16: T_I16, T_BE32: T_I32, T_BE64: T_I64}
 # A literal whose type nothing has fixed yet, by the bytes it needs.
 _LITERALS = {T_LIT8: 1, T_LIT16: 2, T_LIT32: 4, T_LIT: 8}
 _NARROWING = {b"low8": T_I8, b"low16": T_I16, b"low32": T_I32}
-_PRIMITIVES = {b"idx", b"get", b"peel", *_NARROWING}
+_PRIMITIVES = {b"idx", b"get", b"peel", b"len", *_NARROWING}
+# A slot: a power of two that holds a 1518-byte frame, so a byte's place in it needs no division. 128 cells of 16.
+SLOT_BYTES = 2048
+_TYPES_WRITTEN = (K_TYPE, K_TARRAY, K_TFIN, K_TFINNAME)  # the leaves that say a type
+_DECLARATIONS = (K_DATA, K_CTORDECL, K_RECORD, K_STATE, K_ENUM, K_SLOT)
 # Types with no entry in G, and enums. A range of ids per kind, so whether a type is linear can be read from
 # its id alone, as it already can for every other type. An enum's id is its G position past FIRST_ENUM.
 FIRST_ARRAY, FIRST_FIN, FIRST_ENUM, FIRST_TUPLE = 0x8000, 0xC000, 0xD000, 0xE000
@@ -102,6 +111,8 @@ P_WITH_RT = struct.Struct("<BBBHBB")     # off, size, attributes, the constructo
 P_TYPE_RT = struct.Struct("<H")          # a type
 P_GET_RT = struct.Struct("<B")           # the element's size
 P_IDX_RT = struct.Struct("<Q")           # the bound
+# An arm's last byte in P_ARM_RT, saying what it takes apart: a cell, an enum in a register, or a Fin it counts down.
+ARM_CELL, ARM_ENUM, ARM_FIN = 0, 1, 2
 
 
 class Cells(NamedTuple):
@@ -177,6 +188,8 @@ class CheckStage(Stage):
         self.pending_name = b""
         self.child_seen = False
         self.after_handler = False  # a handler has been declared, so nothing declared from here on is one it reaches
+        self.reserves = 0         # R3: the parameters that are a Free
+        self.fin_viable = 0       # R3: the parameters that are a Fin every recursive call so far passed one less of
 
     def attach(self, ring: Ring) -> None:
         super().attach(ring)
@@ -223,6 +236,8 @@ class CheckStage(Stage):
         name = self.G.at(index)[1][:PAYLOAD_BYTES].rstrip(b"\0").decode()
         if kind == E_TYPE:
             ctors = self._ctors(index)
+            if a == K_SLOT:
+                return f"type t{self._type_id(index)} slot {name} {SLOT_BYTES}".encode()
             if a == K_RECORD:
                 shape = "record"
             elif a == K_ENUM:
@@ -356,7 +371,24 @@ class CheckStage(Stage):
             if bound == 0 or bound & bound - 1:
                 raise self._reject(f"section 4.5: Fin {bound}: a power of two until division exists")
             return self._fin_type(bound, True)
+        if kind == K_TFINNAME:
+            return self._fin_type(self._slot_bytes(payload, "Fin"), True)
         return self._type(payload)
+
+    def _slot_bytes(self, name: bytes, where: str) -> int:
+        """A slot's size in bytes, which is a build constant: the bound a Fin or an idx can name."""
+        found = self._g_find(E_TYPE, name.ljust(PAYLOAD_BYTES, b"\0"))
+        if found is None or self._g(found)[1] != K_SLOT:
+            raise self._reject(f"{where} {name.rstrip(bytes(1)).decode()}: a bound by name is a slot's size in bytes, "
+                               f"and this is no slot")
+        return SLOT_BYTES
+
+    def _is_slot(self, ty: int) -> bool:
+        return FIRST_NAMED <= ty < FIRST_ARRAY and self._g(ty - FIRST_NAMED)[1] == K_SLOT
+
+    @staticmethod
+    def _is_fin(ty: int) -> bool:
+        return FIRST_FIN <= ty < FIRST_ENUM
 
     def _type(self, name: bytes) -> int:
         key = name.rstrip(b"\0")
@@ -499,13 +531,12 @@ class CheckStage(Stage):
         store = self.ring.store
         tag, payload = store.tag(cell), store.payload(cell)
         cls, kind = ev_class(tag), ev_kind(tag)
-        if kind in (K_DATA, K_CTORDECL, K_RECORD, K_STATE, K_ENUM) or (
-                len(self.K) and self.K.peek()[0] in (K_DATA, K_CTORDECL, K_RECORD, K_STATE, K_ENUM)):
+        if kind in _DECLARATIONS or (len(self.K) and self.K.peek()[0] in _DECLARATIONS):
             self._declaration(cls, kind, payload)
             self.ring.drop(self, cell)
             return
         if (cls in (SEP, CLOSE) and kind == K_CALL and len(self.K)
-                and self.K.peek()[0] in (K_IDX, K_GET, K_LOW)):
+                and self.K.peek()[0] in (K_IDX, K_GET, K_LOW, K_SLEN)):
             kind = self.K.peek()[0]
         result = (self._on_open, self._on_sep, self._on_leaf, self._on_close)[cls](
             kind, payload)
@@ -525,7 +556,7 @@ class CheckStage(Stage):
                 raise self._reject("duplicate state name")
             self._frame(K_STATE)
             self._g_push(E_STATE, payload)
-        elif cls == LEAF and kind in (K_TYPE, K_TARRAY, K_TFIN) and self.K.peek()[0] == K_STATE:
+        elif cls == LEAF and kind in _TYPES_WRITTEN and self.K.peek()[0] == K_STATE:
             ty = self._type_token(kind, payload)
             if not FIRST_ARRAY <= ty < FIRST_FIN:
                 raise self._reject("section 4.5: a state slot holding cells waits for swap, so "
@@ -537,6 +568,14 @@ class CheckStage(Stage):
             self.decl_queue.append(f"state {name} {self._rt_type(ty)}".encode())
         elif cls == CLOSE and kind == K_STATE:
             self.K.pop()
+        elif cls == OPEN and kind == K_SLOT:
+            if self._g_find(E_TYPE, payload) is not None:
+                raise self._reject("duplicate type name")
+            self.decl_type = self._g_push(E_TYPE, payload, a=K_SLOT)
+            self._frame(K_SLOT)
+        elif cls == CLOSE and kind == K_SLOT:
+            self.K.pop()
+            self._write_out_declaration()
         elif cls == OPEN and kind in (K_DATA, K_RECORD, K_ENUM):
             found = self._g_find(E_TYPE, payload)
             self.decl_forward = -1
@@ -559,7 +598,7 @@ class CheckStage(Stage):
             self.decl_field_count = 0
         elif cls == LEAF and kind == K_FIELD:
             self._g_push(E_FIELD, payload, x=self.decl_ctor)
-        elif cls == LEAF and kind in (K_TYPE, K_TFIN, K_TARRAY):
+        elif cls == LEAF and kind in _TYPES_WRITTEN:
             field = len(self.G) - 1
             if kind == K_TARRAY:
                 raise self._reject("section 4.5: an array lives in its own region of the image, "
@@ -734,7 +773,9 @@ class CheckStage(Stage):
 
     def _on_open(self, kind: int, payload: bytes):
         if len(self.K) and self.K.peek()[0] == K_IDX and self._top()[1]:
-            raise self._reject("the bound of idx must be a literal")
+            raise self._reject("the bound of idx must be a literal, or the name of a slot")
+        if len(self.K) and self.K.peek()[0] == K_SLEN:
+            raise self._reject("len names a slot, whose length it reads and which it keeps")
         if kind == K_TTUPLE:
             self._frame(K_TTUPLE, c1=len(self.TM))
             return None
@@ -765,6 +806,16 @@ class CheckStage(Stage):
             primitive = K_IDX if payload.rstrip(bytes(1)) == b"idx" else K_GET
             self._frame(primitive)
             return primitive, b""
+        elif kind == K_CALL and payload.rstrip(bytes(1)) == b"len":
+            self._frame(K_SLEN)
+            self.child_seen = False
+            return K_SLEN, b""
+        elif kind == K_SGET:
+            src = self._lookup(payload)[0]
+            _linear, ty = self._borrow(src, "a byte read")
+            self._frame(K_SGET)
+            self.child_seen = False
+            return K_SGET, P_VAR.pack(src, 0, size_of(ty))
         elif kind == K_CALL and payload.rstrip(bytes(1)) in _NARROWING:
             self._frame(K_LOW, t1=_NARROWING[payload.rstrip(bytes(1))])
             self.child_seen = False
@@ -811,14 +862,49 @@ class CheckStage(Stage):
             self.child_seen = False
             return kind, VALUE.pack(found, count)
         elif kind == K_PACK:
-            self._frame(K_PACK, a=len(payload.rstrip(bytes(1))))
+            widths = payload.rstrip(bytes(1))
+            self._frame(K_PACK, a=len(widths), m1=int.from_bytes(widths, "little"))
             self.child_seen = False
         elif kind == K_ARM:
             return self._open_arm(payload)
         return kind, payload
 
+    def _borrow(self, index: int, what: str) -> tuple[int, int]:
+        """A slot that a read borrows: it has to be one, and still held. Reading it does not use it, so it is
+        left to be used once, as every linear value is. Its linear index, and its type."""
+        data = self.B.at(index)[1]
+        ty, linear, *_form = _BINDER.unpack_from(data, PAYLOAD_BYTES)
+        name = data[:PAYLOAD_BYTES].rstrip(bytes(1)).decode()
+        if not self._is_slot(ty):
+            raise self._reject(f"{what} reads a slot, and {name} is {self._show(ty)}")
+        if self.used >> linear & 1:
+            raise self._reject(f"slot {name} is read after it was used")
+        return linear, ty
+
+    def _open_fin_arm(self, frame: list, payload: bytes):
+        """`| 0 =>` binds nothing, and `| down(j) =>` binds j, which is one less. If the Fin matched is a
+        parameter, or one less than it, j is one less again: that is what rule R3 reads."""
+        down = payload.rstrip(bytes(1)) == DOWN
+        if not down and payload.rstrip(bytes(1)):
+            raise self._reject(f"a match on {self._show(frame[2])} has two arms, 0 and down(j), and "
+                               f"{payload.rstrip(bytes(1)).decode()} is neither")
+        seen = frame[7]
+        if seen >> down & 1:
+            raise self._reject("duplicate match arm")
+        arm_index = frame[0]
+        frame[7] = seen | 1 << down
+        frame[0] = arm_index + 1
+        self._store(frame)
+        self.used = frame[6]
+        less = frame[5] + 1 if frame[4] else 0
+        self._frame(K_ARM, a=int(down), t2=less, c1=len(self.B), c2=frame[2],
+                    m1=1 << frame[4] - 1 if frame[4] else 0, m3=1)
+        return K_ARM, P_ARM_RT.pack(int(down), 0, int(not down), arm_index, 2, 0, ARM_FIN)
+
     def _open_arm(self, payload: bytes):
         frame = self._top()
+        if self._is_fin(frame[2]):
+            return self._open_fin_arm(frame, payload)
         found = self._g_find(E_CTOR, payload)
         enum = is_enum(frame[2])
         type_index = frame[2] - (FIRST_ENUM if enum else FIRST_NAMED)
@@ -849,7 +935,7 @@ class CheckStage(Stage):
                     t1=0 if position is None else position + 1,
                     t2=0 if saved is None else saved.constant, c1=len(self.B), c2=found,
                     m1=0 if saved is None else saved.unknowns, m2=enum)
-        return K_ARM, P_ARM_RT.pack(tag, tagged, is_null, arm_index, nctors, found, enum)
+        return K_ARM, P_ARM_RT.pack(tag, tagged, is_null, arm_index, nctors, found, ARM_ENUM if enum else ARM_CELL)
 
     # --- sep
 
@@ -879,8 +965,8 @@ class CheckStage(Stage):
                 return self._bind_tuple(kind, ty, frame[5], count)
             name = self.N.peek()[1][:PAYLOAD_BYTES]
             self.N.pop()
-            # let is a renaming, so the value's count carries over to the name
-            self._bind(name, ty, self.form if is_linear(ty) else Cells())
+            # let is a renaming, so the value's count carries over to the name, and so does what a Fin is less than
+            self._bind(name, ty, self.form if is_linear(ty) or self._is_fin(ty) else Cells())
             return kind, P_LET_RT.pack(1, is_linear(ty), size_of(ty), 1)
         if kind == K_TUPLE:
             if len(self.TM) - frame[4] >= TUPLE_MAX:
@@ -889,6 +975,8 @@ class CheckStage(Stage):
             return kind, payload
         if kind == K_LOW:
             raise self._reject("low8, low16 and low32 take one integer")
+        if kind == K_SLEN:
+            raise self._reject("len takes one slot")
         if kind == K_IDX:
             self._need_int(self.ty, "idx's operand")
             frame[1] = 1  # the bound comes next, and it must be a literal
@@ -910,9 +998,21 @@ class CheckStage(Stage):
                 frame[7] = self.used
                 self.used = frame[6]
             self._store(frame)
+        elif kind == K_MATCH and self._is_fin(self.ty):
+            # A Fin counted down. If it is parameter p less some number, its arm `down(j)` knows j is less again.
+            frame[2] = self.ty
+            form = self.form
+            known = not form.opaque and form.unknowns and not form.unknowns & form.unknowns - 1
+            frame[4] = form.unknowns.bit_length() if known else 0
+            frame[5] = form.constant
+            frame[6] = self.used
+            self._store(frame)
+            return kind, bytes((index, 1))  # Lower is told it is a Fin's, so it needs no cell
         elif kind == K_MATCH:
             if self.ty < FIRST_NAMED or (is_composite(self.ty) and not is_enum(self.ty)):
                 raise self._reject(f"cannot match on {self._show(self.ty)}")
+            if self._is_slot(self.ty):
+                raise self._reject(f"cannot match on {self._show(self.ty)}: a slot is bytes, with no constructors")
             frame[2] = self.ty
             # R3: only a value whose count is exactly one unknown can have it expanded. An enum has no cells.
             form = self.form
@@ -948,10 +1048,20 @@ class CheckStage(Stage):
         elif kind == K_VALUE:
             self._arg(frame)
         elif kind == K_PACK:
-            self._need_int(self.ty, "a pack field")
+            self._pack_field(frame)
             frame[5] += 1
             self._store(frame)
         return kind, payload
+
+    def _pack_field(self, frame: list) -> None:
+        """A pack field is an integer, or a Fin whose every value fits its width: which is how a Fin becomes one."""
+        if self._is_fin(self.ty):
+            width = frame[6] >> 8 * frame[5] & 0xFF
+            bound = self._fin_of(self.ty)
+            if bound > 1 << width:
+                raise self._reject(f"pack<{width}> of {self._show(self.ty)}: {bound - 1} does not fit {width} bits")
+            return
+        self._need_int(self.ty, "a pack field")
 
     def _bind_tuple(self, kind: int, ty: int, first_name: int, count: int):
         """let (a, b) = e in ...: each name gets its member. A count is only known through a
@@ -1018,10 +1128,13 @@ class CheckStage(Stage):
         is a number below 64, because a function has at most 6 parameters."""
         positions = 0
         self.reserves = 0  # the positions that are a Free
+        self.fin_viable = 0  # the positions that are a Fin: the other measure, which a call passes one less of
         for position in range(nparams):
             ty = self._g(first + position)[5]
-            if is_composite(ty):
-                continue  # an array has a fixed size: it can never be what shrinks
+            if self._is_fin(ty):
+                self.fin_viable |= 1 << position
+            if is_composite(ty) or self._is_slot(ty):
+                continue  # an array has a fixed size, and a slot has no cells: neither can be what shrinks
             if is_linear(ty):
                 reserve = (ty >= FIRST_NAMED
                            and self.G.at(ty - FIRST_NAMED)[1][:PAYLOAD_BYTES].rstrip(b"\0") == RESERVE_TYPE)
@@ -1051,12 +1164,16 @@ class CheckStage(Stage):
             if self.viable >> subset & 1 and self._falls(subset, args):
                 surviving |= 1 << subset
         self.viable = surviving
+        # A Fin parameter counts down if what this call passes is that parameter, less at least one.
+        self.fin_viable &= sum(1 << position for position, arg in enumerate(args)
+                               if not arg.opaque and arg.unknowns == 1 << position and arg.constant >= 1)
         self.fn_recursive = True
-        if not surviving:
+        if not surviving and not self.fin_viable:
             name = self.G.at(self.fn_self)[1][:PAYLOAD_BYTES].rstrip(b"\0").decode()
             raise self._reject(
                 f"rule R3: no fixed set of linear arguments of {name} loses cells at every "
-                f"recursive call so far, not counting Free, so nothing shows the recursion ends")
+                f"recursive call so far, not counting Free, and no Fin parameter is passed one less, so nothing shows "
+                f"the recursion ends")
 
     def _decreasing_set(self) -> int:
         """The set of positions rule R3 settled on, which the RT layer's potential sits on: one with no Free if
@@ -1065,6 +1182,8 @@ class CheckStage(Stage):
         if not self.fn_recursive:
             return 0
         sets = [s for s in range(1, 64) if self.viable >> s & 1]
+        if not sets:  # a Fin counts down: the lowest one that does
+            return self.fin_viable & -self.fin_viable
         return min(sets, key=lambda s: (bool(s & self.reserves), bin(s).count("1"), s))
 
     def _falls(self, subset: int, args: list[Cells]) -> bool:
@@ -1089,7 +1208,7 @@ class CheckStage(Stage):
         if kind == K_PARAM:
             self.pending_name = payload
             return None
-        if kind in (K_TYPE, K_TARRAY, K_TFIN):
+        if kind in _TYPES_WRITTEN:
             frame = self._top()
             ty = self._type_token(kind, payload)
             if ty in _WIRE:
@@ -1105,7 +1224,8 @@ class CheckStage(Stage):
                 return K_TYPE, P_TYPE_RT.pack(ty)
             if len(self.G) - frame[4] == 6:
                 raise self._reject("more than 6 parameters (the register budget)")
-            src = self._bind(self.pending_name, ty)
+            # A Fin parameter is itself less nothing: rule R3 follows what is one less than it.
+            src = self._bind(self.pending_name, ty, Cells(0, 1 << len(self.entry)) if self._is_fin(ty) else None)
             self.entry.append(self._form_of(src))
             self._g_push(E_PARAM, self.pending_name, x=ty)
             return K_PARAM, P_PARAM_RT.pack(src, size_of(ty), is_linear(ty), ty)
@@ -1134,9 +1254,17 @@ class CheckStage(Stage):
                 off, size, linear = field[1], field[2], attributes(field[7])
             self.child_seen = False
             return kind, P_DIAMOND_RT.pack(src, tag, tagged, count, off, size, linear, frame[4])
+        if len(self.K) and self.K.peek()[0] == K_SLEN:
+            return self._slot_length(kind, payload)
         if len(self.K) and self.K.peek()[0] == K_IDX and self._top()[1]:
+            if kind == K_NULLCTOR:  # a slot's size in bytes
+                frame = self._top()
+                frame[1] = 2
+                frame[7] = self._slot_bytes(payload, "idx by")
+                self._store(frame)
+                return None
             if kind != K_INT:
-                raise self._reject("the bound of idx must be a literal")
+                raise self._reject("the bound of idx must be a literal, or the name of a slot")
             bound = struct.unpack_from("<Q", payload)[0]
             if bound == 0 or bound & bound - 1:
                 raise self._reject(f"section 4.4: idx by {bound}: a power of two until division "
@@ -1175,6 +1303,16 @@ class CheckStage(Stage):
             return kind, P_TYPE_RT.pack(self.ty)
         return kind, payload
 
+    def _slot_length(self, kind: int, payload: bytes):
+        """The one thing len takes: a slot, by its name, which it borrows."""
+        if kind not in (K_VAR, K_VARLAST, K_VARAT) or self.child_seen:
+            raise self._reject("len takes one slot, by its name")
+        src = VARAT.unpack_from(payload)[0] if kind == K_VARAT else self._lookup(payload)[0]
+        _linear, self.ty = self._borrow(src, "len")
+        self.child_seen = True
+        self.form = Cells()
+        return K_VAR, P_VAR.pack(src, 0, size_of(self.ty))
+
     def _binder(self, payload: bytes):
         frame = self._top()
         if self.K.peek()[0] == K_LET:
@@ -1187,6 +1325,9 @@ class CheckStage(Stage):
             raise self._reject(f"pattern has too many binders: expected {frame[0]}")
         frame[1] = position + 1
         self._store(frame)
+        if frame[8]:  # `down(j)`: j is the Fin one less, in a register of its own
+            self._bind(payload, frame[5], Cells(frame[3], frame[6]) if frame[6] else Cells())
+            return K_BINDER, P_BINDER.pack(3, 0, size_of(frame[5]), 0)
         if frame[7]:  # an enum's field, which Lower reads out of the register by its index
             field = self._g(frame[5] + 1 + position)
             self._bind(payload, value_of(field[7]))
@@ -1242,6 +1383,24 @@ class CheckStage(Stage):
             self.K.pop()
             self.child_seen = True
             return kind, bytes((size_of(self.ty),))
+        if kind == K_SGET:
+            if not self.child_seen:
+                raise self._reject("a byte of a slot is read at an index")
+            # The index cannot have used the slot: it is a Fin, so nothing linear leaves it, and the slot has to.
+            if not self._is_fin(self.ty) or self._fin_of(self.ty) != SLOT_BYTES:
+                raise self._reject(f"a byte of a slot is read at a Fin {SLOT_BYTES}, its size, and this is "
+                                   f"{self._show(self.ty)}")
+            self.ty = T_I8
+            self.K.pop()
+            self.child_seen = True
+            return kind, payload
+        if kind == K_SLEN:
+            if not self.child_seen:
+                raise self._reject("len takes one slot, by its name")
+            self.ty = T_I16
+            self.K.pop()
+            self.child_seen = True
+            return kind, payload
         if kind == K_IDX:
             if frame[1] != 2:
                 raise self._reject("idx takes a value and a literal bound")
@@ -1274,6 +1433,11 @@ class CheckStage(Stage):
             self.ty = self._unify(frame[2], self.ty, "the arms of an if")
             if self.used != frame[7]:
                 raise self._reject("the arms of an if consume different linear variables")
+        elif kind == K_MATCH and self._is_fin(frame[2]):
+            if frame[0] != 2:
+                raise self._reject(f"non-exhaustive match on {self._show(frame[2])}: it has two arms, 0 and down(j)")
+            self.ty = frame[3]
+            self.used = frame[8]
         elif kind == K_MATCH:
             type_index = frame[2] - (FIRST_ENUM if is_enum(frame[2]) else FIRST_NAMED)
             if frame[0] != len(self._ctors(type_index)):
@@ -1338,7 +1502,7 @@ class CheckStage(Stage):
         elif kind == K_PACK:
             if not self.child_seen:
                 raise self._reject("pack needs one expression per width")
-            self._need_int(self.ty, "a pack field")
+            self._pack_field(frame)
             if frame[5] + 1 != frame[0]:
                 raise self._reject("pack needs one expression per width")
             self.ty = T_I64

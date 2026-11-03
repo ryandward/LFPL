@@ -441,7 +441,7 @@ MUTANTS = {
         "            self.at_least(token.pot, fn.result_pots[position])\n",
         ""),
     "a tail call's result not tied to the caller's": ("src/rtcheck.py",
-        "                self.at_least(theirs, ours)\n",
+        "                self.owed(self.norm(ty), theirs, ours)\n",
         "                pass\n"),
     "a field need not carry what its new cell does (=)": ("src/rtcheck.py",
         '                self.at_least(held.pot if held is not None else None, None if is_scalar(ty) else carried)\n',

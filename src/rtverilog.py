@@ -13,6 +13,11 @@ and the bound has passed its certificate. The whole handler becomes one synchron
                         that says `=` has no enable, so an unchanged field cannot be written
     tail                <= on every parameter in one clock, then the entry state. The parallel move x86
                         has to schedule, with a scratch register to break cycles, does not exist here
+    a slot              its number in bits 0 to 31 and its length in 32 to 47. Its bytes are a whole number of
+                        cells of the store, aligned to that many: so byte i of slot k is in the cell whose
+                        address is k and i's high bits side by side, in the lane i's low four bits say
+    sget                that cell's read, then a byte of what it returned
+    br.down             the comparison with 0 and the subtraction, in the clock of the branch
     call                <= on the callee's parameters, and on its return state if it has several
     ret                 <= on the destination registers of whichever call this is, then its next state
 
@@ -41,7 +46,7 @@ import math
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable, Optional, Union
 
 from .certify import certify, certify_turn
@@ -55,6 +60,8 @@ K_IN = 1
 O_MAX = 1
 SCALAR_BITS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "bool": 1, "lit": 64, "be16": 16, "be32": 32, "be64": 64}
 ENUM_BITS = 64  # an enum is one register: LFPL-O section 4.11
+SLOT_BITS = 48  # a slot's number in bits 0 to 31, and its length in 32 to 47, as the cell a record keeps it in says
+LANE_BITS = 4   # which byte of a cell: CELL_BYTES is 16
 OPERATORS = {"add": "+", "sub": "-", "mul": "*", "and": "&", "or": "|", "xor": "^", "shl": "<<", "shr": ">>"}
 COMPARISONS = {"b": "<", "be": "<=", "a": ">", "ae": ">=", "e": "==", "ne": "!="}
 KEYWORDS = frozenset(("always", "and", "assign", "begin", "buf", "case", "default", "edge", "else", "end",
@@ -232,11 +239,18 @@ class Translation:
     pointer_bits: int
     memories: dict  # state slot -> hex text for $readmemh, to go beside the Verilog
     verdict: bool = False  # the handler returns an enum beside its record, on a port of its own
+    slots: int = 0         # slots in the store, after its cells
+    first_slot: int = 0    # the number of the first: its first cell's address, over the cells a slot is
+    held_slots: Optional[int] = 0  # the slots an item holds, which the handler gives back, and draws no more of
 
     def report(self) -> str:
+        slots = f", {self.slots} slots from number {self.first_slot}" if self.slots else ""
+        held = "" if self.held_slots == 0 else (f", {self.held_slots} slot{'s' if self.held_slots != 1 else ''} an "
+                                                 f"item holds and gets back" if self.held_slots is not None
+                                                 else ", the slots an item holds, however many")
         lines = [f"handler {self.module}: R(n) = {_linear(self.bound.a, self.bound.b)} cells, "
-                 f"W(n) = {_linear(self.bound.c, self.bound.d)} steps, {self.cells} cells of "
-                 f"{CELL_BITS} bits, {self.pointer_bits}-bit pointers, {self.timing.states} states"]
+                 f"W(n) = {_linear(self.bound.c, self.bound.d)} steps{held}, {self.cells} cells of "
+                 f"{CELL_BITS} bits{slots}, {self.pointer_bits}-bit pointers, {self.timing.states} states"]
         for name, iteration, leaving in self.timing.iterations:
             lines.append(f"walk {name}: {iteration} clocks per iteration, {leaving} to leave")
         clocks = self.timing.clocks
@@ -269,6 +283,7 @@ class Emitter:
         self.tuples: dict[str, list[str]] = {}
         self.ctors: dict[str, Ctor] = {}
         self.enums: set[str] = set()  # types whose values are one register of ENUM_BITS
+        self.slot_types: dict[str, int] = {}  # a slot type, and the bytes of one: SLOT_BITS in a register
         self.slots: list[tuple[str, str]] = []
         self.functions: dict[str, Function] = {}
         self.current: list[str] = []
@@ -312,6 +327,10 @@ class Emitter:
             self.tuples[parts[0]] = parts[1:]
         elif head == "type" and parts[1] == "enum":
             self.enums.add(parts[0])
+        elif head == "type" and parts[1] == "slot":
+            self.slot_types[parts[0]] = int(parts[3])
+            if len(set(self.slot_types.values())) > 1:
+                raise RTError(f"slots of {sorted(set(self.slot_types.values()))} bytes: the store's are all one size")
         elif head == "ctor":
             self.ctors[parts[0]] = Ctor(parts[2])
             self.ctor_types[parts[0]] = parts[1]
@@ -342,10 +361,16 @@ class Emitter:
             return SCALAR_BITS[name]
         if name in self.enums:
             return ENUM_BITS
+        if name in self.slot_types:
+            return SLOT_BITS
         entry = self.composite.get(name)
         if entry is None:
             return self.pointer_bits  # a capability, or any value made of cells
         return self._array_bits() if entry[0] == "array" else _bits_for(entry[1])
+
+    def _slot_bytes(self) -> int:
+        """The size of a slot: every slot type's, since the store's slots are all one size."""
+        return next(iter(self.slot_types.values()))
 
     def _results(self, type_text: str) -> list[str]:
         return self.tuples.get(self._resolve(type_text), [type_text])
@@ -395,12 +420,34 @@ class Emitter:
         """A register's width is the widest thing the function ever puts in it."""
         widths: dict[int, int] = {}
         types: dict[int, str] = {}
+        opened: dict[int, str] = {}  # a register whose cell is open, and the constructor it holds
 
         def define(text: str, width: int, type_text: Optional[str] = None) -> None:
             r = int(_REG.match(text).group(1))
             widths[r] = max(widths.get(r, 0), width)
             if type_text is not None:
                 types[r] = type_text
+
+        def ctor_of(text: str, tag: str) -> Optional[str]:
+            """The constructor a test finds in the cell of a register whose type is known."""
+            owner = types.get(int(_REG.match(text).group(1)))
+            for ctor, ty in self.ctor_types.items():
+                if owner is not None and self._resolve(ty) == self._resolve(owner) and (
+                        self.ctors[ctor].tag == tag or (tag == "full" and self.ctors[ctor].tag != "null")):
+                    return ctor
+            return None
+
+        def taken(text: str, location: str) -> None:
+            """A field taken is a pointer, or a slot, which is wider: which one, its constructor says."""
+            base, off, size = self._location(location)
+            ctor = opened.get(base)
+            fields = self.ctors[ctor].fields if ctor is not None else ()
+            ty = next((t for o, s, t in fields if (o, s) == (off, size)), None)
+            if ty is None and any(self._resolve(t) in self.slot_types for c in self.ctors.values()
+                                  for o, s, t in c.fields if (o, s) == (off, size)):
+                raise RTError(f"take {location}: a slot is at [{off}:{size}] of some constructor, and which one "
+                              f"r{base}'s cell holds cannot be told here, so neither can how wide this is")
+            define(text, self._width(ty) if ty is not None else self.pointer_bits, ty)
 
         for position, type_text in enumerate(fn.params):
             define(f"r{position}", self._width(type_text), type_text)
@@ -433,12 +480,26 @@ class Emitter:
             elif head == "read":
                 define(a[0], 8 * int(_LOC.match(a[1]).group(3)))
             elif head == "take":
-                define(a[0], self.pointer_bits)
+                taken(a[0], a[1])
+            elif head == "open":
+                opened[int(_REG.match(a[0]).group(1))] = a[1]
+            elif head in ("br.null", "br.tag"):
+                ctor = ctor_of(a[0], "full" if head == "br.null" else a[1])
+                if ctor is not None:
+                    opened[int(_REG.match(a[0]).group(1))] = ctor
+            elif head == "sget":
+                define(a[0], 8)
+            elif head == "slen":
+                define(a[0], 16)
+            elif head == "br.down":
+                moves.append((a[1], a[0]))  # one less is as wide as what it is one less than
             elif head == "call":
                 callee = self.functions[a[1]]
                 names = _args(a[0].strip("()")) if a[0].startswith("(") else [a[0]]
                 for name, member in zip(names, self._results(callee.ret)):
                     define(name, self._width(member), member)
+            if head == "move" and int(_REG.match(a[1]).group(1)) in opened:
+                opened[int(_REG.match(a[0]).group(1))] = opened[int(_REG.match(a[1]).group(1))]
         changed = True
         while changed:  # a move's target is as wide as its source, whichever came first in the text
             changed = False
@@ -809,6 +870,30 @@ class Emitter:
         self._hardware(f"read array r{array}", ports=ports)
         self._step("aget", text, clocked=[self._set(a[0], result, width)])
 
+    # --- slots
+
+    def i_sget(self, text: str, a: list[str]) -> None:
+        """Byte i of a slot: its cell's read, then the byte, in the clock after. The address is the slot's number and
+        i's high bits side by side, which needs no adder: slots are aligned to their size in the store."""
+        fn = self.fn
+        assert fn is not None
+        slot, index = (int(_REG.match(operand).group(1)) for operand in a[1:3])
+        index_bits = _bits_for(self._slot_bytes())
+        number_bits = self.pointer_bits - (index_bits - LANE_BITS)
+        s, i = fn.flop(self.pending.get(slot, slot)), fn.flop(self.pending.get(index, index))
+        self._hardware(f"read the cell of byte r{index} of the slot in r{slot}", reads=True,
+                       ports=["a_en = 1'b1;", f"a_addr = {{{s}[{number_bits - 1}:0], {i}[{index_bits - 1}:{LANE_BITS}]}};"])
+        self.loaded = None  # the port holds a cell of the slot, which is no register's cell
+        i = fn.flop(index)  # the moves the read's clock made are made
+        self._step("sget", text, clocked=[self._set(a[0], f"a_dout[{{{i}[{LANE_BITS - 1}:0], 3'd0}} +: 8]", 8)])
+
+    def i_slen(self, text: str, a: list[str]) -> None:
+        """A slot's length: bits of its register, so wires."""
+        fn = self.fn
+        assert fn is not None
+        slot = int(_REG.match(a[1]).group(1))
+        self._step("slen", text, clocked=[self._set(a[0], f"{fn.flop(self.pending.get(slot, slot))}[47:32]", 16)])
+
     # --- cells
 
     def i_open(self, _text: str, _a: list[str]) -> None:
@@ -822,7 +907,7 @@ class Emitter:
     def i_take(self, text: str, a: list[str]) -> None:
         """A link of the header is the next of its cells: the links between them are fixed, see `_header_write`."""
         self._locations(a[1:2])
-        width = self.pointer_bits
+        width = self.fn.widths[int(_REG.match(a[0]).group(1))]
         header = self._in_header(a[1])
         link = self.links.get(self.header_cells[header[0]]) if header is not None else None
         following = header is not None and link is not None and link[:2] == header[1:]
@@ -928,6 +1013,20 @@ class Emitter:
         self._edge(a[3], self.loaded)
         self._edge(a[4], self.loaded)
         self._step("br", text, next_state=Choice(condition, a[3], a[4]))
+        self.open_path = False
+
+    def i_br_down(self, text: str, a: list[str]) -> None:
+        """The comparison with 0 and the subtraction, both in the clock of the branch. d is written on the way to
+        either label, and on the way to Lz nothing reads it: rtcheck holds d to be empty there."""
+        fn = self.fn
+        assert fn is not None
+        p = int(_REG.match(a[0]).group(1))
+        width = fn.widths[self.pending.get(p, p)]
+        value = self._value(a[0], width)
+        one_less = self._set(a[1], f"{value} - {width}'d1", width)
+        self._edge(a[2], self.loaded)
+        self._edge(a[3], self.loaded)
+        self._step("br.down", text, clocked=[one_less], next_state=Choice(f"{value} == {width}'d0", a[2], a[3]))
         self.open_path = False
 
     def i_br_null(self, text: str, a: list[str]) -> None:
@@ -1254,9 +1353,18 @@ class Emitter:
         return (loop[0] or Span(0, 0), leave[0] or Span(0, 0))
 
     def render(self, handler: Function, module: str, bound: Bound, cells: int, initial: dict[str, str], *,
-               n_max: Optional[int] = None, sizes: Optional[dict] = None) -> Translation:
+               n_max: Optional[int] = None, sizes: Optional[dict] = None, slots: int = 0) -> Translation:
         """The machine, and its bound in clocks: a handler's for items of up to `n_max` cells, a turn's with
-        `sizes` saying how many cells each sized parameter holds, as src/certify.py's certify_turn."""
+        `sizes` saying how many cells each sized parameter holds, as src/certify.py's certify_turn. `slots` is how
+        many slots the store has, after its cells: a program whose items own slots needs one at least."""
+        if self.slot_types and not slots:
+            raise RTError("the program's values own slots, and this store has none: give it some, in translate")
+        first_slot = 0
+        if slots:
+            per_slot = self._slot_bytes() // CELL_BYTES
+            first_slot = (cells + 1 + per_slot - 1) // per_slot  # the first number whose cells are all past the cells
+            if (first_slot + slots) * per_slot > 1 << self.pointer_bits:
+                raise RTError(f"{slots} slots from number {first_slot} do not fit {self.pointer_bits}-bit pointers")
         functions = self._reachable(handler)
         kept = {fn.ordinal for fn in functions}
         for fn in functions:  # a function the handler never reaches is not in the machine
@@ -1290,11 +1398,13 @@ class Emitter:
         timing = self._timing(functions, self._clocks(handler, costs, n_max, sizes))
         memories = {name: _hex_lines(data, self._array_of(ty)) for (name, ty), data in
                     ((slot, initial[slot[0]]) for slot in self.slots if slot[0] in initial)}
-        text = self._text(handler, functions, module, cells, timing, memories, bound)
-        return Translation(text, module, bound, timing, cells, self.pointer_bits, memories, self.verdict)
+        top = (first_slot + slots) * (self._slot_bytes() // CELL_BYTES) - 1 if slots else cells
+        text = self._text(handler, functions, module, cells, timing, memories, bound, top)
+        return Translation(text, module, bound, timing, cells, self.pointer_bits, memories, self.verdict, slots,
+                           first_slot)
 
     def _text(self, handler: Function, functions: list[Function], module: str, cells: int,
-              timing: Timing, memories: dict, bound: Bound) -> str:
+              timing: Timing, memories: dict, bound: Bound, top: int) -> str:
         p = self.pointer_bits
         states = [state.name for fn in functions for state in fn.states]
         state_bits = _bits_for(len(states) + 1)
@@ -1372,7 +1482,10 @@ class Emitter:
         add("    // enable per byte. No state enables both, and a host that writes does not read, so a")
         add("    // clock never reads and writes one address. yosys proves that from this decode, and")
         add("    // needs no logic for what such a read should return.")
-        add(f"    reg [{CELL_BITS - 1}:0] cells [0:{cells}];")
+        if top != cells:
+            per_slot = self._slot_bytes() // CELL_BYTES
+            add(f"    // After the cells, to word {top}: slots of {per_slot} cells each, slot k from word {per_slot} k.")
+        add(f"    reg [{CELL_BITS - 1}:0] cells [0:{top}];")
         add("    reg a_en;")
         add(f"    reg [{p - 1}:0] a_addr;")
         add(f"    reg [{CELL_BYTES - 1}:0] b_we;")
@@ -1606,9 +1719,10 @@ def _hex_lines(data: bytes, array: tuple) -> str:
 
 
 def translate(lines: Iterable[str], *, n_max: int = 216, k_out: int = 64, cells: Optional[int] = None,
-              initial: Optional[dict[str, bytes]] = None) -> Translation:
+              initial: Optional[dict[str, bytes]] = None, slots: int = 0) -> Translation:
     """The only way in. rtcheck reads every line first, and the bound has to pass its certificate, so
-    nothing it refuses can come out as Verilog. RTError says what was refused."""
+    nothing it refuses can come out as Verilog. RTError says what was refused. `slots` puts that many slots in
+    the store after its cells, for a program whose items own them."""
     stream = list(lines)
     checker = Checker()
     for line in stream:
@@ -1625,13 +1739,20 @@ def translate(lines: Iterable[str], *, n_max: int = 216, k_out: int = 64, cells:
     count = cells if cells is not None else (K_IN * n_max + reserve + n_max + k_out * O_MAX * largest_output)
     if count < K_IN * n_max + reserve + n_max:
         raise RTError(f"section 3.4: {count} cells cannot hold ingress and one maximal transaction")
-    pointer_bits = _bits_for(count + 1)  # word 0 is null
+    words = count + 1  # word 0 is null
+    slot_bytes = {int(line.split()[4]) for line in stream if line.startswith("type ") and line.split()[2] == "slot"}
+    if slots and slot_bytes:  # whole slots, aligned to their size, after the cells
+        per_slot = max(slot_bytes) // CELL_BYTES
+        words = ((count + 1 + per_slot - 1) // per_slot + slots) * per_slot
+    pointer_bits = _bits_for(words)
     emitter = Emitter(pointer_bits)
     for line in stream:
         emitter.feed(line)
     handler = next(f for f in emitter.functions.values() if f.handler)
     module = name + "_handler" if name in KEYWORDS else name
-    return emitter.render(handler, module, bound, count, initial or {}, n_max=n_max)
+    translation = emitter.render(handler, module, bound, count, initial or {}, n_max=n_max,
+                                 slots=slots if slot_bytes else 0)
+    return replace(translation, held_slots=checker.held_slots(name))
 
 
 def main(argv: list[str]) -> int:
@@ -1641,6 +1762,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--n-max", type=int, default=216, help="the largest item, in cells")
     parser.add_argument("--k-out", type=int, default=64, help="the output queue's capacity")
     parser.add_argument("--cells", type=int, help="cells in the store, instead of section 3.4's C")
+    parser.add_argument("--slots", type=int, default=0, help="slots in the store after the cells, for items that own them")
     parser.add_argument("--state", action="append", default=[], metavar="NAME=FILE",
                         help="initial contents of a state array, read at translation time")
     args = parser.parse_args(argv)
@@ -1655,7 +1777,7 @@ def main(argv: list[str]) -> int:
         with open(args.source, "rb") as handle:
             source = handle.read()
         translation = translate(rt_lines(io.BytesIO(source)), n_max=args.n_max, k_out=args.k_out,
-                                cells=args.cells, initial=initial)
+                                cells=args.cells, initial=initial, slots=args.slots)
     except (RTError, Reject, Limit, FStarved, OSError) as failure:
         print(f"{args.source}: refused: {failure}", file=sys.stderr)
         return 1

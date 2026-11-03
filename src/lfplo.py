@@ -28,7 +28,7 @@ from .rtlower import Limit, rt_lines
 from .runtime import BindingError, Image, Options, assembly, bind
 from .symcheck import check_translation
 from .validate import recompute_stack
-from .x86 import Backend, Starved
+from .x86 import Backend, NotLowered, Starved
 
 
 class Refused(Exception):
@@ -209,7 +209,7 @@ def build(source_path: str, exe_path: str, options: Options,
                 source = handle.read()
                 handle.seek(0)
                 image = _generate(rt_lines(handle), asm_path, options, initial)
-        except (RTError, BindingError, Starved, Limit, FStarved) as failure:
+        except (RTError, BindingError, Starved, NotLowered, Limit, FStarved) as failure:
             raise Refused(str(failure)) from failure
         if keep_asm is not None:
             shutil.copy(asm_path, keep_asm)
@@ -240,7 +240,7 @@ def _main_program(source_path: str, run: bool) -> int:
     try:
         with open(source_path, "rb") as handle:
             asm = compile_program(handle.read())
-    except (Reject, RTError, Limit, FStarved, Starved, OSError) as failure:
+    except (Reject, RTError, Limit, FStarved, Starved, NotLowered, OSError) as failure:
         print(f"{source_path}: refused: {failure}", file=sys.stderr)
         return 1
     if not run:
