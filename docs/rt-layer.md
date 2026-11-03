@@ -268,8 +268,8 @@ proposes numbers, and the pass evaluates every inequality with them.
 
 Every value made of cells carries an unknown amount per cell, the same unknown for both
 resources, which are solved separately: cells drawn and steps run. A Fin carries one per unit of its
-value. Other scalars, capabilities, arrays and slots carry nothing, and a null has no cells to carry
-anything on. A budget, a sum of unknowns plus a
+value, and a slot one per byte of its length, as below. Other scalars, capabilities and arrays carry
+nothing, and a null has no cells to carry anything on. A budget, a sum of unknowns plus a
 constant for each resource, follows each path from the function's own unknown entry amount:
 
     a working instruction    budget - 1 step: everything but move, drop and open, which lower to nothing
