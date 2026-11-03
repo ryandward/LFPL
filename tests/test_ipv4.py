@@ -75,15 +75,16 @@ class TheExample(unittest.TestCase):
         with open(os.path.join(ROOT, "README.md")) as handle:
             self.assertIn(router.report.strip(), handle.read())
 
-    def test_a_frame_past_n_max_is_too_large(self):
-        router = serve(self, options=("--n-max", "216"))
-        largest = model.ipv4_frame(payload=bytes(1480))
-        router.raw(largest)
-        router.raw(model.ipv4_frame(payload=bytes(1473)))
+    def test_a_frame_past_what_a_slot_holds_is_too_large(self):
+        """The 34 bytes of the record, and 2048 more in the slot: one byte more and the kernel says it was cut."""
+        router = serve(self)
+        router.raw(model.ipv4_frame(payload=bytes(2048 + 1)))
+        router.raw(model.ipv4_frame(payload=bytes(2048)))
         now = router.settle(2)
         self.assertEqual((now["too_large"], now["forwarded"]), (1, 1))
-        router.outputs[0].recv(4096)
-        self.assertEqual(router.settle(2)["pool"], now["capacity"])
+        self.assertEqual(len(router.outputs[0].recv(4096)), 34 + 2048)
+        later = router.settle(2)
+        self.assertEqual((later["pool"], later["slots"]), (now["capacity"], now["slot_capacity"]))
 
     def test_n_max_has_to_hold_the_record(self):
         with tempfile.TemporaryDirectory() as workdir:

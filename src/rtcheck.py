@@ -34,8 +34,14 @@ and `br.down` releases one unit as the value goes one lower. A Fin is a scalar, 
 read as often as it likes, so its amount is shared, never copied: whatever takes some of it, a copy, an
 argument or a countdown, leaves the register what is left, and the two together are no more than it
 was. That is Hofmann and Jost's share rule, which linear data never need. A Fin with none still has a
-value, unlike a null, so wherever an amount is wanted of it, the amount has to be nothing. A slot
-carries none: its bytes are not cells, and nothing can make one or take one apart.
+value, unlike a null, so wherever an amount is wanted of it, the amount has to be nothing.
+
+A slot carries an amount per byte of its length, and it is the amount the record it came in carries per
+cell: what a value carries per cell is carried by every cell reachable from it, and by every byte of
+every slot reachable from it. So an item's size is its cells and its slot's bytes, which admission
+works out from the datagram's length. Nothing takes a slot apart, so nothing releases that amount but
+`br.within`, which shares it with the Fin it makes, below the slot's length: a walk of a slot is paid
+for by the slot's bytes, and a short frame's bound is a small one.
 """
 from __future__ import annotations
 
@@ -311,8 +317,11 @@ class Checker:
                 rows[Budget(((pot, -1),))] = None
         return ResourceProgram(tuple(rows), None, turn.entry, 0, weights)
 
-    def verify_turn(self, name: str, sizes: Mapping[int, int], steps: Mapping[int, Fraction]) -> Bound:
-        """The certificate for a turn's steps, checked in every inequality: W, with c = 0, since it is for any item."""
+    def verify_turn(self, name: str, sizes: Mapping[int, int], steps: Mapping[int, Fraction],
+                    per_turn: Optional[int] = None) -> Bound:
+        """The certificate for a turn's steps, checked in every inequality: W, with c = 0, since it is for any item.
+        With `per_turn`, the parameter whose size each turn says, such as the frame ingress holds: c is its amount per
+        unit, and d is everything else at the largest it can be, so a turn takes at most d + c n for its n."""
         program = self.turn_program(name, sizes)
         if any(value < 0 for value in steps.values()):
             raise RTError(f"the certificate for {name} gives an unknown a negative number of steps")
@@ -321,9 +330,12 @@ class Checker:
                         Fraction(row.steps))
             if total < 0:
                 raise RTError(f"the certificate for {name} falls {-total} steps short at {self._show_row(row)}")
+        turn = self._handler_named(name)
+        varying = turn.param_pots[per_turn] if per_turn is not None else None
         whole = sum((Fraction(weight) * Fraction(steps.get(unknown, 0))
-                     for unknown, weight in program.objective().items()), Fraction(0))
-        bound = Bound(0, 0, 0, math.ceil(whole))
+                     for unknown, weight in program.objective().items() if unknown != varying), Fraction(0))
+        slope = Fraction(steps.get(varying, 0)) if varying is not None else Fraction(0)
+        bound = Bound(0, 0, math.ceil(slope), math.ceil(whole))
         self.certified[name] = bound
         return bound
 
@@ -366,14 +378,31 @@ class Checker:
         does not say, as for a list that can hold any number."""
         return self._slots_in(self.norm(self._handler_named(name).params[-2]))
 
-    def _slots_in(self, ty: Type) -> Optional[int]:
+    def record_cells(self, name: str) -> Optional[int]:
+        """The cells of a handler's item, if its type says how many: a record, and the records it holds. None for one
+        that holds a chain, whose cells come with the frame."""
+        return self._cells_in(self.norm(self._handler_named(name).params[-2]))
+
+    def _cells_in(self, ty: Type, within: frozenset = frozenset()) -> Optional[int]:
+        """within: the records on the way here. One that holds itself has no end, and so no count."""
+        decl = self._decl(ty)
+        if decl is None or decl.kind == "slot":
+            return 0
+        if decl.kind != "record" or decl.name in within:
+            return None
+        counts = [self._cells_in(self.norm(field_type), within | {decl.name})
+                  for _off, _size, field_type, _name in decl.ctors[0].fields]
+        return None if None in counts else 1 + sum(counts)
+
+    def _slots_in(self, ty: Type, within: frozenset = frozenset()) -> Optional[int]:
         decl = self._decl(ty)
         if decl is None:
             return 0
         if decl.kind == "slot":
             return 1
-        if decl.kind == "record":
-            counts = [self._slots_in(self.norm(field_type)) for _off, _size, field_type, _name in decl.ctors[0].fields]
+        if decl.kind == "record" and decl.name not in within:
+            counts = [self._slots_in(self.norm(field_type), within | {decl.name})
+                      for _off, _size, field_type, _name in decl.ctors[0].fields]
             return None if None in counts else sum(counts)
         return None if self._reaches_a_slot(ty, set()) else 0
 
@@ -394,12 +423,20 @@ class Checker:
         return self.next_unknown
 
     def _carries(self, ty: Type) -> bool:
-        """Scalars have no cells, a capability's cell is empty, and neither an array nor a slot is made of cells."""
+        """Scalars have no cells, a capability's cell is empty, and an array is not made of cells. A slot is not
+        either, and it carries an amount per byte of its length."""
+        return self._decl(ty) is not None
+
+    def counted(self, ty: Type) -> bool:
+        """A Fin and a slot carry an amount per unit of a number, which one without an amount still has."""
+        return is_fin(ty) or self.is_slot(ty)
+
+    def is_slot(self, ty: Type) -> bool:
         decl = self._decl(ty)
-        return decl is not None and decl.kind != "slot"
+        return decl is not None and decl.kind == "slot"
 
     def _pot_for(self, ty: Type) -> Optional[int]:
-        """An amount per cell for what holds cells, and per unit of its value for a Fin."""
+        """An amount per cell for what holds cells, per byte of its length for a slot, and per unit for a Fin."""
         return self.unknown() if self._carries(ty) or is_fin(ty) else None
 
     def obligate(self, row: Budget, *, beyond_end: bool = False) -> None:
@@ -441,7 +478,7 @@ class Checker:
 
     def owed(self, ty: Type, have: Optional[int], need: Optional[int]) -> None:
         """A value of type `ty` that carries `have`, where `need` is wanted, whichever way that type carries it."""
-        if is_fin(ty):
+        if self.counted(ty):
             self.units_at_least(have, need)
         else:
             self.at_least(have, need)
@@ -618,7 +655,8 @@ class Checker:
                     raise self.fail(f"r{r} holds {present.ty} on one edge and nothing on another")
                 continue
             ty = self.unify(x.ty, y.ty, f"r{r} at a join") if x.ty != y.ty else x.ty
-            regs[r] = Tok(ty, self._merge_word(x.word, y.word), self._merge_pot(x.pot, y.pot, a, b, units=is_fin(ty)))
+            regs[r] = Tok(ty, self._merge_word(x.word, y.word), self._merge_pot(x.pot, y.pot, a, b,
+                                                                              units=self.counted(ty)))
         cells = {}
         for word in set(a.cells) & set(b.cells):
             cells[word] = self._merge_cell(word, a.cells[word], b.cells[word], a, b)
@@ -1087,12 +1125,35 @@ class Checker:
 
     def i_sget(self, a: list[str]) -> None:
         """sget d, s, i: byte i of slot s, which it reads and leaves where it is. i is a Fin of the slot's size,
-        so every byte it can name is in the slot."""
+        so every byte it can name is in the slot, and one at or past the slot's length is 0, whatever an earlier
+        frame left there: so a slot that is used again shows nothing of the frame before."""
         decl = self._slot(a[1], "sget")
         _i, index = self.full(a[2])
         if index.ty != ("fin", decl.bytes):
             raise self.fail(f"sget at {index.ty}: a slot of {decl.bytes} bytes is read at a Fin {decl.bytes}")
         self.set(a[0], Tok("i8", self.fresh()))
+
+    def i_br_within(self, a: list[str]) -> None:
+        """br.within s, x, d, Lin, Lout: to Lin with d the Fin x is, if x is below slot s's length, and to Lout if not.
+        s stays where it is. d is below the length, so it has fewer units than the slot has bytes, and it carries what
+        it takes of the slot's amount per byte, by the share rule: a walk down from d is paid for by the slot."""
+        decl = self._slot(a[0], "br.within")
+        _r, slot = self.full(a[0])
+        tested = self.scalar(a[1], "br.within's integer")
+        if not is_int(tested.ty):
+            raise self.fail(f"br.within tests an integer, and {a[1]} is {tested.ty}")
+        inside = None
+        if slot.pot is not None:
+            inside = self.unknown()
+            self.share(a[0], slot, inside)
+        assert self.S is not None
+        base = self.S
+        self.S = base.copy()
+        self.edge(a[4])
+        self.S = base
+        self.set(a[2], Tok(("fin", decl.bytes), self.fresh(), inside))
+        self.edge(a[3])
+        self.S = None
 
     def i_slen(self, a: list[str]) -> None:
         """slen d, s: how many of slot s's bytes the runtime filled, which it reads and leaves where it is."""
@@ -1377,7 +1438,7 @@ class Checker:
             want = self.norm(ty)
             token = self.operand(operand)
             self.fits(token, want, f"an argument of {signature.name}")
-            if is_fin(want):
+            if self.counted(want):
                 self.share(operand, token, signature.param_pots[position])
             else:
                 self.at_least(token.pot, signature.param_pots[position])
@@ -1526,7 +1587,7 @@ class Checker:
             r, token = self.full(operand)
             self.unify(token.ty, self.norm(ty), "a result")
             self.fits(token, self.norm(ty), "a result")
-            if is_fin(token.ty):  # one register can be two results, and its amount is shared between them
+            if self.counted(token.ty):  # one register can be two results, and its amount is shared between them
                 self.share(operand, token, fn.result_pots[position])
             else:
                 self.at_least(token.pot, fn.result_pots[position])

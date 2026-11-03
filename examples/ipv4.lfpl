@@ -3,13 +3,14 @@
 # One record for the headers, which the compiler lays across as many cells as they take, and that is five. Each
 # field is what the RFCs call it, in the order the frame has it, and a Be field is held in network byte order
 # and is the integer it says to everything that uses it. `length` is not on the wire: the runtime fills it in.
-data Bytes;
+# The rest of the frame is in a slot, which the frame owns and sends as it came: this handler never reads it.
+slot Payload;
 record Frame {
   dst_hi: Be32, dst_lo: Be16, src_hi: Be32, src_lo: Be16, ethertype: Be16,
   version: Int8, tos: Int8, total: Be16, id: Be16, frag: Be16,
   ttl: Int8, proto: Int8, sum: Be16, source: Be32, destination: Be32,
   length: Int16,
-  body: Bytes
+  body: Payload
 };
 
 # Which way the frame goes. It is held in a register beside the frame, so deciding costs no cell. Send goes to the

@@ -20,7 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE = "examples/forward.lfpl"
 COUNTERS = ("capacity", "pool", "served", "forwarded", "dropped", "too_large", "short", "full",
             "malformed", "send_errors", "recv_errors", "admitted_cells", "budget_steps", "steps",
-            "kernel_dropped", "max_age_ns")
+            "kernel_dropped", "max_age_ns", "slot_capacity", "slots")
 
 
 def free_port() -> int:
@@ -85,7 +85,10 @@ class Forwarder:
                 reply = self.ctl.recv(512)
             except TimeoutError:
                 continue
-            return dict(zip(COUNTERS, struct.unpack(f"<{len(COUNTERS)}Q", reply)))
+            values = struct.unpack(f"<{len(reply) // 8}Q", reply)
+            counts = dict(zip(COUNTERS, values))
+            counts["verdicts"] = values[len(COUNTERS):]  # one for each value of the handler's verdict, by its tag
+            return counts
         raise AssertionError("the control port never answered")
 
     def settle(self, served: int) -> dict:
@@ -768,7 +771,7 @@ handler h(routes: Array[1024] Int8, m: Hdr, free: Free) : (Verdict, Free) =
 """)
 
     def test_an_output_this_runtime_cannot_send(self):
-        self.assert_refused("carries scalars, records and one chain", """
+        self.assert_refused("carries scalars, records, and one chain or one slot", """
 record Hdr { ttl: Int8 };
 data Box = A(a: Int8) | B(b: Int16) | C;
 data Out = Nothing | X(port: Int8, b: Box);

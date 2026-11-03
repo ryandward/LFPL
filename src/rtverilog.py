@@ -16,8 +16,9 @@ and the bound has passed its certificate. The whole handler becomes one synchron
     a slot              its number in bits 0 to 31 and its length in 32 to 47. Its bytes are a whole number of
                         cells of the store, aligned to that many: so byte i of slot k is in the cell whose
                         address is k and i's high bits side by side, in the lane i's low four bits say
-    sget                that cell's read, then a byte of what it returned
+    sget                that cell's read, then a byte of what it returned, or 0 if it is at or past the length
     br.down             the comparison with 0 and the subtraction, in the clock of the branch
+    br.within           the comparison with the slot's length, in the clock of the branch
     call                <= on the callee's parameters, and on its return state if it has several
     ret                 <= on the destination registers of whichever call this is, then its next state
 
@@ -493,6 +494,8 @@ class Emitter:
                 define(a[0], 16)
             elif head == "br.down":
                 moves.append((a[1], a[0]))  # one less is as wide as what it is one less than
+            elif head == "br.within":
+                define(a[2], _bits_for(self._slot_bytes()))
             elif head == "call":
                 callee = self.functions[a[1]]
                 names = _args(a[0].strip("()")) if a[0].startswith("(") else [a[0]]
@@ -884,8 +887,10 @@ class Emitter:
         self._hardware(f"read the cell of byte r{index} of the slot in r{slot}", reads=True,
                        ports=["a_en = 1'b1;", f"a_addr = {{{s}[{number_bits - 1}:0], {i}[{index_bits - 1}:{LANE_BITS}]}};"])
         self.loaded = None  # the port holds a cell of the slot, which is no register's cell
-        i = fn.flop(index)  # the moves the read's clock made are made
-        self._step("sget", text, clocked=[self._set(a[0], f"a_dout[{{{i}[{LANE_BITS - 1}:0], 3'd0}} +: 8]", 8)])
+        s, i = fn.flop(slot), fn.flop(index)  # the moves the read's clock made are made
+        # A byte at or past the length is 0, whatever the cell holds: what an earlier frame left is never read.
+        byte = f"({{{16 - index_bits}'d0, {i}}} < {s}[47:32] ? a_dout[{{{i}[{LANE_BITS - 1}:0], 3'd0}} +: 8] : 8'd0)"
+        self._step("sget", text, clocked=[self._set(a[0], byte, 8)])
 
     def i_slen(self, text: str, a: list[str]) -> None:
         """A slot's length: bits of its register, so wires."""
@@ -1027,6 +1032,23 @@ class Emitter:
         self._edge(a[2], self.loaded)
         self._edge(a[3], self.loaded)
         self._step("br.down", text, clocked=[one_less], next_state=Choice(f"{value} == {width}'d0", a[2], a[3]))
+        self.open_path = False
+
+    def i_br_within(self, text: str, a: list[str]) -> None:
+        """The comparison with the slot's length, in the clock of the branch, and the integer into d at the same edge,
+        as wide as a Fin of the slot's size. On the way to Lout nothing reads d."""
+        fn = self.fn
+        assert fn is not None
+        slot = int(_REG.match(a[0]).group(1))
+        width = fn.widths[int(_REG.match(a[2]).group(1))]
+        natural = self._natural_width(a[1]) or 16
+        compared = max(natural, 16)
+        length = f"{fn.flop(self.pending.get(slot, slot))}[47:32]"
+        condition = f"{self._value(a[1], compared)} < {_pad(length, 16, compared)}"
+        fin = self._set(a[2], self._value(a[1], width), width)
+        self._edge(a[3], self.loaded)
+        self._edge(a[4], self.loaded)
+        self._step("br.within", text, clocked=[fin], next_state=Choice(condition, a[3], a[4]))
         self.open_path = False
 
     def i_br_null(self, text: str, a: list[str]) -> None:
@@ -1226,7 +1248,7 @@ class Emitter:
         return Timing(clocks, tuple(iterations), total)
 
     def _clocks(self, handler: Function, costs: collections.Counter, n_max: Optional[int],
-                sizes: Optional[dict]) -> Bound:
+                sizes: Optional[dict], per_turn: Optional[int] = None) -> Bound:
         """The certificate again, with every instruction charged the clocks this machine spends on it in place
         of its step: the same inequalities, and other numbers in them."""
         checker = Checker(costs)
@@ -1235,7 +1257,7 @@ class Emitter:
         checker.finish()
         if handler.turn:
             assert sizes is not None
-            return certify_turn(checker, handler.name, sizes)
+            return certify_turn(checker, handler.name, sizes, per_turn)
         assert n_max is not None
         return certify(checker, handler.name, n_max)
 
@@ -1353,7 +1375,8 @@ class Emitter:
         return (loop[0] or Span(0, 0), leave[0] or Span(0, 0))
 
     def render(self, handler: Function, module: str, bound: Bound, cells: int, initial: dict[str, str], *,
-               n_max: Optional[int] = None, sizes: Optional[dict] = None, slots: int = 0) -> Translation:
+               n_max: Optional[int] = None, sizes: Optional[dict] = None, slots: int = 0,
+               per_turn: Optional[int] = None) -> Translation:
         """The machine, and its bound in clocks: a handler's for items of up to `n_max` cells, a turn's with
         `sizes` saying how many cells each sized parameter holds, as src/certify.py's certify_turn. `slots` is how
         many slots the store has, after its cells: a program whose items own slots needs one at least."""
@@ -1395,7 +1418,7 @@ class Emitter:
             self._join(fn, entered)
         costs = collections.Counter(state.line for fn in functions for state in fn.states)
         assert None not in costs, "a state is charged to no instruction"
-        timing = self._timing(functions, self._clocks(handler, costs, n_max, sizes))
+        timing = self._timing(functions, self._clocks(handler, costs, n_max, sizes, per_turn))
         memories = {name: _hex_lines(data, self._array_of(ty)) for (name, ty), data in
                     ((slot, initial[slot[0]]) for slot in self.slots if slot[0] in initial)}
         top = (first_slot + slots) * (self._slot_bytes() // CELL_BYTES) - 1 if slots else cells
@@ -1735,9 +1758,12 @@ def translate(lines: Iterable[str], *, n_max: int = 216, k_out: int = 64, cells:
     name = handlers[0].name
     bound = certify(checker, name, n_max)
     reserve = bound.a * n_max + bound.b
-    largest_output = n_max + reserve
-    count = cells if cells is not None else (K_IN * n_max + reserve + n_max + k_out * O_MAX * largest_output)
-    if count < K_IN * n_max + reserve + n_max:
+    # An item's n is its cells and its slot's bytes, and only the cells are the store's: a slot has its own place.
+    item_cells = checker.record_cells(name) if checker.held_slots(name) else n_max
+    item_cells = n_max if item_cells is None else min(item_cells, n_max)
+    largest_output = item_cells + reserve
+    count = cells if cells is not None else (K_IN * item_cells + reserve + item_cells + k_out * O_MAX * largest_output)
+    if count < K_IN * item_cells + reserve + item_cells:
         raise RTError(f"section 3.4: {count} cells cannot hold ingress and one maximal transaction")
     words = count + 1  # word 0 is null
     slot_bytes = {int(line.split()[4]) for line in stream if line.startswith("type ") and line.split()[2] == "slot"}

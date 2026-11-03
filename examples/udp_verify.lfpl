@@ -46,21 +46,24 @@ fn add_up(body: Payload, i: Fin Payload, high: Bool, acc: Int64) : (Payload, Int
   | down(j) => add_up(body, j, !(high), more)
   end;
 
-# The first `bytes` bytes of the payload, summed: the last of them is byte bytes - 1, which is high if bytes is odd.
-fn payload_sum(body: Payload, bytes: Int16) : (Payload, Int64) =
-  if ==(bytes, 0) then (body, 0)
-  else add_up(body, idx(-(bytes, 1), Payload), ==(&(bytes, 1), 1), 0);
+# Right if the pseudo-header, the UDP header and the payload, summed with end-around carry, come to 0xFFFF. The
+# payload's words come to at most 1472 / 2 times 0xFFFF, and the headers' to 9 more of them: below 2^26, so one fold
+# gives at most 0x103FE, and a second at most 0xFFFF.
+fn sum_check(head: Int64, payload: Int64) : Check = if ==(fold(fold(+(head, payload))), 0xFFFF) then Fine else Wrong;
 
 # Only a datagram in one frame can be checked, since its checksum covers all of it, and only one whose checksum is
 # not 0, which the sender uses to say it computed none. `head` is the pseudo-header and the UDP header, summed. The
-# payload's words come to at most 1472 / 2 times 0xFFFF, and the headers' to 9 more of them: below 2^26, so one fold
-# gives at most 0x103FE, and a second at most 0xFFFF.
+# payload's last byte is ulen - 9, which `within` says is inside the slot, or not: the payload is then shorter than
+# the UDP length says. The walk down from it is paid for by the slot's bytes, so a short frame's bound is a short one.
+# The last byte is the high half of its word if it is at an even place, which is when ulen is odd.
 fn verified(body: Payload, checkable: Bool, total: Int16, ulen: Int16, head: Int64) : (Payload, Check) =
   if !(checkable) then (body, Fine)
   else if ||(<(ulen, 8), !=(ulen, -(total, 20))) then (body, Broken)
-  else if <(len(body), -(ulen, 8)) then (body, Broken)
-  else let (rest, payload) = payload_sum(body, -(ulen, 8)) in
-    (rest, if ==(fold(fold(+(head, payload))), 0xFFFF) then Fine else Wrong);
+  else if ==(ulen, 8) then (body, sum_check(head, 0))
+  else match within(body, -(ulen, 9)) with
+  | outside => (body, Broken)
+  | inside(last) => let (rest, payload) = add_up(body, last, ==(&(ulen, 1), 1), 0) in (rest, sum_check(head, payload))
+  end;
 
 # As in ipv4.lfpl.
 fn patched(sum: Int16, ttl: Int8, proto: Int8) : Int16 =

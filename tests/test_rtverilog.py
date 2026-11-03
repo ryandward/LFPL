@@ -238,7 +238,7 @@ handler h(m: Hd, free: Free) : (Out, Free) = match m with Hd(d, a) => (Send@d(if
 
     def test_a_verdict_is_its_tag_and_its_port_in_one_register_on_a_port_of_its_own(self):
         with open(os.path.join(ROOT, "examples", "ipv4.lfpl"), "rb") as handle:
-            verilog = translate(list(rt_lines(handle)), n_max=217).verilog
+            verilog = translate(list(rt_lines(handle)), n_max=217, slots=1).verilog
         self.assertIn("output reg  [63:0] verdict_out,", verilog)
         self.assertRegex(verilog, r"= \{56'd0, 8'd1\};", "Expired is its tag alone")
         self.assertRegex(verilog, r"= \{48'd0, [^,]+, 8'd2\};", "Send's port is the byte above its tag")
@@ -854,8 +854,9 @@ class Layout:
             loads.append((first_free + index, 0x00ff, following))
         return loads, 1, (first_free if reserve else 0), first_free - 1 + reserve
 
-    def gather(self, out: int, free: int, words: dict, verdict: Optional[int] = None) -> tuple:
-        """What egress would do with an output: where it goes, its bytes, and how many cells came back."""
+    def gather(self, out: int, free: int, words: dict, verdict: Optional[int] = None, payload: bytes = b"") -> tuple:
+        """What egress would do with an output: where it goes, its bytes, and how many cells came back. A slot's bytes
+        are not among the words, and nothing writes them: they are `payload`, the datagram's, as many as the slot says."""
         names = self.by_type[self.out_type]
         kind = self.kinds[self.out_type]
         back = 0
@@ -893,10 +894,15 @@ class Layout:
                     walk(inner, int.from_bytes(field(words[pointer], offset, size), "little"))
                 elif self._is_scalar(type_text):
                     payload_out += field(words[pointer], offset, size)
+                elif self.is_slot(type_text):
+                    slot_field.append(int.from_bytes(field(words[pointer], offset, size), "little"))
                 else:
                     chain = int.from_bytes(field(words[pointer], offset, size), "little")
 
+        slot_field: list = []
         walk(ctor, out)
+        if slot_field:
+            payload_out += payload[:slot_field[0] >> 32]
         if self.verdict_type is not None:  # the record goes where the verdict's port says, or it comes back
             assert verdict is not None
             said = next(c for c in self.by_type[self.verdict_type] if self.ctors[c][0] == str(verdict & 0xFF))
@@ -919,10 +925,15 @@ def simulate_images(translation: Translation, layout: Layout, datagrams: list) -
     for number, datagram in enumerate(datagrams):
         wire_bytes, record_cells = layout.shape(layout.item)
         slot = translation.first_slot + number % translation.slots if translation.slots else None
-        n = record_cells - 1 + (0 if slot is not None else cells_in(max(0, len(datagram) - wire_bytes)))
-        reserve = bound.a * n + bound.b
+        if slot is not None:  # n is the record's cells and the slot's bytes, and only the cells come back
+            n = record_cells + max(0, len(datagram) - wire_bytes)
+            reserve = bound.a * n + bound.b
+            cells.append((record_cells, reserve))
+        else:
+            n = record_cells - 1 + cells_in(max(0, len(datagram) - wire_bytes))
+            reserve = bound.a * n + bound.b
+            cells.append((n, reserve))
         loads, item, free, words = layout.image(datagram, reserve, slot)
-        cells.append((n, reserve))
         lines += image_lines(item, free, words, loads)
     results, summary = run_images(translation, lines)
     return results, summary, cells
@@ -980,9 +991,11 @@ class OtherHandlers(unittest.TestCase):
     def compare(self, source: str, initial: dict, options: tuple, datagrams: list, said: str) -> Translation:
         with open(source, "rb") as handle:
             lines = list(rt_lines(handle))
-        translation = translate(lines, initial=initial)
+        slotted = any(line.startswith("type ") and line.split()[2] == "slot" for line in lines)
+        translation = translate(lines, initial=initial, slots=4 if slotted else 0)
         layout = Layout(lines)
         results, summary, cells = simulate_images(translation, layout, datagrams)
+        wire_bytes = layout.shape(layout.item)[0]
         self.assertEqual((summary["both_ports"], summary["same_address"]), ("0", "0"), said)
         with tempfile.TemporaryDirectory() as workdir:
             router = Forwarder(bytes(1024), workdir, build_options=("--count-steps", *options), source=source)
@@ -990,7 +1003,8 @@ class OtherHandlers(unittest.TestCase):
                 before = router.stats()
                 for number, (datagram, result, (n, reserve)) in enumerate(zip(datagrams, results, cells), 1):
                     router.raw(datagram)
-                    port, sent, back = layout.gather(result["out"], result["free"], result["words"], result["verdict"])
+                    port, sent, back = layout.gather(result["out"], result["free"], result["words"], result["verdict"],
+                                                     datagram[wire_bytes:])
                     context = f"{said}, datagram {datagram.hex()}"
                     self.assertEqual(back, n + reserve, context)
                     if port is not None and port < len(router.outputs):

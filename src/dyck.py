@@ -38,9 +38,11 @@ already begins with a keyword or a name, so one token of lookahead decides it.
               | id '[' e ']'
     cells   ::= id | '(' id {',' id} ')'
     arm     ::= Name ['(' id {',' id} ')'] '=>' e | '0' '=>' e | 'down' '(' id ')' '=>' e
+              | 'inside' '(' id ')' '=>' e | 'outside' '=>' e
 
 `Fin Name` and `idx(e, Name)` name a slot, whose size in bytes is the bound. `id[e]` reads a byte of the slot
-`id` names, and `0` and `down(j)` are the two arms of a match on a Fin, which counts it down.
+`id` names, and `0` and `down(j)` are the two arms of a match on a Fin, which counts it down. `inside(i)` and
+`outside` are the two of a match on `within(s, x)`, which says whether x is below the slot's length.
 """
 from __future__ import annotations
 
@@ -99,7 +101,7 @@ _KINDS = tuple((
     "FN PARAM TYPE RESWORD DATA CTORDECL FIELD RECORD LET BINDER IF MATCH ARM "
     "WITH BINOP CMP AND OR NOT CALL CTOR DIAMOND PACK VAR INT BOOL NULLCTOR "
     "EOF HANDLER STATE TARRAY TFIN TTUPLE TUPLE IDX GET RTDECL RTDECLMORE LOW "
-    "VARLAST LIVE UPDATE VARAT ENUM VALUE TURN SLOT SGET SLEN TFINNAME "
+    "VARLAST LIVE UPDATE VARAT ENUM VALUE TURN SLOT SGET SLEN TFINNAME WITHIN "
 ).split())
 (
     K_FN, K_PARAM, K_TYPE, K_RESWORD, K_DATA, K_CTORDECL, K_FIELD, K_RECORD,
@@ -118,10 +120,13 @@ _KINDS = tuple((
     K_SGET,             # `s[i]`, open(SGET, s): byte i of the slot s, which it reads and keeps
     K_SLEN,             # and `len(s)`, from Check, which knows len for the primitive it is
     K_TFINNAME,         # `Fin S`: the bound is the size of slot S in bytes, a build constant
+    K_WITHIN,           # `within(s, x)`, from Check: x, if it is below the length of slot s, as a Fin
 ) = range(len(_KINDS))
 FUNCTIONS = (K_FN, K_HANDLER, K_TURN)
 DOWN = b"down"  # the arm of a match on a Fin that binds one less. An arm that says `0` has a payload of zeros
 SLOT = b"slot"  # what a declaration of a slot starts with. Like `down`, it is a word only there, and a name anywhere else
+INSIDE, OUTSIDE = b"inside", b"outside"  # the arms of a match on `within(s, x)`, words only where an arm starts
+ARM_WORDS = (DOWN, INSIDE, OUTSIDE)
 VARAT = struct.Struct("<HB")  # the position, and whether the right-to-left pass found this to be its last use
 VALUE = struct.Struct("<HB")  # the constructor, as Check numbers it, and how many fields it has
 
@@ -755,8 +760,8 @@ class Parser(Stage):
             else:
                 if tag == T_INT and payload[:8] == bytes(8):
                     payload = bytes(len(payload))  # the arm of a Fin that is 0
-                elif tag != T_NAME and not (tag == T_IDENT and payload.rstrip(b"\0") == DOWN):
-                    raise self._fail("a constructor pattern, or 0 or down(j) for a Fin", tag)
+                elif tag != T_NAME and not (tag == T_IDENT and payload.rstrip(b"\0") in ARM_WORDS):
+                    raise self._fail("a constructor pattern, 0 or down(j) for a Fin, or inside(i) or outside", tag)
                 self._set(S_M_NEXT)
                 self._push(K_ARM, S_ARM_OPEN, None)
                 self._emit(cell, OPEN, K_ARM, payload)

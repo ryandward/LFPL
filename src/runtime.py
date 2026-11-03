@@ -26,6 +26,13 @@ What the source does not say, this file decides:
                     an empty body. A program can leave the type abstract, or declare exactly
                     that layout to walk it. Bytes past the used count read as zero, so nothing
                     from an earlier item can be seen.
+    Slot            in place of a chain, a slot: the bytes after the scalars go into one, and the
+                    record's field holds its number and how many they are. Slot k is 2048 k bytes
+                    into the cell store, after the cells, as on the hardware target. Ingress holds
+                    one, and admission gives it a free one in place of the one the item takes. A byte
+                    a handler reads past the length is 0, whatever an earlier item left in it, because
+                    that is what reading a slot means, and not because anything here clears it. An
+                    item's n is its record's cells and its slot's bytes, which is what the bound counts.
     Output          a constructor with a field named `port` is sent to `out_base + port`,
                     as its other scalar fields followed by its chain. Any other constructor
                     sends nothing, and its cells go back to the pool.
@@ -67,7 +74,9 @@ CONTROL_BYTES = 64         # a timestamp takes 32, and a count 24
 # for each item, and is otherwise 0. Nothing refuses on it yet.
 COUNTERS = ("capacity", "pool", "served", "forwarded", "dropped", "too_large", "short", "full",
             "malformed", "send_errors", "recv_errors", "admitted_cells", "budget_steps", "steps",
-            "kernel_dropped", "max_age_ns")
+            "kernel_dropped", "max_age_ns", "slot_capacity", "slots")
+# slot_capacity and slots are the free slots when nothing is held, and now, counted as the pool is. After them, one
+# counter for each value of a handler's verdict, in the order its enum declares them.
 PARAMS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
 RESULTS = ("rax", "rdx", "rcx", "rsi", "rdi", "r8")
 _WIDTH = {1: "byte", 2: "word", 4: "dword", 8: "qword"}
@@ -95,6 +104,7 @@ class Walk:
     links: tuple[tuple[int, int, int], ...]    # cell, offset, the cell the field points to
     chain: Optional[tuple[int, int]]           # cell, offset
     length: Optional[tuple[int, int]]          # cell, offset
+    slot: Optional[tuple[int, int]] = None     # cell, offset: in place of a chain
 
     @property
     def wire_bytes(self) -> int:
@@ -143,17 +153,42 @@ class Image:
     depth: int
     options: Options
     verdict: bool = False  # what goes out is a record, and which way it goes is an enum in a register beside it
+    slot_bytes: int = 0    # a slot's size, if the item holds one
 
     @property
     def largest_output(self) -> int:
         """N_out: an output can hold every cell of its item and of its reserve."""
-        return self.options.n_max + self.reserve_at_most
+        return self.in_cells + self.reserve_at_most
+
+    @property
+    def slotted(self) -> bool:
+        return self.item.slot is not None
+
+    @property
+    def in_cells(self) -> int:
+        """The cells ingress holds: N_max for a chain, and the record's own for a slot, which holds the rest."""
+        return self.item.cells if self.slotted else self.options.n_max
+
+    @property
+    def n_largest(self) -> int:
+        """The largest n: N_max cells, or the record's cells and a full slot's bytes."""
+        return self.item.cells + self.slot_bytes if self.slotted else self.options.n_max
+
+    @property
+    def slot_count(self) -> int:
+        """Ingress's, one for each output the queue holds, and the one a new item takes before ingress gets another."""
+        return self.options.k_out + 1 if self.slotted else 0
+
+    @property
+    def first_slot(self) -> int:
+        """Slots come after the cells, and slot k starts 2048 k bytes into the store."""
+        return (CELL * self.cell_count + self.slot_bytes - 1) // self.slot_bytes if self.slotted else 0
 
     @property
     def cell_count(self) -> int:
         """Section 3.4: C = K_in N_max + (R(N_max) + N_max) + K_out O_max N_out + S_cap. At this
         size Short cannot happen: a queue with room always leaves a maximal transaction's cells."""
-        n_max = self.options.n_max
+        n_max = self.in_cells
         if self.options.cells is not None:
             return self.options.cells
         return (K_IN * n_max + self.reserve_at_most + n_max
@@ -162,11 +197,11 @@ class Image:
     @property
     def reserve_at_most(self) -> int:
         """R(N_max)."""
-        return self.bound.a * self.options.n_max + self.bound.b
+        return self.bound.a * self.n_largest + self.bound.b
 
     @property
     def capacity(self) -> int:
-        return self.cell_count - K_IN * self.options.n_max
+        return self.cell_count - K_IN * self.in_cells
 
 
     @property
@@ -188,8 +223,14 @@ class Image:
 
     @property
     def bytes(self) -> int:
-        return (self.cell_count * CELL + self.stack_bytes
-                + sum(s.length * s.element_size for s in self.states))
+        return (self.store_bytes + self.stack_bytes + sum(s.length * s.element_size for s in self.states))
+
+    @property
+    def store_bytes(self) -> int:
+        """The cells, and the slots after them."""
+        if self.slotted:
+            return (self.first_slot + self.slot_count) * self.slot_bytes
+        return self.cell_count * CELL
 
 
 def handler_slots(checker: Checker, initial: dict[str, str], *, verdicts: bool = False) -> tuple:
@@ -227,6 +268,7 @@ def bind(checker: Checker, handler_name: str, depth: int, options: Options,
     item = _walk(checker, decl.name, decl.ctors[0].fields, from_the_wire=True)
     if options.n_max < item.cells:
         raise BindingError(f"section 8.2: N_max of {options.n_max}, and {decl.name} alone is {item.cells} cells")
+    slot_bytes = next((t.bytes for t in checker.types.values() if t.kind == "slot"), 0) if item.slot else 0
     out_decl = checker._decl(out_type)
     verdict = _verdict_of(checker, fn, states)
     if verdict is not None:
@@ -242,8 +284,22 @@ def bind(checker: Checker, handler_name: str, depth: int, options: Options,
         if len(ctor.walk.scalars) > IOV_MAX:
             raise BindingError(f"section 8.2: {ctor.name} has {len(ctor.walk.scalars)} fields to send, "
                                f"and one message gathers {IOV_MAX}")
-    return Image(handler_name, states, item, verdict is not None or out_decl.kind == "tagged", out,
-                 checker.bounds(handler_name), depth, options, verdict is not None)
+    image = Image(handler_name, states, item, verdict is not None or out_decl.kind == "tagged", out,
+                  checker.bounds(handler_name), depth, options, verdict is not None, slot_bytes)
+    if item.slot is not None and any(ctor.walk.slot is None for ctor in out if ctor.port is not None):
+        raise BindingError("section 3.1: an output sent from a slot item sends its slot")
+    return image
+
+
+def largest_n(checker: Checker, handler_name: str, options: Options) -> int:
+    """The n a handler's bound is certified at: N_max cells, or for an item that holds a slot, its record's cells
+    and a full slot's bytes, since n counts both."""
+    if checker.held_slots(handler_name):
+        cells = checker.record_cells(handler_name)
+        slot_bytes = next(t.bytes for t in checker.types.values() if t.kind == "slot")
+        if cells is not None:
+            return cells + slot_bytes
+    return options.n_max
 
 
 def _verdict_of(checker: Checker, fn, states: tuple) -> Optional[TypeDecl]:
@@ -301,7 +357,7 @@ def _walk(checker: Checker, owner: str, fields: list, *, from_the_wire: bool = F
     """Where everything is, going through these fields and the record of any field that is one."""
     scalars: list = []
     links: list = []
-    found: dict[str, Optional[tuple[int, int]]] = {"chain": None, "length": None}
+    found: dict[str, Optional[tuple[int, int]]] = {"chain": None, "length": None, "slot": None}
     cells = 1
 
     def visit(cell: int, owner: str, fields: list, within: frozenset) -> None:
@@ -328,14 +384,16 @@ def _walk(checker: Checker, owner: str, fields: list, *, from_the_wire: bool = F
                 cells += 1
                 links.append((cell, off, inner))
                 visit(inner, decl.name, decl.ctors[0].fields, within | {decl.name})
-            elif _is_chain(checker, ty) and found["chain"] is None:
+            elif _is_chain(checker, ty) and found["chain"] is None and found["slot"] is None:
                 found["chain"] = (cell, off)
+            elif decl.kind == "slot" and found["chain"] is None and found["slot"] is None:
+                found["slot"] = (cell, off)
             else:
                 raise BindingError(f"section 3.1: {owner}.{name} is {decl.name}, and this runtime "
-                                   f"carries scalars, records and one chain")
+                                   f"carries scalars, records, and one chain or one slot")
 
     visit(0, owner, fields, frozenset((owner,)))
-    return Walk(cells, tuple(scalars), tuple(links), found["chain"], found["length"])
+    return Walk(cells, tuple(scalars), tuple(links), found["chain"], found["length"], found["slot"])
 
 
 def _out_ctor(checker: Checker, ctor: Ctor) -> OutCtor:
@@ -373,7 +431,11 @@ def _read_out_cells(add: Callable[[str], None], walk: Walk) -> None:
 
 
 def _free_all_but_the_first(add: Callable[[str], None], walk: Walk) -> None:
-    """The chain first, because a cell's next field is the first thing giving it back overwrites."""
+    """The slot or the chain first, because a cell's next field is the first thing giving it back overwrites."""
+    if walk.slot is not None:
+        _out_cell(add, "rax", walk.slot[0])
+        add(f"    mov eax, [rax+{walk.slot[1]}]")
+        add("    call push_slot")
     if walk.chain is not None:
         _out_cell(add, "rdi", walk.chain[0])
         add(f"    mov rdi, [rdi+{walk.chain[1]}]")
@@ -388,17 +450,17 @@ def assembly(image: Image) -> str:
     o = image.options
     item = image.item
     item_count = len(item.scalars)
-    iov_in = item_count + image.body_cells
+    iov_in = item_count + (1 if image.slotted else image.body_cells)
     if iov_in > IOV_MAX:
         raise BindingError("section 8.2: N_max is past what one recvmsg can scatter")
     if image.bytes > MAX_IMAGE_BYTES:
         raise BindingError(f"section 8.2: {image.handler} needs an image of {image.bytes} bytes, and "
                            f"this runtime takes at most {MAX_IMAGE_BYTES}")
-    if image.bound.c * o.n_max + image.bound.d >= WORD_LIMIT:
+    if image.bound.c * image.n_largest + image.bound.d >= WORD_LIMIT:
         raise BindingError(f"section 8.2: W(N_max) of {image.handler} is "
-                           f"{image.bound.c * o.n_max + image.bound.d} steps, which admission's "
+                           f"{image.bound.c * image.n_largest + image.bound.d} steps, which admission's "
                            f"64-bit arithmetic cannot hold")
-    smallest = K_IN * o.n_max + image.reserve_at_most + o.n_max
+    smallest = K_IN * image.in_cells + image.reserve_at_most + image.in_cells
     if image.cell_count < smallest:
         raise BindingError(f"section 3.4: {image.cell_count} cells cannot hold ingress and one "
                            f"maximal transaction, which take {smallest}")
@@ -411,7 +473,7 @@ def assembly(image: Image) -> str:
     add("global _start")
     add(f"handler_entry equ fn_{image.handler}")
     fixed_image_startup(add)
-    add("    ; 5: ingress takes the first N_max cells, and the rest are the pool")
+    add("    ; 5: ingress takes the first N_max cells, or its record's for a slot, and the rest are the pool")
     add("    mov edi, cells")
     for cell in range(item.cells):
         add(f"    lea rax, [rdi+{CELL * cell}]")
@@ -433,7 +495,22 @@ def assembly(image: Image) -> str:
     add("    dec rcx")
     add("    jmp .body_iovec")
     add(".body_done:")
-    add(f"    mov eax, cells+{CELL * image.options.n_max}")
+    if image.slotted:
+        add("    ; and the first slot, and a stack of the free ones")
+        add(f"    mov qword [in_slot], {image.first_slot}")
+        add(f"    mov qword [in_iov+{16 * item_count}], cells+{image.slot_bytes * image.first_slot}")
+        add(f"    mov qword [in_iov+{16 * item_count + 8}], {image.slot_bytes}")
+        add(f"    mov eax, {image.first_slot + 1}")
+        add("    xor edx, edx")
+        add(".free_slots:")
+        add("    mov [slot_free+rdx*8], rax")
+        add("    inc rax")
+        add("    inc rdx")
+        add(f"    cmp rdx, {image.slot_count - 1}")
+        add("    jb .free_slots")
+        add("    mov [slot_free_count], rdx")
+        add("    mov [cnt_slot_capacity], rdx")
+    add(f"    mov eax, cells+{CELL * image.in_cells}")
     add("    xor esi, esi")
     add(f"    mov ecx, {image.capacity}")
     add(".thread:")
@@ -541,26 +618,34 @@ def assembly(image: Image) -> str:
     add("    jb .malformed")
     add(f"    sub rax, {item.wire_bytes}")
     add("    mov r12, rax")
-    if item.chain is None:
-        add("    test rax, rax")
-        add("    jnz .too_large")
-    add(f"    add rax, {BODY_PAYLOAD - 1}")
-    add("    xor edx, edx")
-    add(f"    mov ecx, {BODY_PAYLOAD}")
-    add("    div rcx")
-    add("    mov r13, rax")
+    if image.slotted:
+        add("    ; n is the record's cells and the slot's bytes: the record's cells are new ones, and so is a slot")
+        add("    xor r13d, r13d")
+    else:
+        if item.chain is None:
+            add("    test rax, rax")
+            add("    jnz .too_large")
+        add(f"    add rax, {BODY_PAYLOAD - 1}")
+        add("    xor edx, edx")
+        add(f"    mov ecx, {BODY_PAYLOAD}")
+        add("    div rcx")
+        add("    mov r13, rax")
     add(f"    lea r14, [rax+{item.cells}]")
     add("    mov rax, [admission]")
     add("    imul rax, r14")
     add("    add rax, [admission+8]")
     add("    mov r15, rax")
-    add("    add rax, r14")
+    add(f"    add rax, {item.cells}" if image.slotted else "    add rax, r14")  # R(n), and the cells the item takes
     add("    cmp [pool_count], rax")
     add("    jb .short")
     add("    mov rax, [q_count]")
     add(f"    add rax, {O_MAX}")
     add(f"    cmp rax, {image.options.k_out}")
     add("    ja .full")
+    if image.slotted:
+        add("    ; a free slot for ingress to take, last, as the turn takes a spare: a full queue holds every other one")
+        add("    cmp qword [slot_free_count], 0")
+        add("    je .short")
     if o.measure_age:
         add("    call note_age")
     add("    ; n comes from the datagram's length, and R(n) and W(n) from the table")
@@ -620,6 +705,21 @@ def assembly(image: Image) -> str:
     if item.chain is not None:
         add(f"    mov rcx, [slot_cells+{8 * item.chain[0]}]")
         add(f"    mov [rcx+{item.chain[1]}], r8")
+    if item.slot is not None:
+        add("    ; the slot ingress filled is the item's: its number, and how many bytes it holds")
+        add("    mov rax, r12")
+        add("    shl rax, 32")
+        add("    or rax, [in_slot]")
+        add(f"    mov rcx, [slot_cells+{8 * item.slot[0]}]")
+        add(f"    mov [rcx+{item.slot[1]}], rax")
+        add("    ; and ingress takes a free one")
+        add("    dec qword [slot_free_count]")
+        add("    mov rax, [slot_free_count]")
+        add("    mov rax, [slot_free+rax*8]")
+        add("    mov [in_slot], rax")
+        add(f"    shl rax, {image.slot_bytes.bit_length() - 1}")
+        add("    add rax, cells")
+        add(f"    mov [in_iov+{16 * item_count}], rax")
     if item.length is not None:
         add(f"    lea rax, [r12+{item.wire_bytes}]")
         add(f"    mov rcx, [slot_cells+{8 * item.length[0]}]")
@@ -673,6 +773,8 @@ def assembly(image: Image) -> str:
         _dispatch(add, image, "r12", ".out")
     for position, ctor in enumerate(image.out):
         add(f".out_{position}:")
+        if image.verdict:
+            add(f"    inc qword [cnt_verdict_{position}]")
         if ctor.port is not None:
             add("    inc qword [cnt_forwarded]")
             add("    mov rax, [q_head]")
@@ -830,6 +932,18 @@ def _send(add: Callable[[str], None], image: Image, position: int, walk: Walk, o
         add(f"    mov qword [out_iov+{16 * index + 8}], {size}")
     add(f"    mov ecx, {len(walk.scalars)}")
     add(f"    mov ebx, out_iov+{16 * len(walk.scalars)}")
+    if walk.slot is not None:  # the slot's bytes, as many as it says it holds
+        _out_cell(add, "rax", walk.slot[0])
+        add(f"    mov rax, [rax+{walk.slot[1]}]")
+        add("    mov rdx, rax")
+        add("    shr rdx, 32")
+        add("    mov [rbx+8], rdx")
+        add("    mov eax, eax")
+        add(f"    shl rax, {image.slot_bytes.bit_length() - 1}")
+        add("    add rax, cells")
+        add("    mov [rbx], rax")
+        add("    add rbx, 16")
+        add("    inc rcx")
     if walk.chain is not None:
         _out_cell(add, "rdi", walk.chain[0])
         add(f"    mov rdi, [rdi+{walk.chain[1]}]")
@@ -910,10 +1024,13 @@ def _control_and_the_rest(add: Callable[[str], None], image: Image, item: Walk, 
     add("    jmp .walk")
     add(".walked:")
     add("    mov [cnt_pool], rcx")
+    if image.slotted:
+        add("    mov rax, [slot_free_count]")
+        add("    mov [cnt_slots], rax")
     add("    mov eax, 44")
     add("    mov rdi, [ctl_fd]")
     add("    mov esi, counters")
-    add(f"    mov edx, {8 * len(COUNTERS)}")
+    add(f"    mov edx, {8 * (len(COUNTERS) + image.verdict * len(image.out))}")
     add("    mov r10d, 64")
     add("    mov r8d, peer")
     add("    mov r9d, 16")
@@ -963,7 +1080,8 @@ def _control_and_the_rest(add: Callable[[str], None], image: Image, item: Walk, 
     add(f"resb {image.stack_bytes}")
     add("stack_top:")
     add("alignb 16")
-    add(f"cells: resb {CELL * image.cell_count}")
+    add("alignb 4096")
+    add(f"cells: resb {image.store_bytes}")
     for state in image.states:
         if state.initial is None:
             add("alignb 16")
@@ -987,11 +1105,14 @@ def _control_and_the_rest(add: Callable[[str], None], image: Image, item: Walk, 
     for position in range(k):
         add(f"state_{position}: resq 1")
     for name in ("pool", "pool_count", "q_head", "q_count", "turn", "in_fd", "out_fd",
-                 "ctl_fd", "egress_paused"):
+                 "ctl_fd", "egress_paused", "in_slot", "slot_free_count"):
         add(f"{name}: resq 1")
+    add(f"slot_free: resq {max(1, image.slot_count)}")
     add("counters:")
     for name in COUNTERS:
         add(f"cnt_{name}: resq 1")
+    for position in range(len(image.out) if image.verdict else 0):
+        add(f"cnt_verdict_{position}: resq 1")
     add("peer: resb 16")
     add("peer_len: resd 1")
     add("alignb 8")
@@ -1067,6 +1188,12 @@ def pool_routines(add: Callable[[str], None]) -> None:
     add("    mov [rdi], rax")
     add("    mov [pool], rdi")
     add("    inc qword [pool_count]")
+    add("    ret")
+    add("; A slot, by its number in eax, back on the stack of free ones. Uses rcx.")
+    add("push_slot:")
+    add("    mov rcx, [slot_free_count]")
+    add("    mov [slot_free+rcx*8], rax")
+    add("    inc qword [slot_free_count]")
     add("    ret")
     add("free_chain:")
     add("    test rdi, rdi")

@@ -1,12 +1,12 @@
 """The runtime's turn in LFPL, for one handler: src/turn.lfpl, filled in from the handler's own checked stream.
 
 What the turn does is fixed, and written once in src/turn.lfpl. What depends on the handler is filled in here: the
-record its item is, which field of it is the chain, the verdict it returns, and how many places the output queue has.
+record its item is, which field of it is the slot, the verdict it returns, and how many places the output queue has.
 The result is LFPL, appended to the handler's program, and it goes through every stage the handler does. So the turn
 is typed and its bound certified like any other code, and src/rtverilog.py lowers it with the handler.
 
 It serves the shape examples/ipv4.lfpl has, and refuses any other with a reason: a handler with no state slots, that
-draws nothing from its reserve, takes a record with one chain, and returns a verdict beside that same record.
+draws nothing from its reserve, takes a record whose payload is one slot, and returns a verdict beside that record.
 """
 from __future__ import annotations
 
@@ -16,19 +16,28 @@ import string
 from dataclasses import dataclass
 
 from .certify import certify
+from .check import SLOT_BYTES
 from .rtcheck import Checker, TypeDecl
 from .rtlower import rt_lines
-from .runtime import BODY_PAYLOAD, Walk, _is_chain, _walk
+from .runtime import Walk, _walk
+from .spans import FIELDS_MAX, SIZES
+
+# A turn is told a frame's length in 15 bits, beside the bit that says egress has sent, and ingress counts a frame to
+# one byte past what it holds. Section 8.2 keeps that far below 2^15 for every record: at most 64 fields on the wire,
+# none of more than 8 bytes, and one slot. So no handler needs refusing for it.
+assert FIELDS_MAX * max(SIZES.values()) + SLOT_BYTES + 1 < 1 << 15
 
 TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "turn.lfpl")
 TURN = "serve"
 LINK = "$next"
-_TYPES = {"Pool", "Out", "Queue", "Turned"}
-_CTORS = {"Dry", "Cell", "None", "Pending", "Idle", "Queued", "Dropped", "Runt", "TooLarge", "Short", "Full"}
-_FUNCTIONS = {"give", "give_chain", "give_free", "give_frame", "give_out", "split", "unsplit", "refill", "is_full",
-              "release", "enqueue", TURN}
-# What the turn returns in its last result, by tag, which is the order src/turn.lfpl declares them in.
+_TYPES = {"Pool", "Spares", "Out", "Queue", "Turned"}
+_CTORS = {"Dry", "Cell", "NoSpare", "Spare", "None", "Pending", "Idle", "Queued", "Dropped", "Runt", "TooLarge",
+          "Short", "Full"}
+_FUNCTIONS = {"give", "give_free", "give_frame", "give_out", "is_full", "release", "enqueue", TURN}
+# What the turn returns in its last result, by tag, which is the order src/turn.lfpl declares them in. Queued and
+# Dropped carry the tag of the handler's verdict in the byte above their own.
 OUTCOMES = ("idle", "queued", "dropped", "runt", "too_large", "short", "full")
+DECIDED = ("queued", "dropped")
 
 
 class TurnRefused(Exception):
@@ -40,17 +49,25 @@ class Shape:
     """What the hardware around the turn needs to know: where a frame's bytes go, and where the queue's head is."""
     handler: str
     item: str                 # the record's name
-    item_walk: Walk           # its cells, scalars, links, chain and length, as src/runtime.py walks them
+    item_walk: Walk           # its cells, scalars, links, slot and length, as src/runtime.py walks them
     parts: int                # the cells of the record itself
     wire: int                 # bytes of it on the wire
-    capacity: int             # the most bytes a frame in ingress can have: what N_max cells hold
-    n_max: int                # the most cells a frame takes in
-    n_out: int                # and the most an output can hold going out
+    slot_bytes: int           # what its slot holds
     k_out: int                # outputs the queue holds: its head and the places after it
     verdicts: tuple           # (name, tag, the port's offset in the register, or None)
 
+    @property
+    def capacity(self) -> int:
+        """The most bytes a frame in ingress can have: the record's on the wire, and a full slot."""
+        return self.wire + self.slot_bytes
 
-def turn_source(program: bytes, *, n_max: int, k_out: int = 4) -> tuple[str, Shape]:
+    @property
+    def n_max(self) -> int:
+        """The largest n of a frame: its record's cells, and a full slot's bytes."""
+        return self.parts + self.slot_bytes
+
+
+def turn_source(program: bytes, *, k_out: int = 4) -> tuple[str, Shape]:
     """The handler's program with the turn appended, and what the machine needs to know about it."""
     if k_out < 2:
         raise TurnRefused(f"section 8.2: K_out of {k_out}: the queue has its head and at least one place after it")
@@ -72,30 +89,25 @@ def turn_source(program: bytes, *, n_max: int, k_out: int = 4) -> tuple[str, Sha
     decl = checker._decl(item_type)
     if decl is None or decl.kind != "record" or checker.norm(results[1]) != item_type:
         raise TurnRefused("the turn queues the record the handler was given, and this handler returns another")
-    bound = certify(checker, handler.name, n_max)
-    if bound.a or bound.b:
-        raise TurnRefused(f"the turn hands the handler an empty reserve, and {handler.name} draws "
-                          f"R(n) = {bound.a} n + {bound.b}")
     walk = _walk(checker, decl.name, decl.ctors[0].fields, from_the_wire=True)
     fields, parts = _source_fields(checker, decl)
     if walk.cells != parts:
-        raise TurnRefused(f"{decl.name} holds a record in a field, and the turn frees only its own cells and its chain")
-    chain = [index for index, (_name, ty) in enumerate(fields) if checker._decl(checker.norm(ty)) is not None]
-    if walk.chain is None or len(chain) != 1:
-        raise TurnRefused(f"the turn takes a record with one chain, and {decl.name} has {len(chain)} linear fields")
-    chain_decl = checker._decl(checker.norm(fields[chain[0]][1]))
-    assert chain_decl is not None
-    last, chunk, definition = _chain(checker, chain_decl, fields[chain[0]][1])
-    _no_clash(checker, {last, chunk} if definition else set())
+        raise TurnRefused(f"{decl.name} holds a record in a field, and the turn frees only its own cells and its slot")
+    linear = [index for index, (_name, ty) in enumerate(fields) if checker._decl(checker.norm(ty)) is not None]
+    if walk.slot is None or len(linear) != 1:
+        raise TurnRefused(f"the turn takes a record whose payload is one slot, and {decl.name} has "
+                          f"{'a chain' if walk.chain is not None else f'{len(linear)} linear fields'}")
+    slot_decl = checker._decl(checker.norm(fields[linear[0]][1]))
+    assert slot_decl is not None
+    bound = certify(checker, handler.name, parts + slot_decl.bytes)
+    if bound.a or bound.b:
+        raise TurnRefused(f"the turn hands the handler an empty reserve, and {handler.name} draws "
+                          f"R(n) = {bound.a} n + {bound.b}")
+    _no_clash(checker)
     verdicts = _verdicts(checker, checker.types[verdict_type[1]])
-    capacity = walk.wire_bytes + BODY_PAYLOAD * (n_max - parts)
-    if capacity + 1 >= 1 << 16:  # ingress counts a frame up to one byte past what it holds
-        raise TurnRefused(f"section 8.2: N_max of {n_max} holds {capacity} bytes, and one more is past what a 16-bit "
-                          f"length counts")
-    text = _fill(handler.name, decl.name, fields, chain[0], chain_decl.name, last, chunk, definition, parts,
-                 walk.wire_bytes, capacity, k_out, checker.types[verdict_type[1]])
-    # The handler draws nothing, so what it sends is made of the cells it was given: no more than N_max.
-    shape = Shape(handler.name, decl.name, walk, parts, walk.wire_bytes, capacity, n_max, n_max, k_out, verdicts)
+    shape = Shape(handler.name, decl.name, walk, parts, walk.wire_bytes, slot_decl.bytes, k_out, verdicts)
+    text = _fill(handler.name, decl.name, fields, linear[0], slot_decl.name, parts, walk.wire_bytes, shape.capacity,
+                 k_out, checker.types[verdict_type[1]])
     return program.decode() + "\n" + text, shape
 
 
@@ -115,22 +127,10 @@ def _source_fields(checker: Checker, decl: TypeDecl) -> tuple[list, int]:
         ctor = following.ctors[0]
 
 
-def _chain(checker: Checker, decl: TypeDecl, ty: str) -> tuple[str, str, str]:
-    """The chain's two constructors, and its definition if the program left it abstract."""
-    if decl.kind == "abstract":
-        bytes_ = ", ".join(f"b{index}: Int8" for index in range(BODY_PAYLOAD))
-        return "Last", "Chunk", f"data {decl.name} = Last | Chunk(used: Int8, {bytes_}, next: {decl.name});\n"
-    if not _is_chain(checker, ty):
-        raise TurnRefused(f"{decl.name} is the chain, and it is not laid out as ingress fills one")
-    null = next(c for c in decl.ctors if c.tag == "null")
-    full = next(c for c in decl.ctors if c.tag != "null")
-    return null.name, full.name, ""
-
-
-def _no_clash(checker: Checker, more: set) -> None:
+def _no_clash(checker: Checker) -> None:
     taken = ({decl.name for decl in checker.types.values()}, {ctor.name for ctor in checker.ctors.values()},
              {fn.name for fn in checker.functions.values()})
-    for names, ours in zip(taken, (_TYPES, _CTORS | more, _FUNCTIONS)):
+    for names, ours in zip(taken, (_TYPES, _CTORS, _FUNCTIONS)):
         clash = sorted(names & ours)
         if clash:
             raise TurnRefused(f"the turn declares {clash[0]}, and so does the program")
@@ -149,8 +149,8 @@ def _verdicts(checker: Checker, decl: TypeDecl) -> tuple:
     return tuple(verdicts)
 
 
-def _fill(handler: str, item: str, fields: list, chain: int, chain_type: str, last: str, chunk: str, definition: str,
-          parts: int, wire: int, capacity: int, k_out: int, verdict: TypeDecl) -> str:
+def _fill(handler: str, item: str, fields: list, slot: int, slot_type: str, parts: int, wire: int, capacity: int,
+          k_out: int, verdict: TypeDecl) -> str:
     binders = [f"x{index}" for index in range(len(fields))]
     cells = [f"c{index}" for index in range(parts)]
     places = [f"q{index}" for index in range(1, k_out)]  # after the head
@@ -168,12 +168,11 @@ def _fill(handler: str, item: str, fields: list, chain: int, chain_type: str, la
     taken = cells + ["e"]
     take, pools = [], ["pool0"] + [f"p{index}" for index in range(len(taken))]
     for index, name in enumerate(taken):
-        take.append(f"  match {pools[index]} with Dry => ({nest(taken[:index], 'Dry')}, slot, head0, queue0, Short) "
-                    f"| Cell({name}, {pools[index + 1]}) =>")
+        take.append(f"  match {pools[index]} with Dry => ({nest(taken[:index], 'Dry')}, spares0, ingress, head0, queue0, "
+                    f"Short) | Cell({name}, {pools[index + 1]}) =>")
     built = cells[0] if parts == 1 else "(" + ", ".join(cells) + ")"
     out = [f"y{index}" for index in range(len(fields))]  # the record as the handler gave it back
     copy = f"{item}@{built}({', '.join(out)})"  # what the queue holds: ingress's record keeps its cells
-    slot = f"{item}@o {{ {fields[chain][0]} = refill(fresh, rest) }}"
     enqueue, head = [], "Pending@h(port, frame)"
     for index, place in enumerate(places):
         kept = [f"{places[j]} = Pending@e{j}(p{j}, f{j})" for j in range(index)]
@@ -186,19 +185,20 @@ def _fill(handler: str, item: str, fields: list, chain: int, chain_type: str, la
     for ctor in verdict.ctors:
         if ctor.fields:
             arms.append(f"      | {ctor.name}(port) => let (head1, queue2, extra) = enqueue(head0, queue1, "
-                        f"Pending@e(port, {copy})) in (give_out(extra, pool2), {slot}, head1, queue2, Queued)")
+                        f"Pending@e(port, {copy})) in let (pool3, spares2) = give_out(extra, Cell@s(pool2), spares1) in "
+                        f"(pool3, spares2, {item}@o {{ {fields[slot][0]} = fresh }}, head1, queue2, Queued({ctor.tag}))")
         else:
-            arms.append(f"      | {ctor.name} => (give_chain(y{chain}, {nest(taken, 'pool2')}), {slot}, head0, queue1, "
-                        f"Dropped)")
+            arms.append(f"      | {ctor.name} => ({nest(taken, 'pool2')}, Spare@s(fresh, spares1), {item}@o {{}}, head0, "
+                        f"queue1, Dropped({ctor.tag}))")
     with open(TEMPLATE) as handle:
         template = string.Template(handle.read())
     return template.substitute(
-        chain_definition=definition, item=item, k_out=k_out, chain_type=chain_type, last=last, chunk=chunk,
+        slot_type=slot_type, item=item, k_out=k_out,
         queue_fields=", ".join(f"{place}: Out" for place in places),
         queue_pattern=f"Queue(d, {', '.join(places)})", first_place=places[0], last_place=places[-1],
         shifted=", ".join(shifted),
-        enqueue_body="\n".join(enqueue), pattern=f"{item}(d, {', '.join(binders)})", chain_binder=binders[chain],
-        chain_field=fields[chain][0], peel_cells=peel, cells_to_pool=nest(cells, "pool") if parts > 1 else "Cell@d(pool)",
-        take="\n".join(take), take_end=" end" * len(taken), after_take=pools[-1], taken_back=nest(taken, "pool1"),
+        enqueue_body="\n".join(enqueue), pattern=f"{item}(d, {', '.join(binders)})", slot_binder=binders[slot],
+        peel_cells=peel, cells_to_pool=nest(cells, "pool") if parts > 1 else "Cell@d(pool)",
+        take="\n".join(take), take_end=" end" * len(taken), after_take=pools[-1], taken_back=nest(taken, pools[-1]),
         wire=wire, capacity=capacity, handler=handler, out_pattern=f"{item}(o, {', '.join(out)})",
         done_arms="\n".join(arms))

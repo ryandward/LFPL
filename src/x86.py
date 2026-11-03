@@ -47,9 +47,7 @@ class NotLowered(Exception):
     """Something RT has that this backend does not lower yet: a declared limit of section 12, not a bug."""
 
 
-# A slot and a countdown are the Verilog backend's for now: src/runtime.py places no slot, and src/symcheck.py, which
-# every x86 build has to pass, does not read either yet.
-_NOT_LOWERED = {"sget": "a byte of a slot", "slen": "a slot's length", "br.down": "a match that counts a Fin down"}
+SLOT_BASE = "cells"  # slot k is 2048 k bytes into the cell store, as on the hardware target: the runtime puts it there
 
 
 @dataclass(frozen=True)
@@ -154,6 +152,7 @@ class Backend:
         self.tagged: dict[str, bool] = {}
         self.tuples: dict[str, list[str]] = {}
         self.fins: set[str] = set()
+        self.slot_shift = 0  # log2 of a slot's bytes, once the stream declares a slot type
         self.enums: set[str] = set()  # types whose values are one register: scalars, whatever their name
         self.aliases: dict[str, str] = {}
         self.functions: dict[str, Function] = {}
@@ -515,8 +514,10 @@ class Backend:
         elif head == "type":
             parts = rest.split()
             if parts[1] == "slot":
-                raise NotLowered(f"section 12: slot {parts[2]} is not lowered to x86 yet, which has no slots in its "
-                                 f"image: src/rtverilog.py lowers it")
+                size = int(parts[3])
+                if size & size - 1 or (self.slot_shift and 1 << self.slot_shift != size):
+                    raise NotLowered(f"slots of {size} bytes: every slot is one size, a power of two")
+                self.slot_shift = size.bit_length() - 1
             self.tagged[parts[0]] = parts[1] == "tagged"
             if parts[1] == "enum":
                 self.enums.add(parts[0])
@@ -531,8 +532,6 @@ class Backend:
         elif head in ("array", "state"):
             pass
         else:
-            if head in _NOT_LOWERED:
-                raise NotLowered(f"section 12: {_NOT_LOWERED[head]} is not lowered to x86 yet: src/rtverilog.py lowers it")
             if self.count_steps and head not in NO_WORK:
                 self.ins("inc", "qword [cnt_steps]")
             getattr(self, "i_" + head.replace(".", "_"))(_args(rest))
@@ -969,6 +968,59 @@ class Backend:
         else:
             narrowed = _narrowed(place, size)
             self.ins("or", self.sub(register, narrowed.size), self.mem(narrowed))
+
+    # --- slots
+
+    def i_sget(self, a: list[str]) -> None:
+        """Byte i of a slot, or 0 at or past its length. The slot's number is the low 32 bits of its value and its
+        length the 16 above them, and slot k is 2^shift k bytes into the cell store: the byte is read, which cannot
+        leave the slot since i is below its size, and then 0 is chosen in its place past the length, with no branch."""
+        slot = self._phys(self.reg(a[1]))
+        index = self._phys(self.reg(a[2]), frozenset((slot,)))
+        register = self._take(frozenset((slot, index)))
+        self.ins("mov", self.sub(register, 4), self.sub(slot, 4))
+        self.ins("shl", register, str(self.slot_shift))
+        self.ins("add", register, index)
+        self.ins("movzx", self.sub(register, 4), f"byte [{SLOT_BASE}+{register}]")
+        self.ins("mov", TRANSIT, slot)
+        self.ins("shr", TRANSIT, "32")
+        self.ins("cmp", index, TRANSIT)
+        self.ins("mov", self.sub(TRANSIT, 4), "0")
+        self.ins("cmovae", self.sub(register, 4), self.sub(TRANSIT, 4))
+        self.clobbered.add(TRANSIT)
+        self._define(a[0], register)
+
+    def i_slen(self, a: list[str]) -> None:
+        slot = self._phys(self.reg(a[1]))
+        register = self._take(frozenset((slot,)))
+        self.ins("mov", register, slot)
+        self.ins("shr", register, "32")
+        self._define(a[0], register)
+
+    def i_br_down(self, a: list[str]) -> None:
+        """One less, before the test, whichever way it goes: on the way to Lz nothing reads it."""
+        p = self._phys(self.reg(a[0]))
+        register = self._take(frozenset((p,)))
+        self.ins("mov", register, p)
+        self.ins("sub", register, "1")
+        self._define(a[1], register)
+        zero = {r: home for r, home in self.home.items() if r != self.reg(a[1])}
+        self.ins("test", p, p)
+        self._branch("e", a[2], a[3], zero, dict(self.home))
+
+    def i_br_within(self, a: list[str]) -> None:
+        """The integer, as the Fin it is on the way to Lin, and then its comparison with the slot's length."""
+        slot = self._phys(self.reg(a[0]))
+        tested, pins = self._operand(a[1], frozenset((slot,)))
+        register = self._take(pins)
+        self._load(register, tested)
+        self._define(a[2], register)
+        outside = {r: home for r, home in self.home.items() if r != self.reg(a[2])}
+        self.ins("mov", TRANSIT, slot)
+        self.ins("shr", TRANSIT, "32")
+        self.ins("cmp", register, TRANSIT)
+        self.clobbered.add(TRANSIT)
+        self._branch("b", a[3], a[4], dict(self.home), outside)
 
     def i_idx(self, a: list[str]) -> None:
         mask = int(a[1]) - 1

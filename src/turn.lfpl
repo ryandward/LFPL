@@ -1,10 +1,15 @@
 # The runtime's turn: LFPL-O section 3.3's ADMIT, REFUSE and DONE, and the output queue, for the hardware target.
 # src/turn.py fills in what depends on the handler: its item, the verdict it returns, and how long the queue is,
 # and appends this to the handler's program. One turn is one call of `serve`, which the machine makes forever.
-$chain_definition
+
 # The pool. It is laid out as a Free is, and it is not one: running out of it is Short, which happens, where a
 # reserve of R(n) cells never runs out. So rtcheck charges this one's empty arm, and not a reserve's.
 data Pool = Dry | Cell(next: Pool);
+
+# The slots no frame holds, a cell each. A frame that is sent takes ingress's slot into the queue with it, and ingress
+# takes one of these in its place. When egress has sent the frame, its slot comes back here, in the cell that was its
+# place in the queue.
+data Spares = NoSpare | Spare(spare: $slot_type, rest: Spares);
 
 # An output waiting to be sent: the port its verdict named, and the record. It takes a cell of its own.
 data Out = None | Pending(port: Int8, frame: $item);
@@ -14,58 +19,35 @@ data Out = None | Pending(port: Int8, frame: $item);
 # frames behind it. Full is the last place being taken, read from that place and from no count.
 record Queue { $queue_fields };
 
-# What became of a turn, for the machine's counters.
-enum Turned = Idle | Queued | Dropped | Runt | TooLarge | Short | Full;
+# What became of a turn, for the machine's counters: for a frame the handler decided, with the tag of its verdict.
+enum Turned = Idle | Queued(verdict: Int8) | Dropped(verdict: Int8) | Runt | TooLarge | Short | Full;
 
 fn give(cells: Pool, pool: Pool) : Pool = match cells with Dry => pool | Cell(c, rest) => give(rest, Cell@c(pool)) end;
-
-fn give_chain(chain: $chain_type, pool: Pool) : Pool = match chain with
-  | $last => pool
-  | $chunk(c, used, b0, b1, b2, b3, b4, b5, b6, next) => give_chain(next, Cell@c(pool)) end;
 
 # What a handler gave back of its reserve. This is not a draw: the Free was the handler's, and it does run out.
 fn give_free(free: Free, pool: Pool) : Pool = match free with End => pool | More(c, rest) => give_free(rest, Cell@c(pool)) end;
 
-# Every cell of a record goes back: each of its own, and its chain's.
-fn give_frame(frame: $item, pool: Pool) : Pool = match frame with $pattern =>
-  $peel_cells give_chain($chain_binder, $cells_to_pool) end;
+# A record that has gone: its cells go back to the pool, and its slot to the spares, in the cell `e` that held it in
+# the queue.
+fn give_frame(frame: $item, e: Diamond, pool: Pool, spares: Spares) : (Pool, Spares) = match frame with $pattern =>
+  $peel_cells ($cells_to_pool, Spare@e($slot_binder, spares)) end;
 
-fn give_out(out: Out, pool: Pool) : Pool = match out with None => pool | Pending(e, port, frame) => give_frame(frame, Cell@e(pool)) end;
-
-# The chunks of ingress the frame reached go onto `item`, newest first, and one cell from the pool onto `fresh` for
-# each, to take its place. n is found this way, with no division: `left` is the frame's bytes not yet placed. Running
-# dry stops the walk, and says so.
-fn split(chain: $chain_type, left: Int16, item: $chain_type, fresh: Pool, pool: Pool) : ($chain_type, $chain_type, Pool, Pool, Bool) =
-  if ==(left, 0) then (chain, item, fresh, pool, true)
-  else match chain with
-  | $last => ($last, item, fresh, pool, false)
-  | $chunk(c, used, b0, b1, b2, b3, b4, b5, b6, next) => match pool with
-      | Dry => ($chunk@c(used, b0, b1, b2, b3, b4, b5, b6, next), item, fresh, Dry, false)
-      | Cell(p, rest) => split(next, if <=(left, 7) then 0 else -(left, 7),
-                               $chunk@c(used, b0, b1, b2, b3, b4, b5, b6, item), Cell@p(fresh), rest)
-      end
-  end;
-
-# Back in order, onto `chain`: the first chunk taken is the last one on `item`.
-fn unsplit(item: $chain_type, chain: $chain_type) : $chain_type = match item with
-  | $last => chain
-  | $chunk(c, used, b0, b1, b2, b3, b4, b5, b6, older) => unsplit(older, $chunk@c(used, b0, b1, b2, b3, b4, b5, b6, chain)) end;
-
-# Cells from the pool, as empty chunks of ingress.
-fn refill(fresh: Pool, chain: $chain_type) : $chain_type = match fresh with
-  | Dry => chain
-  | Cell(c, rest) => refill(rest, $chunk@c(0, 0, 0, 0, 0, 0, 0, 0, chain)) end;
+fn give_out(out: Out, pool: Pool, spares: Spares) : (Pool, Spares) = match out with
+  | None => (pool, spares)
+  | Pending(e, port, frame) => give_frame(frame, e, pool, spares) end;
 
 fn is_full(queue: Queue) : (Queue, Bool) = match queue with $queue_pattern =>
   match $last_place with
   | None => (Queue@d { $last_place = None }, false)
   | Pending(e, port, frame) => (Queue@d { $last_place = Pending@e(port, frame) }, true) end end;
 
-# What egress has sent leaves the queue, its cells go back to the pool, and the place after it is the new head.
-fn release(head: Out, queue: Queue, pool: Pool) : (Out, Queue, Pool) = match head with
-  | None => (None, queue, pool)
+# What egress has sent leaves the queue, its cells go back to the pool and its slot to the spares, and the place after
+# it is the new head.
+fn release(head: Out, queue: Queue, pool: Pool, spares: Spares) : (Out, Queue, Pool, Spares) = match head with
+  | None => (None, queue, pool, spares)
   | Pending(e, port, frame) => match queue with $queue_pattern =>
-      ($first_place, Queue@d { $shifted }, give_frame(frame, Cell@e(pool))) end end;
+      let (pool1, spares1) = give_frame(frame, e, pool, spares) in ($first_place, Queue@d { $shifted }, pool1, spares1)
+  end end;
 
 # Into the first free place, the head first. What comes back is the output, if there was none, which is_full has
 # ruled out.
@@ -75,25 +57,31 @@ fn enqueue(head: Out, queue: Queue, out: Out) : (Out, Queue, Out) = match head w
 $enqueue_body;
 
 # One turn. What egress has sent goes back first. Then the frame ingress holds, if there is one, is refused or
-# admitted: ADMIT, the handler, then DONE. Ingress keeps its record: the handler is given it, with the chunks the
-# frame reached, and it is ingress's again afterwards, so on the hardware target its cells can be registers. What
-# goes into the queue is a copy of it, in cells taken from the pool by matching it, with one more for the copy's
-# place in the queue and one for each chunk the frame takes out of ingress. Running dry gives back what was taken.
-turn serve(pool: Pool, slot: $item, head: Out, queue: Queue, length: Int16, sent: Bool) : (Pool, $item, Out, Queue, Turned) =
-  let (head0, queue0, pool0) = if sent then release(head, queue, pool) else (head, queue, pool) in
-  if ==(length, 0) then (pool0, slot, head0, queue0, Idle)
-  else if <(length, $wire) then (pool0, slot, head0, queue0, Runt)
-  else if >(length, $capacity) then (pool0, slot, head0, queue0, TooLarge)
+# admitted: ADMIT, the handler, then DONE. Ingress keeps its record: the handler is given it, and it is ingress's
+# again afterwards, so on the hardware target its cells can be registers. What goes into the queue is a copy of it,
+# in cells taken from the pool by matching it, with one more for the copy's place in the queue, and with the slot the
+# frame is in: ingress takes a spare one in its place, whose cell goes back to the pool. Running dry, of cells or of
+# spare slots, gives back what was taken.
+#
+# The machine says two things in one integer, since a function takes six: bit 15 is that egress has sent the head of
+# the queue, and below it is how long the frame ingress holds is, or 0 if there is none.
+turn serve(pool: Pool, spares: Spares, ingress: $item, head: Out, queue: Queue, event: Int16)
+    : (Pool, Spares, $item, Out, Queue, Turned) =
+  let sent = !=(&(event, 0x8000), 0) in
+  let length = &(event, 0x7FFF) in
+  let (head0, queue0, pool0, spares0) = if sent then release(head, queue, pool, spares) else (head, queue, pool, spares) in
+  if ==(length, 0) then (pool0, spares0, ingress, head0, queue0, Idle)
+  else if <(length, $wire) then (pool0, spares0, ingress, head0, queue0, Runt)
+  else if >(length, $capacity) then (pool0, spares0, ingress, head0, queue0, TooLarge)
   else
 $take
-  match slot with $pattern =>
-    let (rest, item, fresh, pool1, ok) = split($chain_binder, -(length, $wire), $last, Dry, $after_take) in
-    if !(ok) then (give(fresh, $taken_back), $item@d { $chain_field = unsplit(item, rest) }, head0, queue0, Short)
-    else let (queue1, full) = is_full(queue0) in
-    if full then (give(fresh, $taken_back), $item@d { $chain_field = unsplit(item, rest) }, head0, queue1, Full)
-    else
-      let (verdict, out, free) = $handler($item@d { $chain_field = unsplit(item, $last) }, End) in
-      let pool2 = give_free(free, pool1) in
+  let (queue1, full) = is_full(queue0) in
+  if full then ($taken_back, spares0, ingress, head0, queue1, Full)
+  else match spares0 with
+  | NoSpare => ($taken_back, NoSpare, ingress, head0, queue1, Short)
+  | Spare(s, fresh, spares1) =>
+      let (verdict, out, free) = $handler(ingress, End) in
+      let pool2 = give_free(free, $after_take) in
       match out with $out_pattern =>
       match verdict with
 $done_arms

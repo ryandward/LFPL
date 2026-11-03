@@ -25,7 +25,7 @@ from .certify import certify
 from .ring import FStarved, Reject, Ring
 from .rtcheck import Bound, Checker, RTError
 from .rtlower import Limit, rt_lines
-from .runtime import BindingError, Image, Options, assembly, bind
+from .runtime import BindingError, Image, Options, assembly, bind, largest_n
 from .symcheck import check_translation
 from .validate import recompute_stack
 from .x86 import Backend, NotLowered, Starved
@@ -73,7 +73,7 @@ def _generate(lines: Iterable[str], asm_path: str, options: Options,
                           f"declares {len(handlers)}")
         name = handlers[0].name
         depth = next(f.depth for f in backend.functions.values() if f.name == name)
-        certify(checker, name, options.n_max)
+        certify(checker, name, largest_n(checker, name, options))
         image = bind(checker, name, depth, options, dict(initial))
         for state in image.states:
             if state.initial is None:

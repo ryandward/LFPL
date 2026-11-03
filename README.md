@@ -313,16 +313,18 @@ An Ethernet and IPv4 header is 34 bytes, and a cell has 16. `examples/ipv4.lfpl`
 in the order the frame has it, and a field of type `Be16` or `Be32` lies in network byte order:
 
 ```
-data Bytes;
+slot Payload;
 record Frame {
   dst_hi: Be32, dst_lo: Be16, src_hi: Be32, src_lo: Be16, ethertype: Be16,
   version: Int8, tos: Int8, total: Be16, id: Be16, frag: Be16,
   ttl: Int8, proto: Int8, sum: Be16, source: Be32, destination: Be32,
   length: Int16,
-  body: Bytes
+  body: Payload
 };
 enum Verdict = Malformed | Expired | Send(port: Int8);
 ```
+
+The rest of the frame, after its headers, is in a slot the frame owns, below.
 
 The compiler lays that across five cells, each keeping 8 bytes for a link to the next unless what is left fits, and
 nothing after the first stage of it knows: a match on `Frame` is five matches by the time Check sees it, and building a
@@ -347,12 +349,12 @@ frame rebuilt in its own five cells with the fields it names changed and every o
 
 A refusal is one line, and it writes nothing: `Frame@d {}` is five builds in which every field stays and every link goes
 back where it was, and x86 makes no instruction of any of them. Forwarding stores the six fields it names, and the runtime
-sends the frame to the port the verdict says. The five cells that arrived are in `n`, so a frame of 1514 bytes is 217
-cells, and nothing is drawn from the reserve:
+sends the frame to the port the verdict says, its record's fields and then its slot's bytes. Nothing is drawn from the
+reserve, and the handler never reads its payload, so its work is the same for every frame:
 
 ```
 $ python3 -m src.lfplo examples/ipv4.lfpl -o ipv4 --in-port 9000 --out-port 9100 --ctl-port 9001 --n-max 217
-handler ipv4: R(n) = 0 cells, W(n) = 94 steps, stack 96 bytes, 14322 cells, image 233248 bytes
+handler ipv4: R(n) = 0 cells, W(n) = 94 steps, stack 96 bytes, 330 cells, image 143360 bytes
 ```
 
 `d`, from a pattern on `Frame`, stands for all five cells, and each still has to go somewhere. `Frame@d(...)` and
@@ -367,72 +369,72 @@ that shares nothing with it, and `tests/test_rtverilog.py` holds the hardware ta
 
 On x86 the loop around a handler is assembly the compiler writes out: admission, handing the item over, and
 taking back what the handler returns. On the hardware target that loop is LFPL. `src/turn.lfpl` is one turn of
-it, and `src/turn.py` appends it to the handler's program, so the turn is typed, every cell it moves is accounted
-for by linearity, and its bound is certified, as the handler's is. Admission takes the cells a frame needs out of
-the pool by matching it, and when the pool runs dry it gives back what it took and refuses the frame: there is no
+it, and `src/turn.py` appends it to the handler's program, so the turn is typed, every cell and every slot it moves is
+accounted for by linearity, and its bound is certified, as the handler's is. Admission takes the cells a frame needs out
+of the pool by matching it, and when the pool runs dry it gives back what it took and refuses the frame: there is no
 count of free cells to trust, because there is none at all.
 
 ```
-$ python3 -m src.machine examples/ipv4.lfpl -o machine --n-max 217
-turn serve for handler ipv4: W = 5984 steps for any frame of up to 217 cells in and 217 out, with 4 places in the queue; clocks <= 3713 a turn, certified; 1309 cells of 128 bits, 11-bit pointers
+$ python3 -m src.machine examples/ipv4.lfpl -o machine
+turn serve for handler ipv4: W = 224 steps for any frame of up to 2082 bytes, with 4 places in the queue; clocks <= 96 a turn, certified; 41 cells of 128 bits and 5 slots, 10-bit pointers
 ```
 
 That is said before anything runs, and it holds of every turn, whatever the frame and whatever came before. A turn
-walks two things it is given, the frame in ingress and the output at the head of the queue, and the bound pays for
-both at their largest. The head is a parameter of its own, so the frames queued behind it cost the bound nothing: a
-turn releases one output, and that is what it pays for. The longest admission measured took 3067 cycles, and the
-longest release 450, against the bound of 3713. The admission was of a frame of 1518 bytes, all 217 cells. The bound
-pays for a release and an admission in one turn, which the machine never asks of one.
+holds two things that grow with frames, the frame in ingress and the output at the head of the queue. The head is a
+parameter of its own, so the frames queued behind it cost the bound nothing: a turn releases one output, and that is
+what it pays for. The longest admission measured took 59 cycles, and the longest release 24, against the bound of 96.
 
-Ingress keeps its record: the handler is given it, with the chunks the frame reached, and it is ingress's again
-afterwards, and what goes into the queue is a copy, written into cells from the pool when the verdict sends the frame.
-So the record's five cells are registers in the machine, and `examples/ipv4.lfpl`'s decision, which reads and writes
-nothing else, touches no block RAM at all: its 94 steps are at most 21 clocks. The emitter knows which registers hold those
-cells, refuses a program that would store a link of one, and refuses a turn that gives back anything else in the
-record's place, so the record is where it was on the next turn.
+A frame's payload is in a slot, 2048 bytes in 128 cells after the rest of the store, and the record holds the slot's
+number and how many bytes it holds. Ingress holds a record and a slot. The writer puts a frame's header into the record,
+which is registers, and the rest into the slot, a byte to its place, and writes the slot's length. When the verdict sends
+the frame, what goes into the queue is a copy of the record, in cells from the pool, and it takes the slot with it:
+ingress takes one of the spare slots in its place. When egress has sent the frame, the turn after gives its cells back
+to the pool and its slot back to the spares. Nothing copies a payload, so a turn's work does not grow with the frame,
+and `examples/ipv4.lfpl`'s decision, which reads and writes only the record, touches no block RAM at all: its 94 steps
+are at most 21 clocks.
 
-What runs is `machine.v`, with `serve_core.v` inside it. A frame comes in as bytes, with valid and ready, and goes
-into the scalar fields of the record ingress holds and then into its chain, and a frame leaves the same way, read out
-of the cells of the output at the head of the queue. The writer never stores a link, so the hardware cannot make one
-cell point at another: every link is the turn's to make. `tests/test_machine.py` sends the whole corpus through it
-and through the x86 build. Every frame comes out the same, to the same port, every turn stays under its bound, and
-afterwards every cell is in exactly one place.
+What runs is `machine.v`, with `serve_core.v` inside it. A frame comes in as bytes, with valid and ready, and leaves the
+same way, the record's fields and then the bytes its slot says it holds. The writer never stores a link or a slot's
+number, so the hardware cannot make one cell point at another or a record name another slot: those are the turn's to
+make. `tests/test_machine.py` sends the whole corpus through it and through the x86 build, for `examples/ipv4.lfpl`,
+`examples/firewall.lfpl` and `examples/udp_verify.lfpl`. Every frame comes out the same, to the same port, each verdict
+is counted as x86 counts it, every turn stays under its frame's bound, and afterwards every cell and every slot is in
+exactly one place.
 
-A hang is stopped by the design, not caught by a test. The writer stores no byte past what 217 cells hold, and the
-reader follows no more of a chain than that. A turn that runs past its bound is stopped, and a turn whose results
-put an output at the head of the queue that no outcome accounts for, or more outputs in it than it has places, is
-not taken: the machine counts it and writes every cell back as it was before the first turn, which is what a reset
+A hang is stopped by the design, not caught by a test. The writer stores no byte past the slot, and egress sends no
+more than a slot holds, whatever a record says. A turn that runs past its frame's bound is stopped, and a turn whose
+results put an output at the head of the queue that no outcome accounts for, or more outputs in it than it has places,
+is not taken: the machine counts it and writes every cell back as it was before the first turn, which is what a reset
 does. With those, the specification's T10 says how soon a frame goes: once egress is ready, every frame admitted is
-sent or released within five turns, and the testbench holds every frame it sends to the clocks T10 counts for it. That second stop exists because a
-deliberately broken build, with every argument of the turn wired to its first, never ran a turn past its bound: its
-first turn ended in 47 cycles and every one after it in 5, and egress sent the same head forever. `tests/test_machine.py` breaks the generated
-Verilog that way and others, and each time the machine stops, counts it and goes on.
+sent or released within five turns, and the testbench holds every frame it sends to the clocks T10 counts for it. That
+second stop exists because a deliberately broken build, with every argument of the turn wired to its first, never ran a
+turn past its bound: its first turn ended in 47 cycles and every one after it in 5, and egress sent the same head
+forever. `tests/test_machine.py` breaks the generated Verilog that way and others, and each time the machine stops,
+counts it and goes on.
 
 ### A frame's bytes, owned whole
 
-A checksum over a whole payload needs a program that can read every byte of it, and know that doing so ends. So a
-frame can own a slot: 2048 bytes in a row, 128 cells. `slot Payload;` names the type, and a record holds one like any
-other linear field. `body[i]` reads byte i, `len(body)` says how many bytes the runtime put there, and neither uses
-the slot up. The index is a `Fin Payload`, a number below 2048, so no read can leave the slot, and a match counts it
-down, `| 0 => ... | down(j) => ...`, which is how the compiler knows the walk ends and what it costs.
-`examples/udp_verify.lfpl` checks every UDP datagram's checksum that way, over the pseudo-header, the UDP header and
-every byte of the payload:
+A checksum over a whole payload needs a program that can read every byte of it, and know that doing so ends. A slot is
+what makes that possible: `slot Payload;` names the type, and a record holds one like any other linear field.
+`body[i]` reads byte i, and 0 for a byte at or past the length, whatever a frame before left there, and `len(body)` says
+how many bytes the runtime put there. Neither uses the slot up. `match within(body, x) with | inside(i) => ... |
+outside => ... end` says whether x is below the length, and gives it as a Fin, `i`, that a match counts down, `| 0 =>
+... | down(j) => ...`, which is how the compiler knows the walk ends and what it costs. `examples/udp_verify.lfpl`
+checks every UDP datagram's checksum that way, over the pseudo-header, the UDP header and every byte of the payload:
 
 ```
-$ python3 -m src.rtverilog examples/udp_verify.lfpl -o udp.v --n-max 217 --slots 4
-handler udp_verify: R(n) = 0 cells, W(n) = 22699 steps, 1 slot an item holds and gets back, 14322 cells of 128 bits, 4 slots from number 112, 14-bit pointers, 93 states
-walk add_up: 7 clocks per iteration, 5 to leave
-clocks(n) <= 14407, certified, from the edge that samples start to the edge that raises done
+$ python3 -m src.lfplo examples/udp_verify.lfpl -o udp --in-port 9000 --out-port 9100 --ctl-port 9001
+handler udp_verify: R(n) = 0 cells, W(n) = 11 n + 112 steps, stack 168 bytes, 396 cells, image 145408 bytes
+$ python3 -m src.machine examples/udp_verify.lfpl -o udp_machine
+turn serve for handler udp_verify: W = 11 n + 256 steps, n being a frame's 6 cells and the bytes of its slot, with 4 places in the queue; clocks <= 7 n + 91 a turn, certified; 47 cells of 128 bits and 5 slots, 10-bit pointers
 ```
 
-It draws no cell, and its slot is counted apart from the cells: nothing can make or drop one, so each frame's one
-comes back. Its work is the same for every frame: `idx` can start the count at 2047 at most, and pays for
-that many steps down before the first, and each step down releases what one costs. `tests/test_slots.py` runs that
-Verilog on slots written into its store directly, and every frame there is decided as RFC 768 says, from a right
-checksum over an odd number of bytes to a slot that holds fewer bytes than its datagram claims, within the bound in
-clocks. Neither runtime fills a slot from a frame yet, and the x86 backend refuses a program that has one.
+It draws no cell, and its slot is counted apart from the cells: nothing can make or drop one, so each frame's one comes
+back. Its bound grows with the frame, since a slot carries an amount for each of its bytes, and `within` hands it to the
+walk: a frame's `n` is its record's cells and its payload's bytes, and admission works it out from the frame's length,
+as it already does for a chain. A frame of 64 bytes is bounded at 287 clocks in the machine, and one of 1518 at 10465.
 
-## How the compiler holds itself to the same rules
+## How the compiler holds itself to the same rules## How the compiler holds itself to the same rules
 
 Most compilers read a whole file into a syntax tree, which costs memory in proportion
 to the file. This one never builds that tree. Its stages sit in a closed ring and pass
@@ -666,7 +668,7 @@ A record's headers still get copied, by the kernel, into cells. Reading a field 
 it changes the resource model, so it comes later. Other things show in `examples/ipv4.lfpl`: an update names its fields in
 the order the record declares them, an enum cannot be stored in a cell, and a 48-bit address is two fields. The
 turn on the hardware target serves only a handler shaped as this one is: no state slots, nothing drawn from its
-reserve, one chain, and a verdict beside the record it was given.
+reserve, a payload in one slot, and a verdict beside the record it was given.
 
 The largest gap in the language itself is non-tail recursion over a structure, the model's DESCEND
 and ASCEND, which is rejected for now. A tree therefore cannot be walked by recursing into both

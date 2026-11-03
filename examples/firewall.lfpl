@@ -4,14 +4,14 @@
 # The ports are the first four bytes after the IP header, and the header is 20 bytes, since anything else is
 # refused as malformed. So they are fields of the record, read like the rest, and the record is 38 bytes on the wire
 # where ipv4.lfpl's is 34: a frame shorter than that is refused before the handler runs.
-data Bytes;
+slot Payload;
 record Frame {
   dst_hi: Be32, dst_lo: Be16, src_hi: Be32, src_lo: Be16, ethertype: Be16,
   version: Int8, tos: Int8, total: Be16, id: Be16, frag: Be16,
   ttl: Int8, proto: Int8, sum: Be16, source: Be32, destination: Be32,
   src_port: Be16, dst_port: Be16,
   length: Int16,
-  body: Bytes
+  body: Payload
 };
 
 # Blocked is the firewall's: a frame it drops by its port, which ipv4.lfpl would have sent.

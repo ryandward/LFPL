@@ -136,13 +136,18 @@ a mask.
     br.down p, d, Lz, Ld  p : Fin N, free d
                         Lz: p unchanged, and d free
                         Ld: p unchanged, d = fresh : Fin N, one less than p
+    br.within s, x, d, Lin, Lout  s = w : S, a slot of B bytes, x : Int W, free d
+                        Lin: s unchanged, d = fresh : Fin B, which is x, below s's length
+                        Lout: s unchanged, and d free
 
-`sget` and `slen` read a slot and leave it where it is: the source's `s[i]` and `len(s)` borrow it. B is a
-power of two and i a Fin B, so `sget` needs no bounds check, for the reason `aget` needs none. Nothing here
+`sget`, `slen` and `br.within` read a slot and leave it where it is: the source's `s[i]`, `len(s)` and
+`within(s, x)` borrow it. B is a power of two and i a Fin B, so `sget` needs no bounds check, for the reason `aget`
+needs none, and a byte at or past the slot's length is 0, whatever the cell holds. Nothing here
 makes a slot or takes one apart, and `const`, `copy` and `drop` refuse one, so the slots a function holds are
 what it was given, and it hands each of them on, as it does any linear value. `br.down` is the source's
 `match i with | 0 => ... | down(j) => ...`. It writes d only on the way to Ld, and p stays where it is, a scalar
-anything may read again.
+anything may read again. `br.within` is `match within(s, x) with | inside(i) => ... | outside => ... end`, and
+writes d only on the way to Lin.
 
 ### Cells
 
@@ -278,6 +283,8 @@ constant for each resource, follows each path from the function's own unknown en
     idx d, N, a              a fresh amount q per unit for d: budget - (N - 1) q, the most d can be
     br.down p, d             on the way to Ld, d takes an amount of p's: budget + that amount, which is the
                              unit d is less
+    br.within s, x, d        on the way to Lin, d takes an amount per unit of s's per byte: d is below the
+                             slot's length, so it has fewer units than the slot has bytes
     ret, tail, tailmod       every result must carry at least what the function's result does, and
                              what is left in the budget must not be negative
     a label                  each edge's budget must cover a fresh one, unless all the edges have
@@ -290,6 +297,8 @@ for the rest, and one row says the two are no more than it held. A Fin with noth
 a cell, is still a number, unlike a null: so wherever an amount is wanted of it, the amount has to be nothing,
 and a countdown it starts cannot be paid for.
 
+A slot carries an amount per byte of its length, the amount its record carries per cell: so an item's size n
+is its cells and its slot's bytes. Nothing releases it but `br.within`, which shares it with the Fin it makes.
 Slots are counted apart from cells. None is drawn or made, so a handler's slots are its item's, and
 `Checker.held_slots` counts them from the item's type: one for each slot field of its record, through the records
 it holds, and none known for a type that can hold any number.
@@ -367,8 +376,12 @@ partial result is ever special. All the failures Phase 1 reports about registers
     etag, efield           movzx of the low byte; mov, shr by the field's offset, then movzx or mov r32
     idx                    mov d, a; and d, N - 1
     aget                   a sized mov through [a + i * s]
-    sget, slen, br.down    refused, as a limit, until src/runtime.py places slots and src/symcheck.py reads
-                           a countdown: a build of either stops before any assembly
+    sget                   the byte's address, the slot's number shifted by log2 B with i added, a movzx from
+                           the cell store's base there, and then cmp i with the length, bits 32 to 47 of the
+                           slot, and cmovae of 0: no branch. src/symcheck.py reads all of it for itself
+    slen                   mov and shr by 32
+    br.down                mov and sub 1 into d, then test p, p; je Lz
+    br.within              x into d, then cmp d with the slot's length; jb Lin
     br                     cmp; jcc, with the fall-through chosen by the next label. On two literals, a
                            jump, and the other label's arm is code nothing reaches
     br.null                test p, p; jcc
@@ -432,7 +445,9 @@ The emitter first writes a state for each instruction:
     br.tag             one state, and a read in front of it if the word is not already at the port
     aget               two states: an array is its own block RAM, so a read, and then its word
     sget               two states: the read of the slot's cell, at the address that is the slot's number
-                       and i's high bits side by side, and then the byte of it that i's low four bits say
+                       and i's high bits side by side, and then the byte of it that i's low four bits say,
+                       or 0 if i is at or past the length
+    br.within          one state: x below the length chooses the next, and d <= x at the same edge
     slen               one state: bits 32 to 47 of the slot's register
     br.down            one state: p = 0 chooses the next, and d <= p - 1 at the same edge
     call               one state: <= on the callee's parameters, and on its return state if it has

@@ -13,6 +13,11 @@ LFPL-O build, after the compiler has finished, so unlike the compiler it may bui
 syntax trees: it is an oracle over one finished program, and it is what LFPL-O section 8.4
 means by Meaning.
 
+A slot is the source's too: `slot S;` is 2048 bytes, and this has its own rule for where they are, which is the
+hardware target's, slot k at 2048 k bytes into the cell store. `s[i]` is the byte there at i, or 0 at or past the
+slot's length, which is bits 32 to 47 of its value. `len(s)` is those bits. A match on a Fin is its value being 0 or
+one less than it, and `within(s, x)` is x being below the length or not.
+
 A record that spans cells, and a field in network byte order, are the source's business, so this works out both
 for itself. `unspan` rewrites the syntax tree into the chain of one-cell records the machine is really working on,
 with a layout rule of its own, and a field of type Be16, Be32 or Be64 means a load that is swapped and a store of
@@ -49,6 +54,7 @@ from typing import Callable, Optional
 MASK64 = (1 << 64) - 1
 NO_ATOM = 1 << 60
 FIELD_SIZES = {"Int8": 1, "Int16": 2, "Int32": 4, "Int64": 8, "Bool": 1, "Be16": 2, "Be32": 4, "Be64": 8}
+SLOT_BYTES, SLOT_SHIFT = 2048, 11  # a slot, and where slot k starts: 2048 k bytes into the cell store
 WIRE_FIELDS = frozenset(("Be16", "Be32", "Be64"))
 CELL_BYTES, BYTES_AHEAD_OF_THE_LINK = 16, 8
 
@@ -193,6 +199,8 @@ class Terms:
             return node[3]
         if kind == "aload":
             return node[3]
+        if kind == "sload":  # a byte of a slot
+            return 1
         if kind == "member":
             return node[3]
         if kind == "op":
@@ -471,6 +479,7 @@ class SourceParser:
         self.spans: dict[str, tuple[list, list]] = {}  # a record of many cells: their names, and fields in each
         self.records: dict[str, list] = {}  # the names of a record's fields, across all its cells
         self.enums: dict[str, tuple] = {}  # a constructor of an enum: the enum, its tag, and its fields where they go
+        self.slots: set[str] = set()  # the slot types: a value of one is its number and its length, in 8 bytes
 
     def unspan(self) -> None:
         """Every function, in terms of records of one cell."""
@@ -520,6 +529,9 @@ class SourceParser:
                 self.expect(":")
                 self.states.append((name, self._type()))
                 self.expect(";")
+            elif keyword == "slot":
+                self.slots.add(self.next())
+                self.expect(";")
             else:
                 raise ValueError(f"unexpected {keyword}")
 
@@ -531,7 +543,8 @@ class SourceParser:
             self.expect("]")
             return f"Array[{length}]:{self.next()}"
         if name == "Fin":
-            return f"Fin {self.next()}"
+            bound = self.next()
+            return f"Fin {SLOT_BYTES if bound in self.slots else bound}"
         return name
 
     def _fields(self, close: str) -> list:
@@ -677,13 +690,20 @@ class SourceParser:
             inner = self.expr()
             self.expect(")")
             return ("low", int(token[3:]) // 8, inner)
-        if token in ("idx", "get") and token not in self.fns and self.peek() == "(":
+        if token in ("idx", "get", "within") and token not in self.fns and self.peek() == "(":
             self.next()
             first = self.expr()
             self.expect(",")
             second = self.expr()
             self.expect(")")
+            if token == "idx" and second[0] == "null" and second[1] in self.slots:
+                second = ("int", SLOT_BYTES)  # a slot's size in bytes
             return (token, first, second)
+        if token == "len" and token not in self.fns and self.peek() == "(":
+            self.next()
+            inner = self.expr()
+            self.expect(")")
+            return ("slen", inner)
         if token == "if":
             cond = self.expr()
             self.expect("then")
@@ -743,6 +763,11 @@ class SourceParser:
         if self.peek() == "(":
             self.next()
             return ("call", token, self._args())
+        if self.peek() == "[":
+            self.next()
+            index = self.expr()
+            self.expect("]")
+            return ("sget", token, index)
         return ("var", token)
 
     def _named_fields(self) -> list:
@@ -842,8 +867,12 @@ class _Unspan:
             return ("if", *(self.expr(part, groups) for part in e[1:]))
         if kind == "low":
             return ("low", e[1], self.expr(e[2], groups))
-        if kind in ("idx", "get"):
+        if kind in ("idx", "get", "within"):
             return (kind, self.expr(e[1], groups), self.expr(e[2], groups))
+        if kind == "sget":
+            return ("sget", e[1], self.expr(e[2], groups))
+        if kind == "slen":
+            return ("slen", self.expr(e[1], groups))
         if kind == "pack":
             return ("pack", e[1], [self.expr(a, groups) for a in e[2]])
         if kind == "enum":
@@ -965,7 +994,8 @@ def _word_of(e: tuple, names: dict, fn: "Fn", fns: dict):
         return then if then == other else _NOTHING_KNOWN
     if kind == "match":
         scrutinee = _word_of(e[1], names, fn, fns)
-        words = {_word_of(body, _arm_names(binders, scrutinee, names), fn, fns) for _ctor, binders, body in e[2]}
+        words = {_word_of(body, _arm_names(binders, _cell_word(ctor, scrutinee), names), fn, fns)
+                 for ctor, binders, body in e[2]}
         return words.pop() if len(words) == 1 else _NOTHING_KNOWN
     if kind == "call" and e[1] != fn.name and e[1] in fns:
         at = fns[e[1]].at
@@ -973,6 +1003,14 @@ def _word_of(e: tuple, names: dict, fn: "Fn", fns: dict):
             word = _word_of(e[2][at], names, fn, fns)
             return word if isinstance(word, int) else _NOTHING_KNOWN
     return _NOTHING_KNOWN
+
+
+# The arms of a match on a Fin and on within: no cell is taken apart, so nothing they bind is a parameter's cell.
+_COUNTING_ARMS = frozenset(("0", "down", "inside", "outside"))
+
+
+def _cell_word(ctor: str, scrutinee):
+    return _NOTHING_KNOWN if ctor in _COUNTING_ARMS else scrutinee
 
 
 def _arm_names(binders: list, scrutinee, names: dict) -> dict:
@@ -996,9 +1034,10 @@ def _allowed_by_exits(e: tuple, names: dict, nulls: frozenset, fn: "Fn", fns: di
     if kind == "match":
         scrutinee = _word_of(e[1], names, fn, fns)
         allowed = set(range(len(fn.params)))
-        for _ctor, binders, body in e[2]:
-            known = nulls | {scrutinee} if not binders and isinstance(scrutinee, int) else nulls
-            allowed &= _allowed_by_exits(body, _arm_names(binders, scrutinee, names), known, fn, fns)
+        for ctor, binders, body in e[2]:
+            word = _cell_word(ctor, scrutinee)
+            known = nulls | {word} if not binders and isinstance(word, int) else nulls
+            allowed &= _allowed_by_exits(body, _arm_names(binders, word, names), known, fn, fns)
         return allowed
     if kind == "call" and e[1] == fn.name:
         return {k for k, argument in enumerate(e[2]) if _word_of(argument, names, fn, fns) == k}
@@ -1099,9 +1138,18 @@ class SourceMeaning:
         if kind == "ctor":
             return self._ctor(e, env)
         if kind == "match":
-            if self.ev(e[1], env)[1] in {enum for enum, _tag, _fields in self.enums.values()}:
+            if e[1][0] == "within":
+                return self._match_within(e, env)
+            scrutinee_ty = self.ev(e[1], env)[1]
+            if scrutinee_ty in {enum for enum, _tag, _fields in self.enums.values()}:
                 return self._match_enum(e, env)
+            if isinstance(scrutinee_ty, str) and scrutinee_ty.startswith("Fin "):
+                return self._match_down(e, env)
             return self._match(e, env)
+        if kind == "sget":
+            return self._slot_byte(e, env)
+        if kind == "slen":
+            return T.lift(lambda s: T.shr(s, T.const(32)), self.ev(e[1], env)[0], key=("shr32",)), 2, None
         if kind == "with":
             return self._with(e, env)
         if kind == "call":
@@ -1133,6 +1181,51 @@ class SourceMeaning:
             size = e[1]
             return T.lift(lambda x: T.trunc(size, x), self.ev(e[2], env)[0], key=("trunc", size)), size, None
         raise ValueError(f"unknown expression {kind}")
+
+    def _slot_byte(self, e: tuple, env: dict) -> tuple:
+        """Byte i of slot s, where this rule says slot k is, or 0 at or past its length."""
+        T = self.T
+        slot, index = env[e[1]][0], self.ev(e[2], env)[0]
+
+        def read(s: int, i: int) -> int:
+            at = T.arith("add", 8, T.arith("shl", 8, T.trunc(4, s), T.const(SLOT_SHIFT)), i)
+            return T.select(T.lt(i, T.shr(s, T.const(32))), T.intern(("sload", at)), T.ZERO)
+
+        return T.lift(read, slot, index, key=("sget",)), 1, None
+
+    def _match_down(self, e: tuple, env: dict) -> tuple:
+        """`| 0 => e0 | down(j) => e1`: e0 if the Fin is 0, and e1 with j one less if not."""
+        T = self.T
+        _, scrutinee, arms = e
+        term, ty, _ = self.ev(scrutinee, env)
+        by_name = {name: (binders, body) for name, binders, body in arms}
+        result_ty: list = [None]
+
+        def on_leaf(leaf: int) -> int:
+            zero, z_ty, _ = self.ev(by_name["0"][1], env)
+            binders, body = by_name["down"]
+            inner = dict(env)
+            inner[binders[0]] = (T.arith("sub", 8, leaf, T.ONE), ty, None)
+            down, d_ty, _ = self.ev(body, inner)
+            result_ty[0] = _joined(_joined(result_ty[0], z_ty), d_ty)
+            return T.select(T.eq(leaf, T.ZERO), zero, down)
+
+        return T.lift(on_leaf, term), result_ty[0], None
+
+    def _match_within(self, e: tuple, env: dict) -> tuple:
+        """`| inside(i) => e1 | outside => e0`: e1 with i the integer if it is below the slot's length."""
+        T = self.T
+        _, (_within, slot_e, tested_e), arms = e
+        slot, tested = self.ev(slot_e, env)[0], self.ev(tested_e, env)[0]
+        by_name = {name: (binders, body) for name, binders, body in arms}
+        binders, inside_e = by_name["inside"]
+        inner = dict(env)
+        inner[binders[0]] = (tested, f"Fin {SLOT_BYTES}", None)
+        inside, i_ty, _ = self.ev(inside_e, inner)
+        outside, o_ty, _ = self.ev(by_name["outside"][1], env)
+        length = T.lift(lambda s: T.shr(s, T.const(32)), slot, key=("shr32",))
+        below = T.lift(T.lt, tested, length, key=("lt",))
+        return T.select(below, inside, outside), _joined(i_ty, o_ty), None
 
     def _get(self, e: tuple, env: dict) -> tuple:
         T = self.T
@@ -1407,6 +1500,9 @@ def _operand(text: str) -> tuple:
     match = re.fullmatch(r"(byte|word|dword|qword) \[(\w+)\+(\w+)\*(\d)\]", text)
     if match:
         return ("element", match.group(2), match.group(3), int(match.group(4)), _SIZES[match.group(1)])
+    match = re.fullmatch(r"byte \[cells\+(\w+)\]", text)
+    if match:  # a byte of a slot, by its place in the cell store
+        return ("slotbyte", match.group(1))
     if re.fullmatch(r"-?\d+", text):
         return ("imm", int(text) & MASK64)
     return ("name", text)
@@ -1565,6 +1661,8 @@ class FunctionCheck:
             return T.lift(lambda x, w=o[2]: T.trunc(w, x), term, key=("trunc", o[2]))
         if o[0] == "mem":
             return T.lift(lambda leaf: self._read(S, leaf, o[2], o[3]), self._pointer(S, o[1]))
+        if o[0] == "slotbyte":
+            return T.lift(lambda at: T.intern(("sload", at)), self._pointer(S, o[1]))
         if o[0] == "element":
             _kind, base, index, scale, size = o
             if scale != size:
@@ -2043,6 +2141,13 @@ class FunctionCheck:
             S.flags = None
         elif op == "jmp":
             return self._jump(S, ops[0][1], where, want, pending, placed, reached)
+        elif op.startswith("cmov"):  # a 32-bit write: the upper half clears whichever way it goes
+            dest, source = ops
+            if dest[0] != "reg" or dest[2] != 4:
+                self.problems.append(Problem(self.fn.name, where, "a cmov that is not into 32 bits"))
+            old = T.lift(lambda x: T.trunc(4, x), self._val(S, dest), key=("trunc", 4))
+            new = T.lift(lambda x: T.trunc(4, x), self._val(S, source), key=("trunc", 4))
+            S.regs[dest[1]] = T.select(self._cond(S, op[4:], where), new, old)
         elif op.startswith("set"):
             old = S.regs.get(ops[0][1], T.undef("setcc into an unset register"))
             S.regs[ops[0][1]] = T.lift(lambda a, b: T.setl(1, a, b), old, self._cond(S, op[3:], where))
@@ -2142,7 +2247,7 @@ def _clobber_sets(bodies: dict) -> dict:
             op, ops = item[1], item[2]
             if op in ("call", "jmp") and ops[0][0] == "name" and ops[0][1].startswith("fn_"):
                 touched |= sets.get(ops[0][1][3:], set())
-            elif op in _WRITERS or op.startswith("set"):
+            elif op in _WRITERS or op.startswith(("set", "cmov")):
                 if ops and ops[0][0] == "reg":
                     touched.add(ops[0][1])
         sets[name] = touched

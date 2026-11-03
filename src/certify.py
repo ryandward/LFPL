@@ -6,7 +6,7 @@ can only cost a refusal, and so can its running out of pivots.
 """
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Mapping, Optional
 
 from .rtcheck import Bound, Checker, Unbounded
 from .simplex import PivotBudgetSpent, minimize
@@ -28,8 +28,9 @@ def certify(checker: Checker, name: str, n_max: int) -> Bound:
     return checker.verify(name, proposed["cells"], proposed["steps"])
 
 
-def certify_turn(checker: Checker, name: str, sizes: Mapping[int, int]) -> Bound:
-    """A turn's bound in steps, for any item: `sizes` gives the most cells each sized parameter can hold."""
+def certify_turn(checker: Checker, name: str, sizes: Mapping[int, int], per_turn: Optional[int] = None) -> Bound:
+    """A turn's bound in steps, for any item: `sizes` gives the most cells each sized parameter can hold. With
+    `per_turn`, the one whose size each turn says: its amount per unit is c, and d is the rest at its largest."""
     program = checker.turn_program(name, sizes)
     try:
         solved = minimize(program.objective(), program.constraints("steps"))
@@ -37,4 +38,4 @@ def certify_turn(checker: Checker, name: str, sizes: Mapping[int, int]) -> Bound
         raise Unbounded(f"section 8.2: the linear program of turn {name} took more than {spent.budget} pivots") from spent
     if solved is None:
         raise Unbounded(f"section 8.2: turn {name} has no bound: no amount per cell of what it holds pays for what it does")
-    return checker.verify_turn(name, sizes, solved)
+    return checker.verify_turn(name, sizes, solved, per_turn)

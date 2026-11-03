@@ -24,7 +24,10 @@ from src.rtcheck import Checker, RTError, Unbounded, check_stream  # noqa: E402
 from src.rtlower import rt_lines  # noqa: E402
 from src.runtime import Options  # noqa: E402
 from src.rtverilog import CELL_BYTES, translate  # noqa: E402
+from src.symcheck import check_translation  # noqa: E402
+from src.x86 import Backend  # noqa: E402
 from tests.reference import ipv4_model  # noqa: E402
+from tests.test_forward import Forwarder  # noqa: E402
 from tests.test_rtverilog import SIMULATOR, TOOLS, Layout, image_lines, run_images  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -163,12 +166,57 @@ class TheCountdown(unittest.TestCase):
         self.refused("fn w(i: Fin 8) : Int8 = match i with | 0 => 0 | 0 => 1 end;\n", "duplicate match arm")
         self.refused("fn w(i: Fin 8) : Int8 = match i with | 0 => 0 | Nil => 1 end;\n",
                      "two arms, 0 and down\\(j\\), and Nil is neither")
-        self.refused("fn w(i: Fin 8) : Int8 = match i with | 1 => 0 end;\n", "or 0 or down\\(j\\) for a Fin")
+        self.refused("fn w(i: Fin 8) : Int8 = match i with | 1 => 0 end;\n", "0 or down\\(j\\) for a Fin")
         self.refused("fn w(i: Fin 8) : Int8 = match i with | 0 => 0 | down => 1 end;\n", "pattern needs 1 binders")
 
     def test_a_fin_becomes_an_integer_by_pack_if_every_value_fits(self):
         rt("fn n(i: Fin 2048) : Int64 = pack<16>(i);\nfn m(i: Fin 256) : Int64 = pack<8>(i);\n")
         self.refused("fn n(i: Fin 2048) : Int64 = pack<8>(i);\n", "2047 does not fit 8 bits")
+
+
+WALK = SLOT + """fn walk(b: Bytes, i: Fin Bytes, acc: Int64) : (Bytes, Int64) =
+  let x = b[i] in match i with | 0 => (b, +(acc, pack<8>(x))) | down(j) => walk(b, j, +(acc, pack<8>(x))) end;
+"""
+
+
+class Within(unittest.TestCase):
+    """`match within(s, x) with | inside(i) => ... | outside => ... end`: i is x, as a Fin below the slot's length, or
+    x is not below it. It borrows the slot, and it is matched where it is written, since it is no value."""
+
+    def refused(self, source: str, message: str) -> None:
+        with self.assertRaisesRegex(Reject, message):
+            rt(source)
+
+    def test_it_makes_a_fin_below_the_length(self):
+        lines = rt(WALK + """fn sum(b: Bytes, x: Int16) : (Bytes, Int64) =
+  match within(b, x) with | inside(i) => walk(b, i, 0) | outside => (b, 0) end;
+""")
+        self.assertTrue(any(re.fullmatch(r"    br\.within r0, r\d+, r\d+, L\d+, L\d+", line) for line in lines), lines)
+
+    def test_its_arms_come_in_either_order(self):
+        rt(WALK + "fn sum(b: Bytes, x: Int16) : (Bytes, Int64) = match within(b, x) with | outside => (b, 0) "
+                  "| inside(i) => walk(b, i, 0) end;\n")
+
+    def test_it_is_matched_where_it_is_written(self):
+        self.refused(SLOT + "fn f(b: Bytes) : Bytes = let w = within(b, 3) in b;\n", "matched where it is written")
+
+    def test_it_names_a_slot_first(self):
+        self.refused(SLOT + "fn f(x: Int16) : Int8 = match within(x, 3) with | inside(i) => 1 | outside => 0 end;\n",
+                     "within reads a slot, and x is Int16")
+        self.refused(SLOT + "fn me(b: Bytes) : Bytes = b;\nfn f(b: Bytes) : Bytes = match within(me(b), 3) with "
+                            "| inside(i) => b | outside => b end;\n", "names a slot first")
+
+    def test_it_has_both_arms_and_only_those(self):
+        self.refused(SLOT + "fn f(b: Bytes) : Bytes = match within(b, 3) with | inside(i) => b end;\n",
+                     "non-exhaustive match on within")
+        self.refused(SLOT + "fn f(b: Bytes) : Bytes = match within(b, 3) with | inside(i) => b | down(j) => b end;\n",
+                     "two arms, inside\\(i\\) and outside, and down is neither")
+        self.refused(SLOT + "fn f(b: Bytes) : Bytes = match within(b, 3) with | outside => b | outside => b end;\n",
+                     "duplicate match arm")
+
+    def test_what_it_makes_is_the_slots_own_fin(self):
+        self.refused(SLOT + "fn f(b: Bytes) : Bytes = match within(b, 3) with | inside(i) => let k = pack<8>(i) in b "
+                            "| outside => b end;\n", "2047 does not fit 8 bits")
 
 
 def counting(bound: int, uses: str = "count(i, a)", from_a_cell: bool = False) -> str:
@@ -244,13 +292,49 @@ handler h(f: Frame, free: Free) : (Verdict, Frame, Free) =
         self.assertEqual(check_stream(rt(two)).held_slots("h"), 2)
         self.assertEqual(check_stream(rt(counting(16))).held_slots("h"), 0)
 
+    def walking(self, uses: str) -> object:
+        return bound_of(WALK + """record Frame { a: Int8, b16: Int16, body: Bytes };
+enum Verdict = Drop | Send(port: Int8);
+handler h(f: Frame, free: Free) : (Verdict, Frame, Free) =
+  match f with Frame(d, a, b16, body) => """ + uses + """ end;
+""")
+
+    def test_a_walk_from_within_is_paid_for_by_the_slots_bytes(self):
+        """Below the length, so the walk is as long as the frame, and its bound grows with n, the item's cells and
+        its slot's bytes. idx can only say it is below 2048, so its walk is charged as the longest there can be."""
+        within = self.walking("""match within(body, b16) with
+    | inside(i) => let (rest, s) = walk(body, i, 0) in (Send(low8(s)), Frame@d(a, b16, rest), free)
+    | outside => (Drop, Frame@d(a, b16, body), free) end""")
+        indexed = self.walking("""let (rest, s) = walk(body, idx(b16, Bytes), 0) in (Send(low8(s)), Frame@d(a, b16, rest), free)""")
+        self.assertGreater(within.c, 0)
+        self.assertEqual(indexed.c, 0)
+        self.assertLess(within.c * (1 + 5) + within.d, indexed.d, "a short frame's bound is a short one")
+        self.assertLess(within.c * (1 + 2048) + within.d, indexed.d + 2 * within.c, "and the longest is the same")
+
+    def test_a_slot_walked_twice_is_paid_for_twice(self):
+        """What the first within takes of the slot's amount, the second cannot."""
+        once = self.walking("""match within(body, b16) with
+    | inside(i) => let (rest, s) = walk(body, i, 0) in (Send(low8(s)), Frame@d(a, b16, rest), free)
+    | outside => (Drop, Frame@d(a, b16, body), free) end""")
+        twice = self.walking("""match within(body, b16) with
+    | inside(i) => let (rest, s) = walk(body, i, 0) in
+        match within(rest, b16) with
+        | inside(j) => let (again, t) = walk(rest, j, s) in (Send(low8(t)), Frame@d(a, b16, again), free)
+        | outside => (Drop, Frame@d(a, b16, rest), free) end
+    | outside => (Drop, Frame@d(a, b16, body), free) end""")
+        self.assertGreaterEqual(twice.c, 2 * once.c - 1)
+
     def test_the_udp_check(self):
         with open(UDP_VERIFY, "rb") as handle:
             checker = check_stream(rt_lines(handle))
         bound = certify(checker, "udp_verify", 217)
-        self.assertEqual((bound.a, bound.b, bound.c), (0, 0, 0), "nothing drawn, and the same work for any item")
+        self.assertEqual((bound.a, bound.b), (0, 0), "nothing drawn")
         self.assertEqual(checker.held_slots("udp_verify"), 1, "slots are counted apart: the item's one")
-        self.assertGreaterEqual(bound.d, 2047 * 4, "a read, a widening, an add and a step down for each byte it can sum")
+        self.assertEqual(checker.record_cells("udp_verify"), 6)
+        # n is the record's six cells and the slot's bytes, so a short frame's bound is a short one.
+        self.assertGreaterEqual(bound.c, 4, "a read, a widening, an add and a step down for each byte it sums")
+        self.assertLess(bound.c * (6 + 5) + bound.d, bound.c * (6 + 1472) + bound.d)
+        self.assertLess(bound.c * (6 + 1472) + bound.d, bound.c * 2047, "and the longest frame's is below a walk of 2047")
 
 
 class InRT(unittest.TestCase):
@@ -307,23 +391,109 @@ end decreasing 0,1
 
 
 class OnX86(unittest.TestCase):
-    """Not lowered yet, and said so: src/runtime.py places no slot, and the symbolic check reads neither."""
+    """Lowered, and checked: src/symcheck.py reads a slot, a countdown and within for itself, and every build passes
+    it, so what each means in the source is what the assembly does."""
 
-    def refused(self, source: str, message: str) -> None:
+    def built(self, source: str) -> str:
         with tempfile.TemporaryDirectory() as workdir:
             path, exe = os.path.join(workdir, "p.lfpl"), os.path.join(workdir, "p")
             with open(path, "w") as handle:
                 handle.write(source)
-            with self.assertRaisesRegex(Refused, message):
-                build(path, exe, Options(in_port=9000, out_base=9100, ctl_port=9001))
-            self.assertFalse(os.path.exists(exe))
+            report = str(build(path, exe, Options(in_port=9000, out_base=9100, ctl_port=9001)))
+            self.assertTrue(os.path.exists(exe))
+            return report
 
     def test_a_slot(self):
         with open(UDP_VERIFY) as handle:
-            self.refused(handle.read(), "slot Payload is not lowered to x86 yet")
+            report = self.built(handle.read())
+        self.assertRegex(report, r"R\(n\) = 0 cells, W\(n\) = \d+ n \+ \d+ steps")
+        with open(os.path.join(ROOT, "README.md")) as handle:
+            self.assertIn(report.split(", stack")[0], handle.read())
 
     def test_a_countdown(self):
-        self.refused(counting(16), "a match that counts a Fin down is not lowered to x86 yet")
+        self.assertRegex(self.built(counting(16)), r"R\(n\) = 0 cells, W\(n\) = \d+ steps")
+
+    def assembly(self, source: bytes) -> str:
+        out: list = []
+        backend = Backend(out.append)
+        for line in rt_lines(io.BytesIO(source)):
+            backend.feed(line)
+        return "default abs\nsection .text\n" + "\n".join(out) + "\n"
+
+    def test_the_symbolic_check_sees_each_break(self):
+        """The assembly of examples/udp_verify.lfpl, broken by hand, each way a slot read, a countdown or within
+        could be got wrong: every one disagrees with what the source means."""
+        with open(UDP_VERIFY, "rb") as handle:
+            source = handle.read()
+        asm = self.assembly(source)
+        self.assertEqual(check_translation(source, asm), [])
+        breaks = {"a byte past the length kept": (r"cmovae", "cmovb"),
+                  "the slot one smaller": (r"shl (\w+), 11", r"shl \1, 10"),
+                  "one less is two less": (r"(mov (\w+), \w+\n\s+)sub \2, 1\n", "\\1sub \\2, 2\n"),
+                  "within takes the length itself": (r"(cmp \w+, r11\n\s+)jb ", r"\1jbe "),
+                  "the length is the number": (r"shr r11, 32", "shr r11, 0")}
+        for name, (pattern, replacement) in breaks.items():
+            with self.subTest(name):
+                broken, count = re.subn(pattern, replacement, asm)
+                self.assertGreater(count, 0)
+                self.assertNotEqual(check_translation(source, broken), [])
+
+
+class OnX86Live(unittest.TestCase):
+    """examples/udp_verify.lfpl on live sockets: each frame's W is the bound for its own n, worked out by admission from
+    its length, and each frame runs within it, so a short frame's bound is a short one."""
+
+    def test_every_frame_within_its_own_bound(self):
+        cases = TheMachine("test_every_verdict_is_the_models").cases()
+        frames = [packet for _name, packet, length in cases if length is None]
+        budgets = {}
+        with tempfile.TemporaryDirectory() as workdir:
+            router = Forwarder(bytes(1024), workdir, build_options=("--count-steps",), source=UDP_VERIFY)
+            try:
+                for socket in router.outputs:
+                    socket.settimeout(0.05)
+                before = router.stats()
+                for number, packet in enumerate(frames, 1):
+                    router.raw(packet)
+                    now = router.settle(number)
+                    for socket in router.outputs:
+                        try:
+                            socket.recv(4096)
+                        except TimeoutError:
+                            pass
+                    steps, budget = now["steps"] - before["steps"], now["budget_steps"] - before["budget_steps"]
+                    self.assertLessEqual(steps, budget, packet.hex()[:24])
+                    budgets[len(packet)] = budget
+                    before = now
+                self.assertEqual((now["pool"], now["slots"]), (now["capacity"], now["slot_capacity"]))
+            finally:
+                router.close()
+        self.assertLess(budgets[47], budgets[1514])
+        report = re.search(r"W\(n\) = (\d+) n \+ (\d+) steps", router.report)
+        c, d = int(report.group(1)), int(report.group(2))
+        self.assertEqual(budgets[47], c * (6 + 47 - 42) + d, "n is the record's 6 cells and the slot's 5 bytes")
+
+    def test_a_full_queue_is_full_and_not_short(self):
+        """Every slot is ingress's or a queued output's, so once the queue is full no slot is free either. The frame
+        after is refused as Full, as the machine's turn refuses it, and not as Short, and when egress goes, the four
+        go out and every cell and slot is back."""
+        good = frame(b"query")  # sent to port 0
+        with tempfile.TemporaryDirectory() as workdir:
+            router = Forwarder(bytes(1024), workdir, build_options=("--k-out", "4"), source=UDP_VERIFY)
+            try:
+                router.stats(b"P")
+                for _ in range(6):
+                    router.raw(good)
+                paused = router.settle(6)
+                self.assertEqual((paused["served"], paused["full"], paused["short"]), (4, 2, 0))
+                self.assertEqual(paused["slots"], 0, "ingress holds one, and the queue the other four")
+                router.stats(b"R")
+                for _ in range(4):
+                    self.assertEqual(len(router.outputs[0].recv(4096)), len(good))
+                drained = router.stats()
+                self.assertEqual((drained["pool"], drained["slots"]), (drained["capacity"], drained["slot_capacity"]))
+            finally:
+                router.close()
 
 
 def ones(data: bytes) -> int:
@@ -411,6 +581,7 @@ class TheMachine(unittest.TestCase):
             ("the longest payload, 1472 bytes", frame(longest, destination=hops[3]), None),
             ("Ethernet's padding after a short datagram", frame(b"hey", padding=bytes(15)), None),
             ("a slot that says it holds less than the datagram", frame(b"query"), 3),
+            ("a slot one byte short of the datagram, so within is asked for the length itself", frame(b"query"), 4),
         ]
 
     def test_every_verdict_is_the_models(self):
@@ -432,7 +603,9 @@ class TheMachine(unittest.TestCase):
                 self.assertEqual(got, verdict)
                 if verdict == "Send":
                     self.assertEqual(result["verdict"] >> 8 & 0xFF, port)
-                self.assertLessEqual(result["cycles"], translation.timing.bound(1))
+                # n is the record's cells and the slot's bytes
+                n = layout.shape(layout.item)[1] + (len(packet) - 42 if slot_length is None else slot_length)
+                self.assertLessEqual(result["cycles"], translation.timing.bound(n))
                 fields = self.fields(result["words"], result["out"])
                 slot = translation.first_slot + number % translation.slots
                 length = len(packet) - 42 if slot_length is None else slot_length
@@ -493,15 +666,18 @@ handler peek(f: Frame, free: Free) : (Verdict, Frame, Free) =
         self.assertTrue(any(line.strip().startswith("take ") for line in lines), "it leaves the cell to be read")
         translation = translate(lines, n_max=8, slots=2)
         layout = Layout(lines)
-        images, payloads, slots = [], (b"\x07abc", bytes(range(200, 256)) * 30), []
-        for number, payload in enumerate(payloads):
+        # The last slot holds bytes an earlier frame left, and says it holds none: so its first byte is 0.
+        images, cases, slots = [], ((b"\x07abc", None), (bytes(range(200, 256)) * 30, None), (b"\x55\x66", 0)), []
+        for number, (payload, length) in enumerate(cases):
             slots.append(translation.first_slot + number % translation.slots)
-            loads, item, free, words = layout.image(b"\x01" + payload, 0, slots[-1])
+            loads, item, free, words = layout.image(b"\x01" + payload, 0, slots[-1], length)
             images += image_lines(item, free, words, loads)
         results, _summary = run_images(translation, images)
-        for result, payload, slot in zip(results, payloads, slots):
-            self.assertEqual(result["verdict"] >> 8 & 0xFF, (len(payload) & 0xFF) ^ payload[0] ^ 1)
-            self.assertEqual(self.body_of(layout, result), slot | len(payload) << 32, "and it went back whole")
+        for result, (payload, length), slot in zip(results, cases, slots):
+            length = len(payload) if length is None else length
+            first = payload[0] if length else 0
+            self.assertEqual(result["verdict"] >> 8 & 0xFF, (length & 0xFF) ^ first ^ 1)
+            self.assertEqual(self.body_of(layout, result), slot | length << 32, "and it went back whole")
 
     @staticmethod
     def body_of(layout: Layout, result: dict) -> int:

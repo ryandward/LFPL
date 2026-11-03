@@ -20,12 +20,12 @@ import struct
 from dataclasses import dataclass, replace
 from typing import BinaryIO, Callable, Generic, Iterable, Iterator, NamedTuple, Optional, Protocol, TypeVar
 
-from .check import (ARM_ENUM, ARM_FIN, ATTR_LINEAR, ATTR_WIRE, P_ARM_RT, P_BINDER, P_CALL_RT, P_DIAMOND_RT, P_FIELD,
+from .check import (ARM_ENUM, ARM_FIN, ARM_WITHIN, ATTR_LINEAR, ATTR_WIRE, P_ARM_RT, P_BINDER, P_CALL_RT, P_DIAMOND_RT, P_FIELD,
                     P_GET_RT, P_IDX_RT, P_LET_RT, P_PARAM_RT, P_TYPE_RT, P_VAR, P_WITH_RT, CheckStage)
 from .dyck import (CC_NAMES, CLOSE, DEFAULT_D_MAX, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP, K_CTOR,
                    K_DIAMOND, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER, K_IDX, K_IF, K_INT, K_LET, K_LIVE,
                    K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR, K_PACK, K_PARAM, K_RESWORD, K_RTDECL,
-                   K_RTDECLMORE, K_SGET, K_SLEN, K_TUPLE, K_TURN, K_TYPE, K_VALUE, K_VAR, K_VARLAST, K_WITH, LEAF,
+                   K_RTDECLMORE, K_SGET, K_SLEN, K_TUPLE, K_TURN, K_TYPE, K_VALUE, K_VAR, K_VARLAST, K_WITH, K_WITHIN, LEAF,
                    OP_NAMES, OPEN, SEP, VALUE, FUNCTIONS, Lexer, Parser, ev_class, ev_kind)
 from .righttoleft import CELLS_PER_DEPTH, MASK_BITS, RightToLeft
 from .spans import HELD_CELLS
@@ -652,7 +652,8 @@ class RTLower(Stage):
             self._value_with_no_fields(VALUE.unpack_from(payload)[0])
         elif kind == K_EOF:
             pass
-        elif kind in (K_VAR, K_VARLAST) and self.F.top().kind == K_SLEN:
+        elif kind in (K_VAR, K_VARLAST) and (self.F.top().kind == K_SLEN or (
+                self.F.top().kind == K_WITHIN and len(self.V) == self.F.top().vmark)):
             self.V.push(self._borrow(P_VAR.unpack_from(payload)[0]))
         else:
             self._deliver(self._leaf_value(kind, payload), self._dest())
@@ -866,6 +867,14 @@ class RTLower(Stage):
             self.V.push(Value(V_TUPLE, frame.count))
 
     def _sep_match(self, top: Frame, payload: bytes) -> None:
+        if payload[1] == 2:  # within: the slot it borrowed, and the integer, which br.within reads in a register
+            tested = self._as_reg(self._native(self.V.pop()))
+            top.reg = self.V.pop().reg
+            top.cell = tested
+            top.state = 4
+            top.gmark, top.umark = len(self.G), len(self.U)
+            self.F.set_top(top)
+            return
         if payload[1]:  # a Fin, which br.down reads and leaves where it is: it needs no register of its own
             top.reg = self._as_reg(self._native(self.V.pop()))
             top.state = 4
@@ -903,6 +912,9 @@ class RTLower(Stage):
             return
         if what == ARM_FIN:
             self._open_fin_arm(match, bool(tag), arm_index)
+            return
+        if what == ARM_WITHIN:
+            self._open_within_arm(match, bool(tag), arm_index)
             return
         if match.state == 1:
             if ctor != match.l1:
@@ -970,6 +982,18 @@ class RTLower(Stage):
             self.i(f"br.down r{match.reg}, r{match.aux}, L{match.l1}, L{match.l2}")
             self.live = False
         self.label(match.l2 if down else match.l1)
+        self.F.set_top(match)
+        self.F.push(Frame(K_ARM, state=4, dest=match.dest, d=match.d, count=match.count, t=match.t, f=match.f,
+                          reg=match.reg, word=match.word, cell=self.new_cell(), bmark=len(self.B), l3=match.aux))
+
+    def _open_within_arm(self, match: Frame, inside: bool, arm_index: int) -> None:
+        """One test, before the first arm: on the way to `inside(i)` the integer is i, a Fin, in a register of its own."""
+        self._rollback(match)
+        if arm_index == 0:
+            match.l1, match.l2, match.aux = self.new_label(), self.new_label(), self.fresh()
+            self.i(f"br.within r{match.reg}, r{match.cell}, r{match.aux}, L{match.l2}, L{match.l1}")
+            self.live = False
+        self.label(match.l2 if inside else match.l1)
         self.F.set_top(match)
         self.F.push(Frame(K_ARM, state=4, dest=match.dest, d=match.d, count=match.count, t=match.t, f=match.f,
                           reg=match.reg, word=match.word, cell=self.new_cell(), bmark=len(self.B), l3=match.aux))
@@ -1507,7 +1531,7 @@ class RTLower(Stage):
             self._sep_logical(top)
         elif kind == K_CTOR:
             self._sep_ctor(payload)
-        elif kind in (K_BINOP, K_CMP, K_CALL, K_TUPLE, K_GET, K_PACK, K_VALUE):
+        elif kind in (K_BINOP, K_CMP, K_CALL, K_TUPLE, K_GET, K_PACK, K_VALUE, K_WITHIN):
             pass
         else:
             raise AssertionError(f"sep of kind {kind}")
@@ -1571,6 +1595,8 @@ class RTLower(Stage):
             self._close_sget()
         elif kind == K_SLEN:
             self._close_slen()
+        elif kind == K_WITHIN:
+            self.F.pop()  # the slot and the integer wait on the stack for the match whose scrutinee this is
         else:
             raise AssertionError(f"close of kind {kind}")
 

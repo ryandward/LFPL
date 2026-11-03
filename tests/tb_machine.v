@@ -1,12 +1,12 @@
 // Drives src/machine.py's machine: frames in as bytes, and what comes out printed as it leaves.
 //
-//   iverilog -g2005 -DCELLS=1310 -DPARTS=5 -o sim tests/tb_machine.v machine.v serve_core.v
+//   iverilog -g2005 -DCELLS=41 -DPARTS=5 -DVERDICTS=3 -o sim tests/tb_machine.v machine.v serve_core.v
 //   vvp sim +frames=frames.txt          (in the directory that holds cells.mem)
 //
 // frames.txt has a frame to a line: `hold length byte byte ...`, in hex bytes. With hold set, egress is held still
 // while the frame goes in, which is how a queue fills. Afterwards egress is let go, and once the machine has been
-// idle with nothing queued for a while, it prints where the pool, ingress and the queue are, what the machine
-// counted, and every cell.
+// idle with nothing queued for a while, it prints where the pool, the spare slots, ingress and the queue are, what the
+// machine counted, each verdict's count, and every cell.
 `timescale 1ns/1ns
 `default_nettype none
 
@@ -15,6 +15,13 @@
 `endif
 `ifndef PARTS
  `define PARTS 5
+`endif
+`ifndef VERDICTS
+ `define VERDICTS 3
+`endif
+`ifndef SLOT_FIRST  // the slots' cells, after the cells: printed too, so a test can see what ingress wrote in them
+ `define SLOT_FIRST 128
+ `define SLOT_LAST 767
 `endif
 
 module tb;
@@ -33,13 +40,15 @@ module tb;
     reg out_ready = 1'b1;
     wire turn_done;
     wire [31:0] turn_cycles;
-    wire [7:0] turn_outcome;
-    wire [31:0] overruns, faults, cuts;
+    wire [7:0] turn_outcome, turn_verdict;
+    wire [31:0] overruns, faults;
+    wire [32 * `VERDICTS - 1:0] verdicts;
 
     machine dut (.clk(clk), .rst(rst), .in_valid(in_valid), .in_data(in_data), .in_last(in_last),
                  .in_ready(in_ready), .out_valid(out_valid), .out_data(out_data), .out_last(out_last),
                  .out_port(out_port), .out_ready(out_ready), .turn_done(turn_done), .turn_cycles(turn_cycles),
-                 .turn_outcome(turn_outcome), .overruns(overruns), .faults(faults), .cuts(cuts));
+                 .turn_outcome(turn_outcome), .turn_verdict(turn_verdict), .overruns(overruns), .faults(faults),
+                 .verdicts(verdicts));
 
     // The machine stops what would hang. These are for when one of its stops is broken, so that a test says so at
     // once rather than at a timeout: nothing moving for long, a frame with no end, more frames out than in.
@@ -72,7 +81,7 @@ module tb;
                 end
             end
         end
-        if (turn_done) $display("TURN %0d %0d %0d", turn_outcome, turn_cycles, $time / 10);
+        if (turn_done) $display("TURN %0d %0d %0d %0d", turn_outcome, turn_cycles, $time / 10, turn_verdict);
     end
 
     reg [1023:0] path;
@@ -107,9 +116,15 @@ module tb;
             @(negedge clk);
             idle = (dut.state == 5'd0 && dut.head == 0 && !out_valid && !dut.draining) ? idle + 1 : 0;
         end
-        $display("FINAL %0d %0d %0d %0d %0d %0d %0d", dut.pool, dut.slot, dut.head, dut.queue, overruns, faults, cuts);
+        $write("FINAL %0d %0d %0d %0d %0d %0d %0d", dut.pool, dut.spares, dut.ingress, dut.head, dut.queue, overruns,
+               faults);
+        for (index = 0; index < `VERDICTS; index = index + 1)
+            $write(" %0d", verdicts[32 * index +: 32]);
+        $write("\n");
         for (index = 1; index <= `CELLS; index = index + 1)  // ingress's record is in registers, cells 1 to PARTS
             $display("WORD %0d %032x", index, index <= `PARTS ? dut.core.header[index] : dut.core.cells[index]);
+        for (index = `SLOT_FIRST; index <= `SLOT_LAST; index = index + 1)
+            $display("WORD %0d %032x", index, dut.core.cells[index]);
         $display("DONE");
         $finish(0);
     end

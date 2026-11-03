@@ -38,19 +38,21 @@ format, one event at a time, so they reach every reader of the stream:
   * a slot, a linear type that owns one whole slot of SLOT_BYTES bytes, which no expression can make or
     take apart. `s[i]` and `len(s)` borrow it, so neither is a use of s. A Fin's bound may be a slot's size;
   * a match on a Fin, which counts it down: `| 0 => ...` and `| down(j) => ...`, with j one less. It is the
-    other measure rule R3 takes, beside the cells: a Fin parameter that every recursive call passes one less of.
+    other measure rule R3 takes, beside the cells: a Fin parameter that every recursive call passes one less of;
+  * `within(s, x)`, matched where it is written, `| inside(i) => ...` with i the Fin x is, below the length of the
+    slot s, or `| outside => ...`. It borrows s, as a read does, and it is how a walk's work comes from the slot.
 """
 from __future__ import annotations
 
 import struct
 from typing import NamedTuple, Optional
 
-from .dyck import (CLOSE, DOWN, ELEMENT_CODES, OP_NAMES, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP,
+from .dyck import (CLOSE, DOWN, INSIDE, OUTSIDE, ELEMENT_CODES, OP_NAMES, K_AND, K_ARM, K_BINDER, K_BINOP, K_BOOL, K_CALL, K_CMP,
                    K_CTOR, K_CTORDECL, K_DATA, K_DIAMOND, K_ENUM, K_EOF, K_FIELD, K_FN, K_GET, K_HANDLER,
                    K_IDX, K_IF, K_INT, K_LET, K_LIVE, K_LOW, K_MATCH, K_NOT, K_NULLCTOR, K_OR,
                    K_PACK, K_PARAM, K_RECORD, K_RESWORD, K_RTDECL, K_RTDECLMORE, K_SGET, K_SLEN, K_SLOT, K_STATE,
                    K_TARRAY, K_TFIN, K_TFINNAME, K_TTUPLE, K_TUPLE, K_TURN, K_TYPE, K_VALUE, K_VAR, K_VARAT, K_VARLAST,
-                   K_WITH, LEAF, OPEN, SEP, VALUE,
+                   K_WITH, K_WITHIN, LEAF, OPEN, SEP, VALUE,
                    FUNCTIONS,
                    VARAT, ev_class, ev_kind, ev_tag)
 from .ring import FrameStack, Reject, Ring, Stage
@@ -62,6 +64,7 @@ LINK_NAME = b"$next"  # the last field of a cell of a record that spans, as src/
 
 # Type ids. Named types are G positions offset by FIRST_NAMED.
 T_I8, T_I16, T_I32, T_I64, T_BOOL, T_DIAMOND, T_LIT, T_LIT8, T_LIT16, T_LIT32, T_BE16, T_BE32, T_BE64 = range(13)
+T_WITHIN = 13  # what `within(s, x)` is: no value, and nothing but the match it is written in can take it
 FIRST_NAMED = 16
 # A field in network byte order. It says how the field lies in its cell, and nothing else: what a pattern binds
 # from one and what a constructor stores in one is the integer, swapped on the way.
@@ -69,7 +72,7 @@ _WIRE = {T_BE16: T_I16, T_BE32: T_I32, T_BE64: T_I64}
 # A literal whose type nothing has fixed yet, by the bytes it needs.
 _LITERALS = {T_LIT8: 1, T_LIT16: 2, T_LIT32: 4, T_LIT: 8}
 _NARROWING = {b"low8": T_I8, b"low16": T_I16, b"low32": T_I32}
-_PRIMITIVES = {b"idx", b"get", b"peel", b"len", *_NARROWING}
+_PRIMITIVES = {b"idx", b"get", b"peel", b"len", b"within", *_NARROWING}
 # A slot: a power of two that holds a 1518-byte frame, so a byte's place in it needs no division. 128 cells of 16.
 SLOT_BYTES = 2048
 _TYPES_WRITTEN = (K_TYPE, K_TARRAY, K_TFIN, K_TFINNAME)  # the leaves that say a type
@@ -112,7 +115,7 @@ P_TYPE_RT = struct.Struct("<H")          # a type
 P_GET_RT = struct.Struct("<B")           # the element's size
 P_IDX_RT = struct.Struct("<Q")           # the bound
 # An arm's last byte in P_ARM_RT, saying what it takes apart: a cell, an enum in a register, or a Fin it counts down.
-ARM_CELL, ARM_ENUM, ARM_FIN = 0, 1, 2
+ARM_CELL, ARM_ENUM, ARM_FIN, ARM_WITHIN = 0, 1, 2, 3
 
 
 class Cells(NamedTuple):
@@ -495,6 +498,8 @@ class CheckStage(Stage):
                 return name.decode()
         if ty in _LITERALS:
             return "integer literal"
+        if ty == T_WITHIN:
+            return "within(...)"
         if ty >= FIRST_TUPLE:
             return "(" + ", ".join(self._show(m) for m in self._tuple_of(ty)) + ")"
         if is_enum(ty):
@@ -536,7 +541,7 @@ class CheckStage(Stage):
             self.ring.drop(self, cell)
             return
         if (cls in (SEP, CLOSE) and kind == K_CALL and len(self.K)
-                and self.K.peek()[0] in (K_IDX, K_GET, K_LOW, K_SLEN)):
+                and self.K.peek()[0] in (K_IDX, K_GET, K_LOW, K_SLEN, K_WITHIN)):
             kind = self.K.peek()[0]
         result = (self._on_open, self._on_sep, self._on_leaf, self._on_close)[cls](
             kind, payload)
@@ -776,6 +781,8 @@ class CheckStage(Stage):
             raise self._reject("the bound of idx must be a literal, or the name of a slot")
         if len(self.K) and self.K.peek()[0] == K_SLEN:
             raise self._reject("len names a slot, whose length it reads and which it keeps")
+        if len(self.K) and self.K.peek()[0] == K_WITHIN and not self._top()[1]:
+            raise self._reject("within names a slot first, by its name, and then the integer it tests")
         if kind == K_TTUPLE:
             self._frame(K_TTUPLE, c1=len(self.TM))
             return None
@@ -810,6 +817,10 @@ class CheckStage(Stage):
             self._frame(K_SLEN)
             self.child_seen = False
             return K_SLEN, b""
+        elif kind == K_CALL and payload.rstrip(bytes(1)) == b"within":
+            self._frame(K_WITHIN)  # b: the slot has been named. t1: its type
+            self.child_seen = False
+            return K_WITHIN, b""
         elif kind == K_SGET:
             src = self._lookup(payload)[0]
             _linear, ty = self._borrow(src, "a byte read")
@@ -901,10 +912,29 @@ class CheckStage(Stage):
                     m1=1 << frame[4] - 1 if frame[4] else 0, m3=1)
         return K_ARM, P_ARM_RT.pack(int(down), 0, int(not down), arm_index, 2, 0, ARM_FIN)
 
+    def _open_within_arm(self, frame: list, payload: bytes):
+        """`| inside(i) =>` binds i, the Fin the integer is, and `| outside =>` binds nothing."""
+        word = payload.rstrip(bytes(1))
+        if word not in (INSIDE, OUTSIDE):
+            raise self._reject(f"a match on within has two arms, inside(i) and outside, and {word.decode()} is neither")
+        inside = word == INSIDE
+        seen = frame[7]
+        if seen >> inside & 1:
+            raise self._reject("duplicate match arm")
+        arm_index = frame[0]
+        frame[7] = seen | 1 << inside
+        frame[0] = arm_index + 1
+        self._store(frame)
+        self.used = frame[6]
+        self._frame(K_ARM, a=int(inside), c1=len(self.B), c2=self._fin_type(SLOT_BYTES, False), m3=1)
+        return K_ARM, P_ARM_RT.pack(int(inside), 0, int(not inside), arm_index, 2, 0, ARM_WITHIN)
+
     def _open_arm(self, payload: bytes):
         frame = self._top()
         if self._is_fin(frame[2]):
             return self._open_fin_arm(frame, payload)
+        if frame[2] == T_WITHIN:
+            return self._open_within_arm(frame, payload)
         found = self._g_find(E_CTOR, payload)
         enum = is_enum(frame[2])
         type_index = frame[2] - (FIRST_ENUM if enum else FIRST_NAMED)
@@ -977,6 +1007,12 @@ class CheckStage(Stage):
             raise self._reject("low8, low16 and low32 take one integer")
         if kind == K_SLEN:
             raise self._reject("len takes one slot")
+        if kind == K_WITHIN:
+            if frame[1] or not self.child_seen:
+                raise self._reject("within takes a slot and an integer")
+            frame[1] = 1
+            self._store(frame)
+            return kind, payload
         if kind == K_IDX:
             self._need_int(self.ty, "idx's operand")
             frame[1] = 1  # the bound comes next, and it must be a literal
@@ -998,6 +1034,11 @@ class CheckStage(Stage):
                 frame[7] = self.used
                 self.used = frame[6]
             self._store(frame)
+        elif kind == K_MATCH and self.ty == T_WITHIN:
+            frame[2] = T_WITHIN
+            frame[6] = self.used
+            self._store(frame)
+            return kind, bytes((index, 2))  # Lower is told it is within's, so it reads no cell
         elif kind == K_MATCH and self._is_fin(self.ty):
             # A Fin counted down. If it is parameter p less some number, its arm `down(j)` knows j is less again.
             frame[2] = self.ty
@@ -1256,6 +1297,8 @@ class CheckStage(Stage):
             return kind, P_DIAMOND_RT.pack(src, tag, tagged, count, off, size, linear, frame[4])
         if len(self.K) and self.K.peek()[0] == K_SLEN:
             return self._slot_length(kind, payload)
+        if len(self.K) and self.K.peek()[0] == K_WITHIN and not self._top()[1]:
+            return self._slot_length(kind, payload, "within")
         if len(self.K) and self.K.peek()[0] == K_IDX and self._top()[1]:
             if kind == K_NULLCTOR:  # a slot's size in bytes
                 frame = self._top()
@@ -1303,12 +1346,12 @@ class CheckStage(Stage):
             return kind, P_TYPE_RT.pack(self.ty)
         return kind, payload
 
-    def _slot_length(self, kind: int, payload: bytes):
-        """The one thing len takes: a slot, by its name, which it borrows."""
+    def _slot_length(self, kind: int, payload: bytes, what: str = "len"):
+        """The slot len and within take, by its name, which they borrow."""
         if kind not in (K_VAR, K_VARLAST, K_VARAT) or self.child_seen:
-            raise self._reject("len takes one slot, by its name")
+            raise self._reject(f"{what} takes one slot, by its name")
         src = VARAT.unpack_from(payload)[0] if kind == K_VARAT else self._lookup(payload)[0]
-        _linear, self.ty = self._borrow(src, "len")
+        _linear, self.ty = self._borrow(src, what)
         self.child_seen = True
         self.form = Cells()
         return K_VAR, P_VAR.pack(src, 0, size_of(self.ty))
@@ -1325,7 +1368,7 @@ class CheckStage(Stage):
             raise self._reject(f"pattern has too many binders: expected {frame[0]}")
         frame[1] = position + 1
         self._store(frame)
-        if frame[8]:  # `down(j)`: j is the Fin one less, in a register of its own
+        if frame[8]:  # `down(j)` or `inside(i)`: a Fin, in a register of its own
             self._bind(payload, frame[5], Cells(frame[3], frame[6]) if frame[6] else Cells())
             return K_BINDER, P_BINDER.pack(3, 0, size_of(frame[5]), 0)
         if frame[7]:  # an enum's field, which Lower reads out of the register by its index
@@ -1401,6 +1444,18 @@ class CheckStage(Stage):
             self.K.pop()
             self.child_seen = True
             return kind, payload
+        if kind == K_WITHIN:
+            if not frame[1] or not self.child_seen:
+                raise self._reject("within takes a slot and an integer")
+            self._need_int(self.ty, "within's second operand")
+            self.K.pop()
+            # An arm is a frame of its own, so a match just below this is the one whose scrutinee it is.
+            if not len(self.K) or self.K.peek()[0] != K_MATCH:
+                raise self._reject("within is matched where it is written: match within(s, x) with | inside(i) => "
+                                   "... | outside => ... end")
+            self.ty = T_WITHIN
+            self.child_seen = True
+            return kind, payload
         if kind == K_IDX:
             if frame[1] != 2:
                 raise self._reject("idx takes a value and a literal bound")
@@ -1433,6 +1488,11 @@ class CheckStage(Stage):
             self.ty = self._unify(frame[2], self.ty, "the arms of an if")
             if self.used != frame[7]:
                 raise self._reject("the arms of an if consume different linear variables")
+        elif kind == K_MATCH and frame[2] == T_WITHIN:
+            if frame[0] != 2:
+                raise self._reject("non-exhaustive match on within: it has two arms, inside(i) and outside")
+            self.ty = frame[3]
+            self.used = frame[8]
         elif kind == K_MATCH and self._is_fin(frame[2]):
             if frame[0] != 2:
                 raise self._reject(f"non-exhaustive match on {self._show(frame[2])}: it has two arms, 0 and down(j)")

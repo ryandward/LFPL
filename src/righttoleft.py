@@ -58,7 +58,7 @@ from dataclasses import dataclass
 from typing import BinaryIO, Optional
 
 from .check import CELL_FIELDS_MAX, TUPLE_MAX
-from .dyck import (CLOSE, DEFAULT_D_MAX, DOWN, K_ARM, K_BINDER, K_BOOL, K_CALL, K_CTOR, K_DIAMOND, K_ENUM, K_EOF, K_FIELD,
+from .dyck import (CLOSE, DEFAULT_D_MAX, ARM_WORDS, K_ARM, K_BINDER, K_BOOL, K_CALL, K_CTOR, K_DIAMOND, K_ENUM, K_EOF, K_FIELD,
                    K_FN, K_HANDLER, K_IF, K_INT, K_LET, K_LIVE, K_MATCH, K_NULLCTOR, K_PARAM, K_RECORD, K_RESWORD,
                    K_TARRAY, K_TFIN, K_TFINNAME, K_TTUPLE, K_TUPLE, K_TYPE, K_VAR, K_VARAT, K_VARLAST, K_WITH, LEAF, OPEN,
                    SEP, VARAT, ev_class, ev_kind, ev_tag, FUNCTIONS)
@@ -312,8 +312,9 @@ class RightToLeft(Stage):
             return
         if kind == K_ARM:
             _match_kind, match = self._top()
-            # An arm of a match on a Fin, `0` or `down(j)`, has no cell, and what it binds is no parameter's.
-            counting = payload.rstrip(b"\0") in (b"", DOWN)
+            # An arm of a match on a Fin or on `within`, `0`, `down(j)`, `inside(i)` or `outside`, has no cell, and
+            # what it binds is no parameter's.
+            counting = payload.rstrip(b"\0") in (b"", *ARM_WORDS)
             self._push(K_ARM, _Open(exit=match.exit, mark=len(self.B), word=NOTHING_KNOWN if counting else match.word,
                                     nulls=self.nulls))
             return
