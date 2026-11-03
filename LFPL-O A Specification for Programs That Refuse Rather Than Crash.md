@@ -921,9 +921,9 @@ The compiler and the LP solver are deliberately not on this list. A wrong output
 
 ## 12. Status against the repository
 
-The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and serves UDP sockets on the loopback address, `examples/checksum.lfpl` walks its item under a certified bound, and `examples/ipv4.lfpl` declares a 34-byte header as one record in network byte order, through the whole of the pipeline below except the parts this table marks as missing. This is `ryandward/LFPL` main at commit `d1f995c`, where all 722 tests pass with Python 3.14.9, one of them by failing as expected: the phantom construction in the table.
+The section 4.7 handler now compiles unchanged from `examples/forward.lfpl` and serves UDP sockets on the loopback address, `examples/checksum.lfpl` walks its item under a certified bound, and `examples/ipv4.lfpl` declares a 34-byte header as one record in network byte order, through the whole of the pipeline below except the parts this table marks as missing. This is `ryandward/LFPL` main at commit `0e11c0b`, where all 770 tests pass with Python 3.14.9, one of them by failing as expected: the phantom construction in the table.
 
-| Requirement | Status at `d1f995c` | Needed |
+| Requirement | Status at `0e11c0b` | Needed |
 | --- | --- | --- |
 | exactly-once linear typing | present in Check, and repeated one level down by `src/rtcheck.py` | nothing |
 | exhaustive matching | present | nothing |
