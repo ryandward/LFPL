@@ -1,0 +1,198 @@
+// examples/udp_verify.lfpl in the syntax of examples/next/ipv4.lfpl: that program's forwarding, and before it the UDP
+// checksum of every datagram that has one, over the pseudo-header, the UDP header and every byte of the payload. A
+// frame whose checksum is wrong is not sent. The compiler does not accept this yet either.
+
+/// A frame as the wire has it: the Ethernet, IPv4 and UDP headers, each field its bytes, in the order of RFC 894,
+/// RFC 791 and RFC 768. The rest of the frame is `body`, a slot the frame owns: the UDP payload, and after it any
+/// padding Ethernet added.
+struct Frame {
+    dst_mac: [u8; 6],
+    src_mac: [u8; 6],
+    ethertype: [u8; 2],
+    version_ihl: u8,
+    tos: u8,
+    total: [u8; 2],
+    id: [u8; 2],
+    frag: [u8; 2],
+    ttl: u8,
+    proto: u8,
+    sum: [u8; 2],
+    source: [u8; 4],
+    destination: [u8; 4],
+    src_port: [u8; 2],
+    dst_port: [u8; 2],
+    ulen: [u8; 2],
+    usum: [u8; 2],
+    body: Slot,
+}
+
+/// Why a frame is not sent. The runtime takes the frame back, and counts it under its reason.
+enum Discard {
+    Malformed,
+    Expired,
+    /// A wrong UDP checksum, on a frame examples/next/ipv4.lfpl would have sent.
+    Corrupt,
+}
+
+/// What the UDP check found. Broken is a UDP length that disagrees with the IP length, or a payload of which the slot
+/// holds less than the UDP length says.
+enum Check {
+    Fine,
+    Broken,
+    Wrong,
+}
+
+/// The ethertype that says an IPv4 header follows.
+const IPV4: u16 = 0x0800;
+/// Version 4, and a header of 5 words: one with no options.
+const VERSION_IHL: u8 = 0x45;
+/// The bytes of that header.
+const IP_HEADER: u16 = 20;
+/// The IP protocol number of UDP.
+const UDP: u8 = 17;
+/// The bytes of the UDP header.
+const UDP_HEADER: u16 = 8;
+/// The bit that says more fragments follow, and the fragment offset. A datagram in one frame has none of them set.
+const FRAGMENTED: u16 = 0x3FFF;
+
+/// The ones'-complement sum of two 16-bit words (RFC 1071). A carry out of the top comes back in at the bottom,
+/// because 2^16 is 1 modulo 2^16 - 1. When there is a carry, `sum` is at most 0xFFFE, so adding it never wraps.
+fn ones_add(a: u16, b: u16) -> u16 {
+    let (sum, carry) = a.overflowing_add(b);
+    sum.wrapping_add(carry as u16)
+}
+
+/// Ten 16-bit words, summed in ones' complement.
+fn ones_sum(words: [u16; 10]) -> u16 {
+    let mut sum = 0;
+    for i in 0..words.len() {
+        sum = ones_add(sum, words[i]);
+    }
+    sum
+}
+
+/// The IPv4 header as RFC 791 sums it: its ten 16-bit words, the checksum among them. They come to 0xFFFF when the
+/// checksum is right.
+fn header_sum(f: &Frame) -> u16 {
+    let [s0, s1, s2, s3] = f.source;
+    let [d0, d1, d2, d3] = f.destination;
+    ones_sum([
+        u16::from_be_bytes([f.version_ihl, f.tos]),
+        u16::from_be_bytes(f.total),
+        u16::from_be_bytes(f.id),
+        u16::from_be_bytes(f.frag),
+        u16::from_be_bytes([f.ttl, f.proto]),
+        u16::from_be_bytes(f.sum),
+        u16::from_be_bytes([s0, s1]),
+        u16::from_be_bytes([s2, s3]),
+        u16::from_be_bytes([d0, d1]),
+        u16::from_be_bytes([d2, d3]),
+    ])
+}
+
+/// As in examples/next/ipv4.lfpl, except that the UDP header comes between the IPv4 header and the slot.
+fn well_formed(f: &Frame) -> bool {
+    let total = u16::from_be_bytes(f.total);
+    u16::from_be_bytes(f.ethertype) == IPV4
+        && f.version_ihl == VERSION_IHL
+        && total >= IP_HEADER
+        && total - IP_HEADER <= UDP_HEADER + f.body.len()
+        && header_sum(f) == 0xFFFF
+}
+
+/// The first `n` bytes of the payload as RFC 768 sums them: 16-bit words in network order, and an odd last byte as
+/// the high half of a word whose low half is zero. None if the slot holds fewer than `n`. It only reads the slot, so
+/// it borrows it, and its caller still has it afterwards.
+fn payload_sum(body: &Slot, n: u16) -> Option<u16> {
+    if n > body.len() {
+        None
+    } else {
+        let mut sum = 0;
+        for i in (0..n).step_by(2) {
+            let low = if i + 1 < n { body[i + 1] } else { 0 };
+            sum = ones_add(sum, u16::from_be_bytes([body[i], low]));
+        }
+        Some(sum)
+    }
+}
+
+/// The UDP check. Only a datagram in one frame can be checked, since its checksum covers all of it, and only one whose
+/// checksum is not 0, which its sender uses to say it computed none. `total - IP_HEADER` does not wrap: the handler
+/// calls this only once `well_formed` has found the total length at least IP_HEADER.
+fn udp_check(f: &Frame) -> Check {
+    let total = u16::from_be_bytes(f.total);
+    let ulen = u16::from_be_bytes(f.ulen);
+    let usum = u16::from_be_bytes(f.usum);
+    if f.proto != UDP || (u16::from_be_bytes(f.frag) & FRAGMENTED) != 0 || usum == 0 {
+        Check::Fine
+    } else if ulen < UDP_HEADER || ulen != total - IP_HEADER {
+        Check::Broken
+    } else {
+        match payload_sum(&f.body, ulen - UDP_HEADER) {
+            None => Check::Broken,
+            Some(payload) => {
+                // The pseudo-header: the two addresses, a zero byte and the protocol, and the UDP length. Then the UDP
+                // header, with its checksum in it.
+                let [s0, s1, s2, s3] = f.source;
+                let [d0, d1, d2, d3] = f.destination;
+                let headers = ones_sum([
+                    u16::from_be_bytes([s0, s1]),
+                    u16::from_be_bytes([s2, s3]),
+                    u16::from_be_bytes([d0, d1]),
+                    u16::from_be_bytes([d2, d3]),
+                    u16::from_be_bytes([0, f.proto]),
+                    ulen,
+                    u16::from_be_bytes(f.src_port),
+                    u16::from_be_bytes(f.dst_port),
+                    ulen,
+                    usum,
+                ]);
+                if ones_add(headers, payload) == 0xFFFF { Check::Fine } else { Check::Wrong }
+            }
+        }
+    }
+}
+
+/// RFC 1624, equation 3: the header checksum once the 16-bit word that holds the TTL and the protocol changes from
+/// `old` to `new`. HC' = ~(~HC + ~m + m'), every addition in ones' complement.
+fn patched(sum: u16, old: u16, new: u16) -> u16 {
+    !ones_add(ones_add(!sum, !old), new)
+}
+
+/// The next hop, by the top two bits of the destination address. It is also the port the frame leaves by.
+fn next_hop(destination: [u8; 4]) -> u8 {
+    destination[0] >> 6
+}
+
+/// The handler, which the runtime calls once for each frame it admits. Ok sends the frame to the port it names, and
+/// Err gives the frame back.
+#[handler]
+fn udp_verify(f: Frame) -> (Result<u8, Discard>, Frame) {
+    if !well_formed(&f) {
+        (Err(Discard::Malformed), f)
+    } else {
+        match udp_check(&f) {
+            Check::Broken => (Err(Discard::Malformed), f),
+            Check::Wrong => (Err(Discard::Corrupt), f),
+            Check::Fine => {
+                if f.ttl <= 1 {
+                    (Err(Discard::Expired), f)
+                } else {
+                    // As in examples/next/ipv4.lfpl: new addresses, one less TTL, and the checksum that follows it.
+                    let hop = next_hop(f.destination);
+                    let ttl = f.ttl - 1;
+                    let sum = patched(u16::from_be_bytes(f.sum), u16::from_be_bytes([f.ttl, f.proto]),
+                                      u16::from_be_bytes([ttl, f.proto]));
+                    let sent = Frame {
+                        dst_mac: [0x02, 0, 0, 0, 0, 0x10 + hop],
+                        src_mac: [0x02, 0, 0, 0, 0x01, 0x10 + hop],
+                        ttl,
+                        sum: sum.to_be_bytes(),
+                        ..f
+                    };
+                    (Ok(hop), sent)
+                }
+            }
+        }
+    }
+}

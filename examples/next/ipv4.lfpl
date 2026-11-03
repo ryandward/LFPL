@@ -1,0 +1,119 @@
+// examples/ipv4.lfpl in the syntax LFPL-O is moving to, which is Rust's wherever Rust has one. The compiler does not
+// accept it yet: the commit that added this file says what each construct in it needs.
+
+/// A frame as the wire has it: the Ethernet header, then the IPv4 header, a field for each field of RFC 894 and
+/// RFC 791 in their order, each one its bytes. So no field has a byte order of its own, and a number comes out of its
+/// bytes through the standard conversions. The rest of the frame is `body`, a slot the frame owns, which this handler
+/// sends as it came without reading it.
+struct Frame {
+    dst_mac: [u8; 6],
+    src_mac: [u8; 6],
+    ethertype: [u8; 2],
+    version_ihl: u8,
+    tos: u8,
+    total: [u8; 2],
+    id: [u8; 2],
+    frag: [u8; 2],
+    ttl: u8,
+    proto: u8,
+    sum: [u8; 2],
+    source: [u8; 4],
+    destination: [u8; 4],
+    body: Slot,
+}
+
+/// Why a frame is not sent. The runtime takes the frame back, and counts it under its reason.
+enum Discard {
+    Malformed,
+    Expired,
+}
+
+/// The ethertype that says an IPv4 header follows.
+const IPV4: u16 = 0x0800;
+/// Version 4, and a header of 5 words: one with no options.
+const VERSION_IHL: u8 = 0x45;
+/// The bytes of that header.
+const IP_HEADER: u16 = 20;
+
+/// The ones'-complement sum of two 16-bit words (RFC 1071). A carry out of the top comes back in at the bottom,
+/// because 2^16 is 1 modulo 2^16 - 1. When there is a carry, `sum` is at most 0xFFFE, so adding it never wraps.
+fn ones_add(a: u16, b: u16) -> u16 {
+    let (sum, carry) = a.overflowing_add(b);
+    sum.wrapping_add(carry as u16)
+}
+
+/// Ten 16-bit words, summed in ones' complement.
+fn ones_sum(words: [u16; 10]) -> u16 {
+    let mut sum = 0;
+    for i in 0..words.len() {
+        sum = ones_add(sum, words[i]);
+    }
+    sum
+}
+
+/// The IPv4 header as RFC 791 sums it: its ten 16-bit words, the checksum among them. They come to 0xFFFF when the
+/// checksum is right.
+fn header_sum(f: &Frame) -> u16 {
+    let [s0, s1, s2, s3] = f.source;
+    let [d0, d1, d2, d3] = f.destination;
+    ones_sum([
+        u16::from_be_bytes([f.version_ihl, f.tos]),
+        u16::from_be_bytes(f.total),
+        u16::from_be_bytes(f.id),
+        u16::from_be_bytes(f.frag),
+        u16::from_be_bytes([f.ttl, f.proto]),
+        u16::from_be_bytes(f.sum),
+        u16::from_be_bytes([s0, s1]),
+        u16::from_be_bytes([s2, s3]),
+        u16::from_be_bytes([d0, d1]),
+        u16::from_be_bytes([d2, d3]),
+    ])
+}
+
+/// An IPv4 header with no options and a right checksum, whose datagram the frame holds whole. The datagram's bytes
+/// past its header are the slot's, so its total length, less the header, has to fit in the slot.
+fn well_formed(f: &Frame) -> bool {
+    let total = u16::from_be_bytes(f.total);
+    u16::from_be_bytes(f.ethertype) == IPV4
+        && f.version_ihl == VERSION_IHL
+        && total >= IP_HEADER
+        && total - IP_HEADER <= f.body.len()
+        && header_sum(f) == 0xFFFF
+}
+
+/// RFC 1624, equation 3: the header checksum once the 16-bit word that holds the TTL and the protocol changes from
+/// `old` to `new`. HC' = ~(~HC + ~m + m'), every addition in ones' complement.
+fn patched(sum: u16, old: u16, new: u16) -> u16 {
+    !ones_add(ones_add(!sum, !old), new)
+}
+
+/// The next hop, by the top two bits of the destination address. It is also the port the frame leaves by.
+fn next_hop(destination: [u8; 4]) -> u8 {
+    destination[0] >> 6
+}
+
+/// The handler, which the runtime calls once for each frame it admits. Ok sends the frame to the port it names, and
+/// Err gives the frame back.
+#[handler]
+fn ipv4(f: Frame) -> (Result<u8, Discard>, Frame) {
+    if !well_formed(&f) {
+        (Err(Discard::Malformed), f)
+    } else if f.ttl <= 1 {
+        (Err(Discard::Expired), f)
+    } else {
+        // The addresses become 02:00:00:00:00:1h and 02:00:00:00:01:1h for hop h, the TTL drops by one, and the
+        // checksum follows it. Every other field, and the slot, stays as it is.
+        let hop = next_hop(f.destination);
+        let ttl = f.ttl - 1;
+        let sum = patched(u16::from_be_bytes(f.sum), u16::from_be_bytes([f.ttl, f.proto]),
+                          u16::from_be_bytes([ttl, f.proto]));
+        let sent = Frame {
+            dst_mac: [0x02, 0, 0, 0, 0, 0x10 + hop],
+            src_mac: [0x02, 0, 0, 0, 0x01, 0x10 + hop],
+            ttl,
+            sum: sum.to_be_bytes(),
+            ..f
+        };
+        (Ok(hop), sent)
+    }
+}
